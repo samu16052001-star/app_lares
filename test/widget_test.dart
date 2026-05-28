@@ -16,6 +16,11 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Welcome to the user section!'), findsOneWidget);
+
+    await tester.tap(find.byIcon(Icons.arrow_forward));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Scanning Bluetooth Devices'), findsWidgets);
   });
 
   testWidgets('opens the researcher section with the researcher code', (

@@ -135,11 +135,51 @@ class SectionPage extends StatelessWidget {
       body: Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
-          child: Text(
-            message,
-            style: Theme.of(context).textTheme.headlineSmall,
-            textAlign: TextAlign.center,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                message,
+                style: Theme.of(context).textTheme.headlineSmall,
+                textAlign: TextAlign.center,
+              ),
+              if (sectionName == 'user') ...[
+                const SizedBox(height: 24),
+                IconButton(
+                  color: Colors.black,
+                  icon: const Icon(Icons.arrow_forward),
+                  iconSize: 48,
+                  onPressed: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const BluetoothScanningPage(),
+                      ),
+                    );
+                  },
+                ),
+              ],
+            ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class BluetoothScanningPage extends StatelessWidget {
+  const BluetoothScanningPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Scanning Bluetooth Devices'),
+      ),
+      body: Center(
+        child: Text(
+          'Scanning Bluetooth Devices',
+          style: Theme.of(context).textTheme.headlineSmall,
+          textAlign: TextAlign.center,
         ),
       ),
     );
