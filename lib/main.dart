@@ -1,6 +1,11 @@
+import 'dart:async';
+
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
+  FlutterBluePlus.setOperationQueueMode(OperationQueueMode.perDevice);
   runApp(const LaresApp());
 }
 
@@ -166,20 +171,301 @@ class SectionPage extends StatelessWidget {
   }
 }
 
-class BluetoothScanningPage extends StatelessWidget {
+class BluetoothScanningPage extends StatefulWidget {
   const BluetoothScanningPage({super.key});
 
   @override
+  State<BluetoothScanningPage> createState() => _BluetoothScanningPageState();
+}
+
+class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
+  final Map<String, ScanResult> _scanResults = {};
+  final Set<String> _connectingDeviceIds = {};
+  final Set<String> _connectedDeviceIds = {};
+  StreamSubscription<List<ScanResult>>? _scanSubscription;
+  StreamSubscription<bool>? _isScanningSubscription;
+
+  bool _isScanning = false;
+  String? _statusMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _listenToScanState();
+  }
+
+  @override
+  void dispose() {
+    _scanSubscription?.cancel();
+    _isScanningSubscription?.cancel();
+    FlutterBluePlus.stopScan();
+    super.dispose();
+  }
+
+  void _listenToScanState() {
+    _isScanningSubscription = FlutterBluePlus.isScanning.listen((isScanning) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isScanning = isScanning;
+      });
+    });
+  }
+
+  Future<void> _startScan() async {
+    setState(() {
+      _scanResults.clear();
+      _statusMessage = null;
+    });
+
+    final hasPermissions = await _requestBluetoothPermissions();
+    if (!hasPermissions) {
+      setState(() {
+        _statusMessage = 'Bluetooth permission is required to scan devices.';
+      });
+      return;
+    }
+
+    final isSupported = await FlutterBluePlus.isSupported;
+    if (!isSupported) {
+      setState(() {
+        _statusMessage = 'Bluetooth is not supported on this device.';
+      });
+      return;
+    }
+
+    try {
+      await FlutterBluePlus.adapterState
+          .where((state) => state == BluetoothAdapterState.on)
+          .first
+          .timeout(const Duration(seconds: 8));
+    } on TimeoutException {
+      setState(() {
+        _statusMessage = 'Turn on Bluetooth and try again.';
+      });
+      return;
+    }
+
+    await _scanSubscription?.cancel();
+    _scanSubscription = FlutterBluePlus.onScanResults.listen(
+      (results) {
+        if (!mounted) {
+          return;
+        }
+
+        setState(() {
+          for (final result in results) {
+            _scanResults[_deviceId(result.device)] = result;
+          }
+        });
+      },
+      onError: (Object error) {
+        if (!mounted) {
+          return;
+        }
+
+        setState(() {
+          _statusMessage = 'Scan failed: $error';
+        });
+      },
+    );
+
+    try {
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+      await FlutterBluePlus.isScanning.where((isScanning) => !isScanning).first;
+
+      if (mounted && _scanResults.isEmpty) {
+        setState(() {
+          _statusMessage = 'No Bluetooth LE devices found nearby.';
+        });
+      }
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _statusMessage = 'Scan failed: $error';
+      });
+    }
+  }
+
+  Future<bool> _requestBluetoothPermissions() async {
+    final statuses = await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.locationWhenInUse,
+    ].request();
+
+    final scanStatus = statuses[Permission.bluetoothScan];
+    final connectStatus = statuses[Permission.bluetoothConnect];
+
+    return (scanStatus == null || scanStatus.isGranted) &&
+        (connectStatus == null || connectStatus.isGranted);
+  }
+
+  Future<void> _toggleConnection(BluetoothDevice device) async {
+    final id = _deviceId(device);
+
+    if (_connectedDeviceIds.contains(id)) {
+      await _disconnectFromDevice(device);
+      return;
+    }
+
+    await _connectToDevice(device);
+  }
+
+  Future<void> _connectToDevice(BluetoothDevice device) async {
+    final id = _deviceId(device);
+
+    setState(() {
+      _connectingDeviceIds.add(id);
+      _statusMessage = null;
+    });
+
+    try {
+      await device.connect(
+        license: License.nonprofit,
+        timeout: const Duration(seconds: 12),
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _connectedDeviceIds.add(id);
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _statusMessage = 'Could not connect to ${_deviceName(device)}: $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _connectingDeviceIds.remove(id);
+        });
+      }
+    }
+  }
+
+  Future<void> _disconnectFromDevice(BluetoothDevice device) async {
+    final id = _deviceId(device);
+
+    setState(() {
+      _connectingDeviceIds.add(id);
+      _statusMessage = null;
+    });
+
+    try {
+      await device.disconnect();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _connectedDeviceIds.remove(id);
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _statusMessage = 'Could not disconnect ${_deviceName(device)}: $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _connectingDeviceIds.remove(id);
+        });
+      }
+    }
+  }
+
+  String _deviceId(BluetoothDevice device) {
+    return device.remoteId.toString();
+  }
+
+  String _deviceName(BluetoothDevice device) {
+    final platformName = device.platformName.trim();
+    return platformName.isEmpty ? 'Unknown device' : platformName;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final devices = _scanResults.values.toList()
+      ..sort((a, b) => _deviceName(a.device).compareTo(_deviceName(b.device)));
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Scanning Bluetooth Devices'),
       ),
-      body: Center(
-        child: Text(
-          'Scanning Bluetooth Devices',
-          style: Theme.of(context).textTheme.headlineSmall,
-          textAlign: TextAlign.center,
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            FilledButton.icon(
+              icon: Icon(_isScanning ? Icons.bluetooth_searching : Icons.search),
+              label: Text(_isScanning ? 'Scanning...' : 'Scan Bluetooth Devices'),
+              onPressed: _isScanning ? null : _startScan,
+            ),
+            if (_statusMessage != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _statusMessage!,
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+            const SizedBox(height: 16),
+            Expanded(
+              child: devices.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'Press the scan button to find nearby Bluetooth LE devices.',
+                        textAlign: TextAlign.center,
+                      ),
+                    )
+                  : ListView.separated(
+                      itemCount: devices.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final result = devices[index];
+                        final device = result.device;
+                        final id = _deviceId(device);
+                        final isConnected = _connectedDeviceIds.contains(id);
+                        final isBusy = _connectingDeviceIds.contains(id);
+
+                        return ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(_deviceName(device)),
+                          subtitle: Text('$id - RSSI ${result.rssi} dBm'),
+                          trailing: FilledButton(
+                            onPressed: isBusy
+                                ? null
+                                : () => _toggleConnection(device),
+                            child: Text(
+                              isBusy
+                                  ? 'Wait'
+                                  : isConnected
+                                      ? 'Disconnect'
+                                      : 'Connect',
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
         ),
       ),
     );
