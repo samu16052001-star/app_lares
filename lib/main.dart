@@ -625,7 +625,7 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
     120,
   ];
 
-  int _samplingFrequencyIndex = 1;
+  int _samplingFrequencyIndex = 0;
 
   int get _selectedSamplingFrequency {
     return _samplingFrequencies[_samplingFrequencyIndex];
