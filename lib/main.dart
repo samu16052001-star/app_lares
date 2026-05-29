@@ -574,6 +574,25 @@ class DeviceConfigurationPage extends StatefulWidget {
 }
 
 class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
+  static const List<String> _measurementOptions = [
+    'CO2',
+    'CO',
+    'NH3',
+    'NO2',
+    'VOC',
+    'NOX',
+    'VOC Index',
+    'NOX Index',
+    'PM1.0',
+    'PM2.5',
+    'PM10',
+    'Internal Temperature',
+    'External Temperature',
+    'Internal Humidity',
+    'External Humidity',
+    'Atmospheric Pressure',
+  ];
+
   final Map<String, bool> _options = {
     'CO2': false,
     'CO': false,
@@ -591,7 +610,7 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
     'Internal Humidity': false,
     'External Humidity': false,
     'Atmospheric Pressure': false,
-    'SD Card Storage': false,
+    'SD Card Storage': true,
     'Fan': false,
   };
 
@@ -612,6 +631,18 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
     return _samplingFrequencies[_samplingFrequencyIndex];
   }
 
+  bool get _allMeasurementsEnabled {
+    return _measurementOptions.every((option) => _options[option] ?? false);
+  }
+
+  void _setAllMeasurements(bool value) {
+    setState(() {
+      for (final option in _measurementOptions) {
+        _options[option] = value;
+      }
+    });
+  }
+
   void _setOption(String option, bool value) {
     setState(() {
       _options[option] = value;
@@ -624,54 +655,74 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
     });
   }
 
+  void _openAcquisitionInitializationPage() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => const AcquisitionInitializationPage(),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Device Configuration'),
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
+      body: Column(
         children: [
-          ..._buildSwitchGroup([
-            'CO2',
-            'CO',
-            'NH3',
-            'NO2',
-            'VOC',
-            'NOX',
-            'VOC Index',
-            'NOX Index',
-            'PM1.0',
-            'PM2.5',
-            'PM10',
-            'Internal Temperature',
-            'External Temperature',
-            'Internal Humidity',
-            'External Humidity',
-            'Atmospheric Pressure',
-          ]),
-          const Divider(height: 32),
-          ..._buildSwitchGroup(['SD Card Storage']),
-          const Divider(height: 32),
-          ..._buildSwitchGroup(['Fan']),
-          const Divider(height: 32),
-          Text(
-            'Sampling Frequency',
-            style: Theme.of(context).textTheme.titleMedium,
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('All Measurements'),
+                  value: _allMeasurementsEnabled,
+                  onChanged: _setAllMeasurements,
+                ),
+                const SizedBox(height: 8),
+                ..._buildSwitchGroup(_measurementOptions),
+                const Divider(height: 32),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('SD Card Storage'),
+                  value: true,
+                  onChanged: null,
+                ),
+                const Divider(height: 32),
+                ..._buildSwitchGroup(['Fan']),
+                const Divider(height: 32),
+                Text(
+                  'Sampling Frequency',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Sampling Frequency: $_selectedSamplingFrequency s',
+                  style: Theme.of(context).textTheme.bodyLarge,
+                ),
+                Slider(
+                  value: _samplingFrequencyIndex.toDouble(),
+                  min: 0,
+                  max: (_samplingFrequencies.length - 1).toDouble(),
+                  divisions: _samplingFrequencies.length - 1,
+                  label: '$_selectedSamplingFrequency s',
+                  onChanged: _setSamplingFrequency,
+                ),
+              ],
+            ),
           ),
-          const SizedBox(height: 12),
-          Text(
-            'Sampling Frequency: $_selectedSamplingFrequency s',
-            style: Theme.of(context).textTheme.bodyLarge,
-          ),
-          Slider(
-            value: _samplingFrequencyIndex.toDouble(),
-            min: 0,
-            max: (_samplingFrequencies.length - 1).toDouble(),
-            divisions: _samplingFrequencies.length - 1,
-            label: '$_selectedSamplingFrequency s',
-            onChanged: _setSamplingFrequency,
+          SafeArea(
+            minimum: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            child: SizedBox(
+              width: double.infinity,
+              height: 52,
+              child: FilledButton(
+                onPressed: _openAcquisitionInitializationPage,
+                child: const Text('Continue'),
+              ),
+            ),
           ),
         ],
       ),
@@ -687,5 +738,21 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
         onChanged: (value) => _setOption(option, value),
       );
     }).toList();
+  }
+}
+
+class AcquisitionInitializationPage extends StatelessWidget {
+  const AcquisitionInitializationPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        title: const Text('Acquisition Initialization'),
+      ),
+      body: const SizedBox.expand(),
+    );
   }
 }
