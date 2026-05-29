@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
@@ -370,6 +371,11 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   }
 
   Future<bool> _requestBluetoothPermissions() async {
+    if (Platform.isIOS) {
+      // Su iOS flutter_blue_plus gestisce i permessi BLE autonomamente
+      return true;
+    }
+
     final statuses = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
