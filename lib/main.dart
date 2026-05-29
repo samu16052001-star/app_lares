@@ -338,6 +338,8 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       setState(() {
         _connectedDeviceIds.add(id);
       });
+
+      _openPreparingDevicesPage();
     } catch (error) {
       if (!mounted) {
         return;
@@ -353,6 +355,14 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         });
       }
     }
+  }
+
+  void _openPreparingDevicesPage() {
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute<void>(
+        builder: (_) => const PreparingDevicesPage(),
+      ),
+    );
   }
 
   Future<void> _disconnectFromDevice(BluetoothDevice device) async {
@@ -467,6 +477,22 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class PreparingDevicesPage extends StatelessWidget {
+  const PreparingDevicesPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Preparing devices...'),
+      ),
+      body: const Center(
+        child: CircularProgressIndicator(),
       ),
     );
   }
