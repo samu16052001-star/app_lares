@@ -415,6 +415,10 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       setState(() {
         _connectedDeviceIds.add(id);
       });
+
+      if (_isEnvDevice(device)) {
+        _openDeviceConfigurationPage();
+      }
     } catch (error) {
       if (!mounted) {
         return;
@@ -430,6 +434,18 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         });
       }
     }
+  }
+
+  bool _isEnvDevice(BluetoothDevice device) {
+    return _deviceName(device).toLowerCase().contains('env');
+  }
+
+  void _openDeviceConfigurationPage() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => const DeviceConfigurationPage(),
+      ),
+    );
   }
 
   Future<void> _disconnectFromDevice(BluetoothDevice device) async {
@@ -545,6 +561,20 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
           ],
         ),
       ),
+    );
+  }
+}
+
+class DeviceConfigurationPage extends StatelessWidget {
+  const DeviceConfigurationPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Device Configuration'),
+      ),
+      body: const SizedBox.expand(),
     );
   }
 }
