@@ -47,6 +47,10 @@
 			</array>
 		</dict>
 	</dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>This app uses Bluetooth to connect to RespirHò device.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Location is required to scan for nearby Bluetooth devices.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
