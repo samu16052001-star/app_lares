@@ -565,8 +565,64 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   }
 }
 
-class DeviceConfigurationPage extends StatelessWidget {
+class DeviceConfigurationPage extends StatefulWidget {
   const DeviceConfigurationPage({super.key});
+
+  @override
+  State<DeviceConfigurationPage> createState() =>
+      _DeviceConfigurationPageState();
+}
+
+class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
+  final Map<String, bool> _options = {
+    'CO2': false,
+    'CO': false,
+    'NH3': false,
+    'NO2': false,
+    'VOC': false,
+    'NOX': false,
+    'VOC Index': false,
+    'NOX Index': false,
+    'PM1.0': false,
+    'PM2.5': false,
+    'PM10': false,
+    'Internal Temperature': false,
+    'External Temperature': false,
+    'Internal Humidity': false,
+    'External Humidity': false,
+    'Atmospheric Pressure': false,
+    'SD Card Storage': false,
+    'Fan': false,
+  };
+
+  static const List<int> _samplingFrequencies = [
+    15,
+    30,
+    45,
+    60,
+    75,
+    90,
+    105,
+    120,
+  ];
+
+  int _samplingFrequencyIndex = 1;
+
+  int get _selectedSamplingFrequency {
+    return _samplingFrequencies[_samplingFrequencyIndex];
+  }
+
+  void _setOption(String option, bool value) {
+    setState(() {
+      _options[option] = value;
+    });
+  }
+
+  void _setSamplingFrequency(double value) {
+    setState(() {
+      _samplingFrequencyIndex = value.round();
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -574,7 +630,62 @@ class DeviceConfigurationPage extends StatelessWidget {
       appBar: AppBar(
         title: const Text('Device Configuration'),
       ),
-      body: const SizedBox.expand(),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          ..._buildSwitchGroup([
+            'CO2',
+            'CO',
+            'NH3',
+            'NO2',
+            'VOC',
+            'NOX',
+            'VOC Index',
+            'NOX Index',
+            'PM1.0',
+            'PM2.5',
+            'PM10',
+            'Internal Temperature',
+            'External Temperature',
+            'Internal Humidity',
+            'External Humidity',
+            'Atmospheric Pressure',
+          ]),
+          const Divider(height: 32),
+          ..._buildSwitchGroup(['SD Card Storage']),
+          const Divider(height: 32),
+          ..._buildSwitchGroup(['Fan']),
+          const Divider(height: 32),
+          Text(
+            'Sampling Frequency',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Sampling Frequency: $_selectedSamplingFrequency s',
+            style: Theme.of(context).textTheme.bodyLarge,
+          ),
+          Slider(
+            value: _samplingFrequencyIndex.toDouble(),
+            min: 0,
+            max: (_samplingFrequencies.length - 1).toDouble(),
+            divisions: _samplingFrequencies.length - 1,
+            label: '$_selectedSamplingFrequency s',
+            onChanged: _setSamplingFrequency,
+          ),
+        ],
+      ),
     );
+  }
+
+  List<Widget> _buildSwitchGroup(List<String> options) {
+    return options.map((option) {
+      return SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: Text(option),
+        value: _options[option] ?? false,
+        onChanged: (value) => _setOption(option, value),
+      );
+    }).toList();
   }
 }
