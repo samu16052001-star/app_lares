@@ -20,6 +20,24 @@ void main() {
     await tester.tap(find.byIcon(Icons.arrow_forward));
     await tester.pumpAndSettle();
 
+    expect(find.text('Automatic Configuration'), findsOneWidget);
+    expect(find.text('Manual Configuration'), findsOneWidget);
+  });
+
+  testWidgets('opens Bluetooth scanning from manual configuration', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const LaresApp());
+
+    await tester.enterText(find.byType(EditableText), 'user');
+    await tester.tap(find.text('Continue'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.arrow_forward));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Manual Configuration'));
+    await tester.pumpAndSettle();
+
     expect(find.text('Scanning Bluetooth Devices'), findsWidgets);
   });
 

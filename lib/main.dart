@@ -157,7 +157,7 @@ class SectionPage extends StatelessWidget {
                   onPressed: () {
                     Navigator.of(context).push(
                       MaterialPageRoute<void>(
-                        builder: (_) => const BluetoothScanningPage(),
+                        builder: (_) => const ConfigurationChoicePage(),
                       ),
                     );
                   },
@@ -167,6 +167,83 @@ class SectionPage extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class ConfigurationChoicePage extends StatelessWidget {
+  const ConfigurationChoicePage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Configuration'),
+      ),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const AutomaticConfigurationPage(),
+                      ),
+                    );
+                  },
+                  child: Card(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 48,
+                      ),
+                      child: Text(
+                        'Automatic Configuration',
+                        style: Theme.of(context).textTheme.headlineSmall,
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 24),
+                TextButton(
+                  onPressed: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const BluetoothScanningPage(),
+                      ),
+                    );
+                  },
+                  child: const Text('Manual Configuration'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class AutomaticConfigurationPage extends StatelessWidget {
+  const AutomaticConfigurationPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        title: const Text('Automatic Configuration'),
+      ),
+      body: const SizedBox.expand(),
     );
   }
 }
@@ -338,8 +415,6 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       setState(() {
         _connectedDeviceIds.add(id);
       });
-
-      _openPreparingDevicesPage();
     } catch (error) {
       if (!mounted) {
         return;
@@ -355,14 +430,6 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         });
       }
     }
-  }
-
-  void _openPreparingDevicesPage() {
-    Navigator.of(context).pushReplacement(
-      MaterialPageRoute<void>(
-        builder: (_) => const PreparingDevicesPage(),
-      ),
-    );
   }
 
   Future<void> _disconnectFromDevice(BluetoothDevice device) async {
@@ -477,22 +544,6 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class PreparingDevicesPage extends StatelessWidget {
-  const PreparingDevicesPage({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Preparing devices...'),
-      ),
-      body: const Center(
-        child: CircularProgressIndicator(),
       ),
     );
   }
