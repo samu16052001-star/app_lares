@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:app_lares/ble_configuration_service.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -423,7 +424,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       });
 
       if (_isEnvDevice(device)) {
-        _openDeviceConfigurationPage();
+        _openDeviceConfigurationPage(device);
       }
     } catch (error) {
       if (!mounted) {
@@ -446,10 +447,10 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     return _deviceName(device).toLowerCase().contains('env');
   }
 
-  void _openDeviceConfigurationPage() {
+  void _openDeviceConfigurationPage(BluetoothDevice device) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => const DeviceConfigurationPage(),
+        builder: (_) => DeviceConfigurationPage(device: device),
       ),
     );
   }
@@ -572,7 +573,12 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 }
 
 class DeviceConfigurationPage extends StatefulWidget {
-  const DeviceConfigurationPage({super.key});
+  const DeviceConfigurationPage({
+    super.key,
+    required this.device,
+  });
+
+  final BluetoothDevice device;
 
   @override
   State<DeviceConfigurationPage> createState() =>
@@ -632,6 +638,7 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
   ];
 
   int _samplingFrequencyIndex = 0;
+  bool _isContinuing = false;
 
   int get _selectedSamplingFrequency {
     return _samplingFrequencies[_samplingFrequencyIndex];
@@ -662,11 +669,33 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
   }
 
   void _openAcquisitionInitializationPage() {
+    if (_isContinuing) {
+      return;
+    }
+
+    setState(() {
+      _isContinuing = true;
+    });
+
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => const AcquisitionInitializationPage(),
+        builder: (_) => AcquisitionInitializationPage(
+          device: widget.device,
+          configuration: BleConfiguration(
+            enabledOptions: Map<String, bool>.from(_options),
+            samplingFrequencySeconds: _selectedSamplingFrequency,
+          ),
+        ),
       ),
-    );
+    ).whenComplete(() {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isContinuing = false;
+      });
+    });
   }
 
   @override
@@ -725,8 +754,9 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
               width: double.infinity,
               height: 52,
               child: FilledButton(
-                onPressed: _openAcquisitionInitializationPage,
-                child: const Text('Continue'),
+                onPressed:
+                    _isContinuing ? null : _openAcquisitionInitializationPage,
+                child: Text(_isContinuing ? 'Opening...' : 'Continue'),
               ),
             ),
           ),
@@ -747,18 +777,198 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
   }
 }
 
-class AcquisitionInitializationPage extends StatelessWidget {
-  const AcquisitionInitializationPage({super.key});
+class AcquisitionInitializationPage extends StatefulWidget {
+  const AcquisitionInitializationPage({
+    super.key,
+    required this.device,
+    required this.configuration,
+  });
+
+  final BluetoothDevice device;
+  final BleConfiguration configuration;
+
+  @override
+  State<AcquisitionInitializationPage> createState() =>
+      _AcquisitionInitializationPageState();
+}
+
+class _AcquisitionInitializationPageState
+    extends State<AcquisitionInitializationPage> {
+  late final BleConfigurationService _service;
+
+  final List<BleNotificationMessage> _messages = [];
+  StreamSubscription<BleNotificationMessage>? _messagesSubscription;
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+
+  bool _isInitializing = true;
+  bool _initializationStarted = false;
+  String? _errorMessage;
+  bool _canRetry = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _service = BleConfigurationService(widget.device);
+    _messagesSubscription = _service.messages.listen((message) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _messages.add(message);
+      });
+    });
+    _connectionSubscription = _service.connectionState.listen((state) {
+      if (!mounted || state != BluetoothConnectionState.disconnected) {
+        return;
+      }
+
+      setState(() {
+        _isInitializing = false;
+        _errorMessage = 'BLE device disconnected.';
+        _canRetry = false;
+      });
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _startInitialization();
+    });
+  }
+
+  @override
+  void dispose() {
+    unawaited(_messagesSubscription?.cancel());
+    unawaited(_connectionSubscription?.cancel());
+    unawaited(_service.dispose());
+    super.dispose();
+  }
+
+  Future<void> _startInitialization() async {
+    if (_initializationStarted) {
+      return;
+    }
+
+    _initializationStarted = true;
+
+    if (mounted) {
+      setState(() {
+        _isInitializing = true;
+        _errorMessage = null;
+        _canRetry = false;
+        _messages.clear();
+      });
+    }
+
+    try {
+      await _service.initialize(widget.configuration);
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isInitializing = false;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isInitializing = false;
+        _errorMessage = error.toString();
+        _canRetry = error is BleConfigurationException && error.canRetry;
+      });
+    }
+  }
+
+  void _retryInitialization() {
+    if (_isInitializing) {
+      return;
+    }
+
+    _initializationStarted = false;
+    _startInitialization();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.white,
-      appBar: AppBar(
-        backgroundColor: Colors.white,
-        title: const Text('Acquisition Initialization'),
+    final title = _isInitializing || _errorMessage != null
+        ? 'Acquisition Initialization'
+        : 'Acquisition in progress...';
+
+    return PopScope(
+      canPop: !_isInitializing,
+      child: AbsorbPointer(
+        absorbing: _isInitializing,
+        child: Scaffold(
+          backgroundColor: Colors.white,
+          appBar: AppBar(
+            backgroundColor: Colors.white,
+            title: Text(title),
+          ),
+          body: SafeArea(
+            child: _buildBody(context),
+          ),
+        ),
       ),
-      body: const SizedBox.expand(),
+    );
+  }
+
+  Widget _buildBody(BuildContext context) {
+    if (_isInitializing) {
+      return const Center(
+        child: CircularProgressIndicator(),
+      );
+    }
+
+    if (_errorMessage != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                _errorMessage!,
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+              if (_canRetry) ...[
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: _retryInitialization,
+                  child: const Text('Retry'),
+                ),
+              ],
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_messages.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text(
+            'Waiting for BLE notifications...',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
+
+    return ListView.separated(
+      padding: const EdgeInsets.all(16),
+      itemCount: _messages.length,
+      separatorBuilder: (_, _) => const Divider(height: 1),
+      itemBuilder: (context, index) {
+        return ListTile(
+          contentPadding: EdgeInsets.zero,
+          title: Text(_messages[index].displayText),
+        );
+      },
     );
   }
 }
