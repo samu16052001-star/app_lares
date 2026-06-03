@@ -88,7 +88,7 @@ class BleConfigurationService {
 
       await _writeWithRetries(
         characteristics[_samplingFrequencyUuid]!,
-        ascii.encode(configuration.samplingFrequencySeconds.toString()),
+        [configuration.samplingFrequencySeconds],
         _samplingFrequencyUuid,
       );
       await Future.delayed(const Duration(seconds: 2));
