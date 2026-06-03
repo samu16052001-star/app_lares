@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
@@ -89,7 +88,7 @@ class BleConfigurationService {
 
       await _writeWithRetries(
         characteristics[_samplingFrequencyUuid]!,
-        _encodeUint16LittleEndian(configuration.samplingFrequencySeconds),
+        ascii.encode(configuration.samplingFrequencySeconds.toString()),
         _samplingFrequencyUuid,
       );
       await Future.delayed(const Duration(seconds: 2));
@@ -225,11 +224,6 @@ class BleConfigurationService {
       await subscription.cancel();
     }
     _notificationSubscriptions.clear();
-  }
-
-  List<int> _encodeUint16LittleEndian(int value) {
-    final bytes = ByteData(2)..setUint16(0, value, Endian.little);
-    return bytes.buffer.asUint8List().toList();
   }
 
   String _formatPayload(List<int> value) {
