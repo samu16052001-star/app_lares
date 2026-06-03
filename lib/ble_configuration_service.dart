@@ -178,7 +178,7 @@ class BleConfigurationService {
 
     for (var attempt = 0; attempt <= _maxAdditionalWriteAttempts; attempt++) {
       try {
-        await characteristic.write(payload, withoutResponse: true);
+        await characteristic.write(payload, withoutResponse: false);
         return;
       } catch (error) {
         lastError = error;
