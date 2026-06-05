@@ -149,7 +149,7 @@ class OpenRemoteMqttService {
       _client?.disconnect();
       _client = client;
 
-      await client.connect();
+      await client.connect().timeout(const Duration(seconds: 12));
 
       if (_disposed) {
         client.disconnect();
@@ -159,9 +159,10 @@ class OpenRemoteMqttService {
       final connected =
           client.connectionStatus?.state == MqttConnectionState.connected;
       if (!connected) {
+        final returnCode = client.connectionStatus?.returnCode;
         client.disconnect();
-        throw const OpenRemoteMqttException(
-          'OpenRemote connection failed.',
+        throw OpenRemoteMqttException(
+          _messageForReturnCode(returnCode),
         );
       }
 
@@ -174,9 +175,19 @@ class OpenRemoteMqttService {
       );
     } on OpenRemoteMqttException catch (error) {
       _handleConnectError(error.message, manualAttempt: manualAttempt);
-    } catch (_) {
+    } on SocketException {
       _handleConnectError(
-        'Could not connect to OpenRemote.',
+        'OpenRemote broker is not reachable.',
+        manualAttempt: manualAttempt,
+      );
+    } on HandshakeException {
+      _handleConnectError(
+        'OpenRemote TLS verification failed.',
+        manualAttempt: manualAttempt,
+      );
+    } catch (error) {
+      _handleConnectError(
+        _safeConnectionMessage(error),
         manualAttempt: manualAttempt,
       );
     } finally {
@@ -256,6 +267,45 @@ class OpenRemoteMqttService {
 
     return value.toString();
   }
+
+  String _safeConnectionMessage(Object error) {
+    final text = error.toString().toLowerCase();
+
+    if (text.contains('auth') ||
+        text.contains('not authorized') ||
+        text.contains('bad username') ||
+        text.contains('password')) {
+      return 'OpenRemote authentication was rejected.';
+    }
+
+    if (text.contains('certificate') || text.contains('handshake')) {
+      return 'OpenRemote TLS verification failed.';
+    }
+
+    if (text.contains('timed out') || text.contains('timeout')) {
+      return 'OpenRemote connection timed out.';
+    }
+
+    return 'Could not connect to OpenRemote.';
+  }
+
+  String _messageForReturnCode(MqttConnectReturnCode? returnCode) {
+    return switch (returnCode) {
+      MqttConnectReturnCode.connectionAccepted =>
+        'Connected to OpenRemote',
+      MqttConnectReturnCode.unacceptedProtocolVersion =>
+        'OpenRemote rejected the MQTT protocol version.',
+      MqttConnectReturnCode.identifierRejected =>
+        'OpenRemote rejected the MQTT client ID.',
+      MqttConnectReturnCode.brokerUnavailable =>
+        'OpenRemote broker is unavailable.',
+      MqttConnectReturnCode.badUsernameOrPassword =>
+        'OpenRemote authentication was rejected.',
+      MqttConnectReturnCode.notAuthorized =>
+        'OpenRemote authentication was rejected.',
+      _ => 'OpenRemote connection failed.',
+    };
+  }
 }
 
 class _OpenRemoteMqttConfig {
@@ -306,7 +356,10 @@ class _OpenRemoteMqttConfig {
       _read('OR_TLS_INSECURE', fallback: 'false'),
     );
     final realm = _required('OR_REALM');
-    final clientPrefix = _required('OR_CLIENT_PREFIX');
+    final clientPrefix = _requiredAny([
+      'OR_CLIENT_SUFFIX',
+      'OR_CLIENT_PREFIX',
+    ]);
     final rawUsername = _required('OR_USERNAME');
     final password = _required('OR_PASSWORD');
     final assetId = _required('OR_ASSET_ID');
@@ -338,13 +391,39 @@ class _OpenRemoteMqttConfig {
     return value;
   }
 
+  static String _requiredAny(List<String> keys) {
+    for (final key in keys) {
+      final value = _read(key);
+      if (value != null && value.isNotEmpty && !value.startsWith('<')) {
+        return value;
+      }
+    }
+
+    throw OpenRemoteMqttException(
+      'OpenRemote configuration is incomplete: ${keys.join(' or ')} is missing.',
+    );
+  }
+
   static String? _read(String key, {String? fallback}) {
-    final value = dotenv.env[key]?.trim();
+    final value = _stripInlineComment(dotenv.env[key])?.trim();
     if (value == null || value.isEmpty) {
       return fallback;
     }
 
     return value;
+  }
+
+  static String? _stripInlineComment(String? value) {
+    if (value == null) {
+      return null;
+    }
+
+    final commentStart = value.indexOf(' #');
+    if (commentStart == -1) {
+      return value;
+    }
+
+    return value.substring(0, commentStart);
   }
 
   static int _parsePort(String value) {

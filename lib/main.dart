@@ -1105,11 +1105,26 @@ class _AcquisitionInitializationPageState
                 ),
                 const SizedBox(width: 12),
                 Expanded(
-                  child: Text(
-                    text,
-                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                          color: foregroundColor,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        text,
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                              color: foregroundColor,
+                            ),
+                      ),
+                      if (status == OpenRemoteMqttStatus.failed &&
+                          _mqttState.message != null) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          _mqttState.message!,
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                color: foregroundColor,
+                              ),
                         ),
+                      ],
+                    ],
                   ),
                 ),
                 if (status == OpenRemoteMqttStatus.connecting)
