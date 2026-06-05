@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:app_lares/ble_configuration_service.dart';
+import 'package:app_lares/services/mqtt_service.dart';
+import 'package:app_lares/services/pm10_parser.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -795,20 +797,26 @@ class AcquisitionInitializationPage extends StatefulWidget {
 class _AcquisitionInitializationPageState
     extends State<AcquisitionInitializationPage> {
   late final BleConfigurationService _service;
+  late final OpenRemoteMqttService _mqttService;
 
   final List<BleNotificationMessage> _messages = [];
   StreamSubscription<BleNotificationMessage>? _messagesSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+  StreamSubscription<OpenRemoteMqttState>? _mqttStateSubscription;
 
   bool _isInitializing = true;
   bool _initializationStarted = false;
   String? _errorMessage;
   bool _canRetry = false;
+  OpenRemoteMqttState _mqttState = const OpenRemoteMqttState(
+    status: OpenRemoteMqttStatus.disconnected,
+  );
 
   @override
   void initState() {
     super.initState();
     _service = BleConfigurationService(widget.device);
+    _mqttService = OpenRemoteMqttService();
     _messagesSubscription = _service.messages.listen((message) {
       if (!mounted) {
         return;
@@ -817,6 +825,7 @@ class _AcquisitionInitializationPageState
       setState(() {
         _messages.add(message);
       });
+      unawaited(_publishPm10IfConnected(message.value));
     });
     _connectionSubscription = _service.connectionState.listen((state) {
       if (!mounted || state != BluetoothConnectionState.disconnected) {
@@ -829,6 +838,20 @@ class _AcquisitionInitializationPageState
         _canRetry = false;
       });
     });
+    _mqttStateSubscription = _mqttService.states.listen((state) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _mqttState = state;
+      });
+
+      if (state.status == OpenRemoteMqttStatus.failed &&
+          state.message != null) {
+        _appendLog('OpenRemote: ${state.message}');
+      }
+    });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _startInitialization();
@@ -839,6 +862,8 @@ class _AcquisitionInitializationPageState
   void dispose() {
     unawaited(_messagesSubscription?.cancel());
     unawaited(_connectionSubscription?.cancel());
+    unawaited(_mqttStateSubscription?.cancel());
+    unawaited(_mqttService.dispose());
     unawaited(_service.dispose());
     super.dispose();
   }
@@ -888,6 +913,56 @@ class _AcquisitionInitializationPageState
 
     _initializationStarted = false;
     _startInitialization();
+  }
+
+  Future<void> _connectOpenRemote() async {
+    if (_mqttState.status == OpenRemoteMqttStatus.connecting ||
+        _mqttState.status == OpenRemoteMqttStatus.connected) {
+      return;
+    }
+
+    await _mqttService.connect();
+  }
+
+  Future<void> _publishPm10IfConnected(String bleValue) async {
+    if (!_mqttService.isConnected) {
+      return;
+    }
+
+    final pm10 = parsePm10Value(bleValue);
+    if (pm10 == null) {
+      return;
+    }
+
+    final sent = await _mqttService.publishPm10(pm10);
+    if (!sent || !mounted) {
+      return;
+    }
+
+    _appendLog('MQTT sent — PM10: ${_formatPm10(pm10)}');
+  }
+
+  void _appendLog(String value) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _messages.add(
+        BleNotificationMessage(
+          receivedAt: DateTime.now(),
+          value: value,
+        ),
+      );
+    });
+  }
+
+  String _formatPm10(double value) {
+    if (value == value.truncateToDouble()) {
+      return value.toInt().toString();
+    }
+
+    return value.toString();
   }
 
   @override
@@ -947,6 +1022,17 @@ class _AcquisitionInitializationPageState
       );
     }
 
+    return Column(
+      children: [
+        Expanded(
+          child: _buildMessagesLog(),
+        ),
+        _buildOpenRemoteBanner(context),
+      ],
+    );
+  }
+
+  Widget _buildMessagesLog() {
     if (_messages.isEmpty) {
       return const Center(
         child: Padding(
@@ -969,6 +1055,81 @@ class _AcquisitionInitializationPageState
           title: Text(_messages[index].displayText),
         );
       },
+    );
+  }
+
+  Widget _buildOpenRemoteBanner(BuildContext context) {
+    final status = _mqttState.status;
+    final canTap = status == OpenRemoteMqttStatus.disconnected ||
+        status == OpenRemoteMqttStatus.failed;
+    final colorScheme = Theme.of(context).colorScheme;
+
+    final text = switch (status) {
+      OpenRemoteMqttStatus.connecting => 'Connecting to OpenRemote...',
+      OpenRemoteMqttStatus.connected => 'Connected to OpenRemote',
+      OpenRemoteMqttStatus.failed => 'Connection failed — Tap to retry',
+      OpenRemoteMqttStatus.disconnected => 'Connect to OpenRemote',
+    };
+
+    final backgroundColor = switch (status) {
+      OpenRemoteMqttStatus.connected => Colors.green.shade50,
+      OpenRemoteMqttStatus.failed => colorScheme.errorContainer,
+      OpenRemoteMqttStatus.connecting => colorScheme.secondaryContainer,
+      OpenRemoteMqttStatus.disconnected => colorScheme.surfaceContainerHighest,
+    };
+
+    final foregroundColor = switch (status) {
+      OpenRemoteMqttStatus.connected => Colors.green.shade900,
+      OpenRemoteMqttStatus.failed => colorScheme.onErrorContainer,
+      OpenRemoteMqttStatus.connecting => colorScheme.onSecondaryContainer,
+      OpenRemoteMqttStatus.disconnected => colorScheme.onSurfaceVariant,
+    };
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      child: Material(
+        color: backgroundColor,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: canTap ? _connectOpenRemote : null,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Row(
+              children: [
+                Image.asset(
+                  'assets/images/openremote_logo.png',
+                  width: 36,
+                  height: 36,
+                  fit: BoxFit.contain,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    text,
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          color: foregroundColor,
+                        ),
+                  ),
+                ),
+                if (status == OpenRemoteMqttStatus.connecting)
+                  SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: foregroundColor,
+                    ),
+                  )
+                else if (status == OpenRemoteMqttStatus.connected)
+                  Icon(Icons.check_circle, color: foregroundColor)
+                else
+                  Icon(Icons.chevron_right, color: foregroundColor),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
