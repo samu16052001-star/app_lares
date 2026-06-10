@@ -4,8 +4,6 @@ import 'dart:io';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:uuid/uuid.dart';
 
 enum OpenRemoteMqttStatus {
   disconnected,
@@ -364,7 +362,6 @@ class _OpenRemoteMqttConfig {
     final password = _required('OR_PASSWORD');
     final assetId = _required('OR_ASSET_ID');
     final attribute = _required('OR_ATTRIBUTE');
-    final installationId = await _installationId();
 
     return _OpenRemoteMqttConfig(
       host: host,
@@ -372,7 +369,7 @@ class _OpenRemoteMqttConfig {
       useTls: useTls,
       tlsInsecure: tlsInsecure,
       realm: realm,
-      clientId: '$clientPrefix-$installationId',
+      clientId: clientPrefix,
       username: '$realm:$rawUsername',
       password: password,
       assetId: assetId,
@@ -441,16 +438,4 @@ class _OpenRemoteMqttConfig {
     return value?.trim().toLowerCase() == 'true';
   }
 
-  static Future<String> _installationId() async {
-    const key = 'openremote_installation_id';
-    final prefs = await SharedPreferences.getInstance();
-    final existing = prefs.getString(key);
-    if (existing != null && existing.isNotEmpty) {
-      return existing;
-    }
-
-    final generated = const Uuid().v4();
-    await prefs.setString(key, generated);
-    return generated;
-  }
 }
