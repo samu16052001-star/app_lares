@@ -261,12 +261,16 @@ class BluetoothScanningPage extends StatefulWidget {
 
 class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   final Map<String, ScanResult> _scanResults = {};
+  final Map<String, int> _discoveryOrder = {};
   final Set<String> _connectingDeviceIds = {};
   final Set<String> _connectedDeviceIds = {};
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<bool>? _isScanningSubscription;
 
+  int _nextDiscoveryIndex = 0;
   bool _isScanning = false;
+  bool _showOnlyLaresDevices = false;
+  bool _sortBySignalStrength = false;
   String? _statusMessage;
 
   @override
@@ -298,6 +302,8 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   Future<void> _startScan() async {
     setState(() {
       _scanResults.clear();
+      _discoveryOrder.clear();
+      _nextDiscoveryIndex = 0;
       _statusMessage = null;
     });
 
@@ -338,7 +344,9 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
         setState(() {
           for (final result in results) {
-            _scanResults[_deviceId(result.device)] = result;
+            final id = _deviceId(result.device);
+            _discoveryOrder.putIfAbsent(id, () => _nextDiscoveryIndex++);
+            _scanResults[id] = result;
           }
         });
       },
@@ -501,10 +509,96 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     return platformName.isEmpty ? 'Unknown device' : platformName;
   }
 
+  String _visibleDeviceName(BluetoothDevice device) {
+    return device.platformName.trim();
+  }
+
+  List<ScanResult> _displayDevices() {
+    var devices = _scanResults.values.toList();
+
+    if (_showOnlyLaresDevices) {
+      devices = devices.where((result) {
+        final name = _visibleDeviceName(result.device);
+        return name.isNotEmpty && name.toLowerCase().contains('lares');
+      }).toList();
+    }
+
+    if (_sortBySignalStrength) {
+      devices.sort((a, b) {
+        final signalComparison = b.rssi.compareTo(a.rssi);
+        if (signalComparison != 0) {
+          return signalComparison;
+        }
+
+        final aOrder = _discoveryOrder[_deviceId(a.device)] ?? 0;
+        final bOrder = _discoveryOrder[_deviceId(b.device)] ?? 0;
+        return aOrder.compareTo(bOrder);
+      });
+      return devices;
+    }
+
+    devices.sort(
+      (a, b) => _deviceName(a.device).compareTo(_deviceName(b.device)),
+    );
+    return devices;
+  }
+
+  void _toggleLaresFilter() {
+    setState(() {
+      _showOnlyLaresDevices = !_showOnlyLaresDevices;
+    });
+  }
+
+  void _toggleSignalSort() {
+    setState(() {
+      _sortBySignalStrength = !_sortBySignalStrength;
+    });
+  }
+
+  Widget _buildScanOptionButtons(BuildContext context) {
+    return Wrap(
+      spacing: 12,
+      runSpacing: 8,
+      children: [
+        _buildScanOptionButton(
+          context,
+          label: 'LARES Devices',
+          selected: _showOnlyLaresDevices,
+          onPressed: _toggleLaresFilter,
+        ),
+        _buildScanOptionButton(
+          context,
+          label: 'Strongest Signal',
+          selected: _sortBySignalStrength,
+          onPressed: _toggleSignalSort,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildScanOptionButton(
+    BuildContext context, {
+    required String label,
+    required bool selected,
+    required VoidCallback onPressed,
+  }) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return ElevatedButton(
+      style: ElevatedButton.styleFrom(
+        backgroundColor:
+            selected ? colorScheme.primary : colorScheme.surfaceContainerHighest,
+        foregroundColor:
+            selected ? colorScheme.onPrimary : colorScheme.onSurfaceVariant,
+      ),
+      onPressed: onPressed,
+      child: Text(label),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final devices = _scanResults.values.toList()
-      ..sort((a, b) => _deviceName(a.device).compareTo(_deviceName(b.device)));
+    final devices = _displayDevices();
 
     return Scaffold(
       appBar: AppBar(
@@ -515,6 +609,8 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            _buildScanOptionButtons(context),
+            const SizedBox(height: 12),
             FilledButton.icon(
               icon: Icon(_isScanning ? Icons.bluetooth_searching : Icons.search),
               label: Text(_isScanning ? 'Scanning...' : 'Scan Bluetooth Devices'),
