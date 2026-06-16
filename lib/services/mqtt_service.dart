@@ -134,7 +134,7 @@ class OpenRemoteMqttService {
 
       if (config.useTls) {
         client.securityContext = SecurityContext.defaultContext;
-        client.onBadCertificate = (_) => config.tlsInsecure;
+        client.onBadCertificate = (Object certificate) => config.tlsInsecure;
       }
 
       client.connectionMessage = MqttConnectMessage()
@@ -277,7 +277,8 @@ class OpenRemoteMqttService {
     }
 
     if (text.contains('certificate') || text.contains('handshake')) {
-      return 'OpenRemote TLS verification failed.';
+      return text;
+      //return 'OpenRemote TLS verification failed.';
     }
 
     if (text.contains('timed out') || text.contains('timeout')) {
