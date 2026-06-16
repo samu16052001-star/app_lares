@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:app_lares/ble_configuration_service.dart';
+import 'package:app_lares/services/acquisition_csv_logger.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -894,6 +895,7 @@ class _AcquisitionInitializationPageState
     extends State<AcquisitionInitializationPage> {
   late final BleConfigurationService _service;
   late final OpenRemoteMqttService _mqttService;
+  late final AcquisitionCsvLogger _csvLogger;
 
   final List<BleNotificationMessage> _messages = [];
   StreamSubscription<BleNotificationMessage>? _messagesSubscription;
@@ -902,8 +904,12 @@ class _AcquisitionInitializationPageState
 
   bool _isInitializing = true;
   bool _initializationStarted = false;
+  bool _acquisitionStarted = false;
+  bool _acquisitionStopped = false;
+  bool _isStoppingAcquisition = false;
   String? _errorMessage;
   bool _canRetry = false;
+  bool _requiresReconnect = false;
   OpenRemoteMqttState _mqttState = const OpenRemoteMqttState(
     status: OpenRemoteMqttStatus.disconnected,
   );
@@ -913,26 +919,40 @@ class _AcquisitionInitializationPageState
     super.initState();
     _service = BleConfigurationService(widget.device);
     _mqttService = OpenRemoteMqttService();
+    _csvLogger = AcquisitionCsvLogger();
     _messagesSubscription = _service.messages.listen((message) {
-      if (!mounted) {
+      if (!mounted || _acquisitionStopped) {
         return;
       }
 
       setState(() {
         _messages.add(message);
       });
+      if (_acquisitionStarted && _csvLogger.isStarted) {
+        unawaited(
+          _csvLogger.appendBleMessage(
+            receivedAt: message.receivedAt,
+            deviceName: _deviceName(widget.device),
+            value: message.value,
+          ),
+        );
+      }
       unawaited(_publishPm10IfConnected(message.value));
     });
     _connectionSubscription = _service.connectionState.listen((state) {
-      if (!mounted || state != BluetoothConnectionState.disconnected) {
+      if (!mounted ||
+          _acquisitionStopped ||
+          state != BluetoothConnectionState.disconnected) {
         return;
       }
 
       setState(() {
         _isInitializing = false;
         _errorMessage = 'BLE device disconnected.';
-        _canRetry = false;
+        _canRetry = true;
+        _requiresReconnect = true;
       });
+      _initializationStarted = false;
     });
     _mqttStateSubscription = _mqttService.states.listen((state) {
       if (!mounted) {
@@ -959,6 +979,7 @@ class _AcquisitionInitializationPageState
     unawaited(_messagesSubscription?.cancel());
     unawaited(_connectionSubscription?.cancel());
     unawaited(_mqttStateSubscription?.cancel());
+    unawaited(_csvLogger.stop());
     unawaited(_mqttService.dispose());
     unawaited(_service.dispose());
     super.dispose();
@@ -976,18 +997,25 @@ class _AcquisitionInitializationPageState
         _isInitializing = true;
         _errorMessage = null;
         _canRetry = false;
-        _messages.clear();
+        _requiresReconnect = false;
+        if (!_acquisitionStarted) {
+          _messages.clear();
+        }
       });
     }
 
     try {
       await _service.initialize(widget.configuration);
+      if (!_csvLogger.isStarted) {
+        await _csvLogger.start();
+      }
       if (!mounted) {
         return;
       }
 
       setState(() {
         _isInitializing = false;
+        _acquisitionStarted = true;
       });
     } catch (error) {
       if (!mounted) {
@@ -998,17 +1026,52 @@ class _AcquisitionInitializationPageState
         _isInitializing = false;
         _errorMessage = error.toString();
         _canRetry = error is BleConfigurationException && error.canRetry;
+        _requiresReconnect = false;
       });
     }
   }
 
-  void _retryInitialization() {
+  Future<void> _retryInitialization() async {
     if (_isInitializing) {
       return;
     }
 
     _initializationStarted = false;
-    _startInitialization();
+    await _startInitialization();
+  }
+
+  Future<void> _reconnectAndRestartInitialization() async {
+    if (_isInitializing) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isInitializing = true;
+        _errorMessage = null;
+        _canRetry = false;
+      });
+    }
+
+    try {
+      await widget.device.connect(
+        license: License.nonprofit,
+        timeout: const Duration(seconds: 12),
+      );
+      _initializationStarted = false;
+      await _startInitialization();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isInitializing = false;
+        _errorMessage = 'Could not reconnect to ${_deviceName(widget.device)}: $error';
+        _canRetry = true;
+        _requiresReconnect = true;
+      });
+    }
   }
 
   Future<void> _connectOpenRemote() async {
@@ -1061,6 +1124,50 @@ class _AcquisitionInitializationPageState
     return value.toString();
   }
 
+  String _deviceName(BluetoothDevice device) {
+    final platformName = device.platformName.trim();
+    return platformName.isEmpty ? 'Unknown device' : platformName;
+  }
+
+  Future<void> _stopAcquisition() async {
+    if (_isStoppingAcquisition || _acquisitionStopped) {
+      return;
+    }
+
+    setState(() {
+      _isStoppingAcquisition = true;
+      _acquisitionStopped = true;
+    });
+
+    try {
+      await _messagesSubscription?.cancel();
+      _messagesSubscription = null;
+      await _csvLogger.stop();
+
+      if (!mounted) {
+        return;
+      }
+
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => AcquisitionCompletedPage(csvLogger: _csvLogger),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _acquisitionStopped = false;
+        _isStoppingAcquisition = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not stop acquisition')),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final title = _isInitializing || _errorMessage != null
@@ -1108,8 +1215,10 @@ class _AcquisitionInitializationPageState
               if (_canRetry) ...[
                 const SizedBox(height: 16),
                 FilledButton(
-                  onPressed: _retryInitialization,
-                  child: const Text('Retry'),
+                  onPressed: _requiresReconnect
+                      ? _reconnectAndRestartInitialization
+                      : _retryInitialization,
+                  child: Text(_requiresReconnect ? 'Reconnect' : 'Retry'),
                 ),
               ],
             ],
@@ -1123,8 +1232,27 @@ class _AcquisitionInitializationPageState
         Expanded(
           child: _buildMessagesLog(),
         ),
+        _buildStopAcquisitionButton(),
         _buildOpenRemoteBanner(context),
       ],
+    );
+  }
+
+  Widget _buildStopAcquisitionButton() {
+    return SafeArea(
+      top: false,
+      bottom: false,
+      minimum: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      child: SizedBox(
+        width: double.infinity,
+        height: 48,
+        child: FilledButton(
+          onPressed: _isStoppingAcquisition ? null : _stopAcquisition,
+          child: Text(
+            _isStoppingAcquisition ? 'Stopping...' : 'Stop acquisition',
+          ),
+        ),
+      ),
     );
   }
 
@@ -1237,6 +1365,88 @@ class _AcquisitionInitializationPageState
                 else
                   Icon(Icons.chevron_right, color: foregroundColor),
               ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class AcquisitionCompletedPage extends StatelessWidget {
+  const AcquisitionCompletedPage({
+    super.key,
+    required this.csvLogger,
+  });
+
+  final AcquisitionCsvLogger csvLogger;
+
+  Future<void> _downloadData(BuildContext context) async {
+    try {
+      await csvLogger.exportToDownloadsOrShare();
+      if (!context.mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('CSV file saved successfully')),
+      );
+    } catch (_) {
+      if (!context.mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not save CSV file')),
+      );
+    }
+  }
+
+  void _goHome(BuildContext context) {
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute<void>(
+        builder: (_) => const SectionPage(
+          sectionName: 'user',
+          message: 'Welcome to the user section!',
+        ),
+      ),
+      (_) => false,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Acquisition completed'),
+          automaticallyImplyLeading: false,
+        ),
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 360),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    FilledButton.icon(
+                      icon: const Icon(Icons.download),
+                      label: const Text('Download data'),
+                      onPressed: () => unawaited(_downloadData(context)),
+                    ),
+                    const SizedBox(height: 24),
+                    IconButton(
+                      icon: const Icon(Icons.home),
+                      iconSize: 40,
+                      onPressed: () => _goHome(context),
+                    ),
+                  ],
+                ),
+              ),
             ),
           ),
         ),
