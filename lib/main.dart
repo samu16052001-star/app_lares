@@ -610,13 +610,13 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _buildScanOptionButtons(context),
-            const SizedBox(height: 12),
             FilledButton.icon(
               icon: Icon(_isScanning ? Icons.bluetooth_searching : Icons.search),
               label: Text(_isScanning ? 'Scanning...' : 'Scan Bluetooth Devices'),
               onPressed: _isScanning ? null : _startScan,
             ),
+            const SizedBox(height: 12),
+            _buildScanOptionButtons(context),
             if (_statusMessage != null) ...[
               const SizedBox(height: 12),
               Text(
