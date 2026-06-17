@@ -4,11 +4,104 @@ import 'dart:io';
 import 'package:share_plus/share_plus.dart';
 
 class AcquisitionCsvLogger {
+  static final RegExp _counterPattern = RegExp(r'^\d+$');
+  static const List<_CsvSensorField> _sensorFields = [
+    _CsvSensorField(
+      prefix: 'CO2',
+      label: 'CO2',
+      unit: 'ppm',
+    ),
+    _CsvSensorField(
+      prefix: 'TEM1',
+      label: 'Internal Temperature',
+      unit: '°C',
+    ),
+    _CsvSensorField(
+      prefix: 'HUM1',
+      label: 'Internal Humidity',
+      unit: '%',
+    ),
+    _CsvSensorField(
+      prefix: 'VOC',
+      label: 'VOC',
+    ),
+    _CsvSensorField(
+      prefix: 'NOX',
+      label: 'NOX',
+    ),
+    _CsvSensorField(
+      prefix: 'VOCi',
+      label: 'VOC Index',
+    ),
+    _CsvSensorField(
+      prefix: 'NOXi',
+      label: 'NOX Index',
+    ),
+    _CsvSensorField(
+      prefix: 'NH3',
+      label: 'NH3',
+      unit: 'ppm',
+    ),
+    _CsvSensorField(
+      prefix: 'CO',
+      label: 'CO',
+      unit: 'ppm',
+    ),
+    _CsvSensorField(
+      prefix: 'Batt',
+      label: 'Battery Level',
+      unit: '%',
+    ),
+    _CsvSensorField(
+      prefix: 'NO2',
+      label: 'NO2',
+      unit: 'ppb',
+    ),
+    _CsvSensorField(
+      prefix: 'PM1.0',
+      label: 'PM1.0',
+      unit: 'ug/m3',
+    ),
+    _CsvSensorField(
+      prefix: 'PM2.5',
+      label: 'PM2.5',
+      unit: 'ug/m3',
+    ),
+    _CsvSensorField(
+      prefix: 'PM10',
+      label: 'PM10',
+      unit: 'ug/m3',
+    ),
+    _CsvSensorField(
+      prefix: 'TEM2',
+      label: 'External Temperature',
+      unit: '°C',
+    ),
+    _CsvSensorField(
+      prefix: 'HUM2',
+      label: 'External Humidity',
+      unit: '%',
+    ),
+    _CsvSensorField(
+      prefix: 'PRE',
+      label: 'Atmospheric Pressure',
+      unit: 'Pa',
+    ),
+  ];
+
+  static final Map<String, _CsvSensorField> _sensorFieldsByPrefix = {
+    for (final field in _sensorFields) field.prefix: field,
+  };
+
   File? _file;
   IOSink? _sink;
   String? _fileName;
   bool _isStarted = false;
   bool _isStopped = false;
+  int? _currentClusterCounter;
+  DateTime? _currentClusterReceivedAt;
+  String? _currentClusterDeviceName;
+  final Map<String, String> _currentClusterValues = {};
 
   String? get fileName => _fileName;
 
@@ -37,6 +130,7 @@ class AcquisitionCsvLogger {
     _sink = sink;
     _isStarted = true;
     _isStopped = false;
+    _clearCurrentCluster();
   }
 
   Future<void> appendBleMessage({
@@ -49,14 +143,17 @@ class AcquisitionCsvLogger {
       return;
     }
 
-    final row = [
-      _escapeCsvField(_formatUtcTimestamp(receivedAt)),
-      _escapeCsvField(deviceName),
-      _escapeCsvField(value),
-    ].join(';');
+    final trimmedValue = value.trim();
+    if (_isCounterMessage(trimmedValue)) {
+      final counter = int.parse(trimmedValue);
+      if (counter >= 1) {
+        _handleCounter(counter, receivedAt, deviceName, sink);
+        await sink.flush();
+      }
+      return;
+    }
 
-    sink.writeln(row);
-    await sink.flush();
+    _handleDataMessage(trimmedValue);
   }
 
   Future<void> stop() async {
@@ -72,6 +169,7 @@ class AcquisitionCsvLogger {
       return;
     }
 
+    _flushCurrentClusterIfNeeded(sink);
     await sink.flush();
     await sink.close();
   }
@@ -114,12 +212,82 @@ class AcquisitionCsvLogger {
     }
   }
 
+  bool _isCounterMessage(String value) {
+    return _counterPattern.hasMatch(value);
+  }
+
+  void _handleCounter(
+    int counter,
+    DateTime receivedAt,
+    String deviceName,
+    IOSink sink,
+  ) {
+    _flushCurrentClusterIfNeeded(sink);
+    _currentClusterCounter = counter;
+    _currentClusterReceivedAt = receivedAt;
+    _currentClusterDeviceName = deviceName;
+    _currentClusterValues.clear();
+  }
+
+  void _handleDataMessage(String message) {
+    if (_currentClusterCounter == null) {
+      return;
+    }
+
+    final separatorIndex = message.indexOf(':');
+    if (separatorIndex <= 0) {
+      return;
+    }
+
+    final prefix = message.substring(0, separatorIndex);
+    if (!_sensorFieldsByPrefix.containsKey(prefix)) {
+      return;
+    }
+
+    _currentClusterValues[prefix] = message.substring(separatorIndex + 1).trim();
+  }
+
+  void _flushCurrentClusterIfNeeded(IOSink sink) {
+    if (_currentClusterCounter == null ||
+        _currentClusterReceivedAt == null ||
+        _currentClusterDeviceName == null) {
+      return;
+    }
+
+    sink.writeln(_buildClusterRow());
+    _clearCurrentCluster();
+  }
+
+  String _buildClusterRow() {
+    final receivedAt = _currentClusterReceivedAt!;
+    final deviceName = _currentClusterDeviceName!;
+
+    return [
+      _escapeCsvField(_formatUtcTimestamp(receivedAt)),
+      _escapeCsvField(deviceName),
+      _escapeCsvField(_buildDataReceivedString()),
+    ].join(';');
+  }
+
+  String _buildDataReceivedString() {
+    return _sensorFields.map((field) {
+      final value = _currentClusterValues[field.prefix] ?? 'NA';
+      return field.formatValue(value);
+    }).join(',');
+  }
+
+  void _clearCurrentCluster() {
+    _currentClusterCounter = null;
+    _currentClusterReceivedAt = null;
+    _currentClusterDeviceName = null;
+    _currentClusterValues.clear();
+  }
+
   String _escapeCsvField(String value) {
     final needsEscaping = value.contains(';') ||
         value.contains('"') ||
         value.contains('\n') ||
-        value.contains('\r') ||
-        value.contains(',');
+        value.contains('\r');
 
     if (!needsEscaping) {
       return value;
@@ -146,6 +314,23 @@ class AcquisitionCsvLogger {
     ].join('-');
 
     return '${date}_$time';
+  }
+}
+
+class _CsvSensorField {
+  const _CsvSensorField({
+    required this.prefix,
+    required this.label,
+    this.unit,
+  });
+
+  final String prefix;
+  final String label;
+  final String? unit;
+
+  String formatValue(String value) {
+    final suffix = unit == null ? '' : ' $unit';
+    return '$label:$value$suffix';
   }
 }
 
