@@ -263,7 +263,7 @@ class AcquisitionCsvLogger {
     final deviceName = _currentClusterDeviceName!;
 
     return [
-      _escapeCsvField(_formatUtcTimestamp(receivedAt)),
+      _escapeCsvField(_formatLocalTimestamp(receivedAt)),
       _escapeCsvField(deviceName),
       _escapeCsvField(_buildDataReceivedString()),
     ].join(';');
@@ -296,8 +296,8 @@ class AcquisitionCsvLogger {
     return '"${value.replaceAll('"', '""')}"';
   }
 
-  String _formatUtcTimestamp(DateTime value) {
-    return value.toUtc().toIso8601String();
+  String _formatLocalTimestamp(DateTime value) {
+    return value.toLocal().toIso8601String();
   }
 
   String _formatFileTimestamp(DateTime value) {
