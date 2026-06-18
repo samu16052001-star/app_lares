@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:app_lares/ble_configuration_service.dart';
 import 'package:app_lares/services/acquisition_csv_logger.dart';
+import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -896,6 +897,7 @@ class _AcquisitionInitializationPageState
   late final BleConfigurationService _service;
   late final OpenRemoteMqttService _mqttService;
   late final AcquisitionCsvLogger _csvLogger;
+  late final GpsLocationService _gpsLocationService;
 
   final List<BleNotificationMessage> _messages = [];
   StreamSubscription<BleNotificationMessage>? _messagesSubscription;
@@ -920,6 +922,7 @@ class _AcquisitionInitializationPageState
     _service = BleConfigurationService(widget.device);
     _mqttService = OpenRemoteMqttService();
     _csvLogger = AcquisitionCsvLogger();
+    _gpsLocationService = GpsLocationService();
     _messagesSubscription = _service.messages.listen((message) {
       if (!mounted || _acquisitionStopped) {
         return;
@@ -933,6 +936,7 @@ class _AcquisitionInitializationPageState
           _csvLogger.appendBleMessage(
             receivedAt: message.receivedAt,
             deviceName: _deviceName(widget.device),
+            gpsCoordinates: _gpsLocationService.currentCoordinates,
             value: message.value,
           ),
         );
@@ -980,6 +984,7 @@ class _AcquisitionInitializationPageState
     unawaited(_connectionSubscription?.cancel());
     unawaited(_mqttStateSubscription?.cancel());
     unawaited(_csvLogger.stop());
+    unawaited(_gpsLocationService.dispose());
     unawaited(_mqttService.dispose());
     unawaited(_service.dispose());
     super.dispose();
@@ -1008,6 +1013,7 @@ class _AcquisitionInitializationPageState
       await _service.initialize(widget.configuration);
       if (!_csvLogger.isStarted) {
         await _csvLogger.start();
+        unawaited(_gpsLocationService.start());
       }
       if (!mounted) {
         return;
@@ -1143,6 +1149,7 @@ class _AcquisitionInitializationPageState
       await _messagesSubscription?.cancel();
       _messagesSubscription = null;
       await _csvLogger.stop();
+      await _gpsLocationService.stop();
 
       if (!mounted) {
         return;

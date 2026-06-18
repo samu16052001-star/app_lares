@@ -50,7 +50,7 @@
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>This app uses Bluetooth to connect to RespirHò device.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Location is required to scan for nearby Bluetooth devices.</string>
+	<string>Location is used to scan for nearby Bluetooth devices and save GPS coordinates during acquisition.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

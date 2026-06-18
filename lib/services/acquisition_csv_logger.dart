@@ -101,6 +101,7 @@ class AcquisitionCsvLogger {
   int? _currentClusterCounter;
   DateTime? _currentClusterReceivedAt;
   String? _currentClusterDeviceName;
+  String? _currentClusterGpsCoordinates;
   final Map<String, String> _currentClusterValues = {};
 
   String? get fileName => _fileName;
@@ -123,7 +124,7 @@ class AcquisitionCsvLogger {
 
     await file.create(recursive: true);
     final sink = file.openWrite(mode: FileMode.writeOnly);
-    sink.writeln('TIMESTAMP;DEVICE_NAME;DATA_RECEIVED');
+    sink.writeln('TIMESTAMP;DEVICE_NAME;DATA_RECEIVED;GPS_COORDINATES');
     await sink.flush();
 
     _file = file;
@@ -136,6 +137,7 @@ class AcquisitionCsvLogger {
   Future<void> appendBleMessage({
     required DateTime receivedAt,
     required String deviceName,
+    required String gpsCoordinates,
     required String value,
   }) async {
     final sink = _sink;
@@ -147,7 +149,7 @@ class AcquisitionCsvLogger {
     if (_isCounterMessage(trimmedValue)) {
       final counter = int.parse(trimmedValue);
       if (counter >= 1) {
-        _handleCounter(counter, receivedAt, deviceName, sink);
+        _handleCounter(counter, receivedAt, deviceName, gpsCoordinates, sink);
         await sink.flush();
       }
       return;
@@ -220,12 +222,14 @@ class AcquisitionCsvLogger {
     int counter,
     DateTime receivedAt,
     String deviceName,
+    String gpsCoordinates,
     IOSink sink,
   ) {
     _flushCurrentClusterIfNeeded(sink);
     _currentClusterCounter = counter;
     _currentClusterReceivedAt = receivedAt;
     _currentClusterDeviceName = deviceName;
+    _currentClusterGpsCoordinates = gpsCoordinates;
     _currentClusterValues.clear();
   }
 
@@ -250,7 +254,8 @@ class AcquisitionCsvLogger {
   void _flushCurrentClusterIfNeeded(IOSink sink) {
     if (_currentClusterCounter == null ||
         _currentClusterReceivedAt == null ||
-        _currentClusterDeviceName == null) {
+        _currentClusterDeviceName == null ||
+        _currentClusterGpsCoordinates == null) {
       return;
     }
 
@@ -261,11 +266,13 @@ class AcquisitionCsvLogger {
   String _buildClusterRow() {
     final receivedAt = _currentClusterReceivedAt!;
     final deviceName = _currentClusterDeviceName!;
+    final gpsCoordinates = _currentClusterGpsCoordinates!;
 
     return [
       _escapeCsvField(_formatLocalTimestamp(receivedAt)),
       _escapeCsvField(deviceName),
       _escapeCsvField(_buildDataReceivedString()),
+      _escapeCsvField(gpsCoordinates),
     ].join(';');
   }
 
@@ -280,6 +287,7 @@ class AcquisitionCsvLogger {
     _currentClusterCounter = null;
     _currentClusterReceivedAt = null;
     _currentClusterDeviceName = null;
+    _currentClusterGpsCoordinates = null;
     _currentClusterValues.clear();
   }
 
