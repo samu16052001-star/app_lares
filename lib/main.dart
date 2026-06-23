@@ -686,7 +686,7 @@ class DeviceConfigurationPage extends StatefulWidget {
 }
 
 class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
-  static const List<String> _measurementOptions = [
+  static final List<String> _measurementOptions = [
     for (final definition in _measurementDefinitions) definition.label,
   ];
 
@@ -1534,7 +1534,9 @@ class _LiveMeasurementCard extends StatelessWidget {
               border: Border.all(color: borderColor, width: 1.2),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black.withOpacity(0.04 + highlight * 0.04),
+                  color: Colors.black.withValues(
+                    alpha: 0.04 + highlight * 0.04,
+                  ),
                   blurRadius: 10,
                   offset: const Offset(0, 4),
                 ),
