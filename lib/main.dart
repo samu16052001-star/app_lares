@@ -687,22 +687,7 @@ class DeviceConfigurationPage extends StatefulWidget {
 
 class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
   static const List<String> _measurementOptions = [
-    'CO2',
-    'CO',
-    'NH3',
-    'NO2',
-    'VOC',
-    'NOX',
-    'VOC Index',
-    'NOX Index',
-    'PM1.0',
-    'PM2.5',
-    'PM10',
-    'Internal Temperature',
-    'External Temperature',
-    'Internal Humidity',
-    'External Humidity',
-    'Atmospheric Pressure',
+    for (final definition in _measurementDefinitions) definition.label,
   ];
 
   final Map<String, bool> _options = {
@@ -877,6 +862,69 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
   }
 }
 
+const List<_MeasurementDefinition> _measurementDefinitions = [
+  _MeasurementDefinition(label: 'CO2', prefix: 'CO2', unit: 'ppm'),
+  _MeasurementDefinition(label: 'CO', prefix: 'CO', unit: 'ppm'),
+  _MeasurementDefinition(label: 'NH3', prefix: 'NH3', unit: 'ppm'),
+  _MeasurementDefinition(label: 'NO2', prefix: 'NO2', unit: 'ppb'),
+  _MeasurementDefinition(label: 'VOC', prefix: 'VOC', unit: 'raw'),
+  _MeasurementDefinition(label: 'NOX', prefix: 'NOX', unit: 'raw'),
+  _MeasurementDefinition(label: 'VOC Index', prefix: 'VOCi', unit: 'index'),
+  _MeasurementDefinition(label: 'NOX Index', prefix: 'NOXi', unit: 'index'),
+  _MeasurementDefinition(label: 'PM1.0', prefix: 'PM1.0', unit: 'µg/m³'),
+  _MeasurementDefinition(label: 'PM2.5', prefix: 'PM2.5', unit: 'µg/m³'),
+  _MeasurementDefinition(label: 'PM10', prefix: 'PM10', unit: 'µg/m³'),
+  _MeasurementDefinition(
+    label: 'Internal Temperature',
+    prefix: 'TEM1',
+    unit: '°C',
+  ),
+  _MeasurementDefinition(
+    label: 'External Temperature',
+    prefix: 'TEM2',
+    unit: '°C',
+  ),
+  _MeasurementDefinition(
+    label: 'Internal Humidity',
+    prefix: 'HUM1',
+    unit: '%RH',
+  ),
+  _MeasurementDefinition(
+    label: 'External Humidity',
+    prefix: 'HUM2',
+    unit: '%RH',
+  ),
+  _MeasurementDefinition(
+    label: 'Atmospheric Pressure',
+    prefix: 'PRE',
+    unit: 'Pa',
+  ),
+];
+
+class _MeasurementDefinition {
+  const _MeasurementDefinition({
+    required this.label,
+    required this.prefix,
+    required this.unit,
+  });
+
+  final String label;
+  final String prefix;
+  final String unit;
+}
+
+class _LiveMeasurementValue {
+  const _LiveMeasurementValue({
+    required this.formattedValue,
+    required this.updatedAt,
+    required this.updateCount,
+  });
+
+  final String formattedValue;
+  final DateTime updatedAt;
+  final int updateCount;
+}
+
 class AcquisitionInitializationPage extends StatefulWidget {
   const AcquisitionInitializationPage({
     super.key,
@@ -898,8 +946,11 @@ class _AcquisitionInitializationPageState
   late final OpenRemoteMqttService _mqttService;
   late final AcquisitionCsvLogger _csvLogger;
   late final GpsLocationService _gpsLocationService;
+  late final List<_MeasurementDefinition> _visibleMeasurements;
+  late final Map<String, _MeasurementDefinition> _visibleMeasurementsByPrefix;
 
   final List<BleNotificationMessage> _messages = [];
+  final Map<String, _LiveMeasurementValue> _liveMeasurementValues = {};
   StreamSubscription<BleNotificationMessage>? _messagesSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   StreamSubscription<OpenRemoteMqttState>? _mqttStateSubscription;
@@ -923,6 +974,16 @@ class _AcquisitionInitializationPageState
     _mqttService = OpenRemoteMqttService();
     _csvLogger = AcquisitionCsvLogger();
     _gpsLocationService = GpsLocationService();
+    _visibleMeasurements = _measurementDefinitions
+        .where(
+          (definition) =>
+              widget.configuration.enabledOptions[definition.label] ?? false,
+        )
+        .toList(growable: false);
+    _visibleMeasurementsByPrefix = {
+      for (final definition in _visibleMeasurements)
+        definition.prefix: definition,
+    };
     _messagesSubscription = _service.messages.listen((message) {
       if (!mounted || _acquisitionStopped) {
         return;
@@ -930,6 +991,7 @@ class _AcquisitionInitializationPageState
 
       setState(() {
         _messages.add(message);
+        _updateLiveMeasurement(message);
       });
       if (_acquisitionStarted && _csvLogger.isStarted) {
         unawaited(
@@ -1005,6 +1067,7 @@ class _AcquisitionInitializationPageState
         _requiresReconnect = false;
         if (!_acquisitionStarted) {
           _messages.clear();
+          _liveMeasurementValues.clear();
         }
       });
     }
@@ -1107,6 +1170,32 @@ class _AcquisitionInitializationPageState
     _appendLog('MQTT sent — PM10: ${_formatPm10(pm10)}');
   }
 
+  void _updateLiveMeasurement(BleNotificationMessage message) {
+    final separatorIndex = message.value.indexOf(':');
+    if (separatorIndex <= 0) {
+      return;
+    }
+
+    final prefix = message.value.substring(0, separatorIndex);
+    final definition = _visibleMeasurementsByPrefix[prefix];
+    if (definition == null) {
+      return;
+    }
+
+    final rawValue = message.value.substring(separatorIndex + 1);
+    final parsedValue = double.tryParse(rawValue);
+    if (parsedValue == null) {
+      return;
+    }
+
+    final previous = _liveMeasurementValues[definition.prefix];
+    _liveMeasurementValues[definition.prefix] = _LiveMeasurementValue(
+      formattedValue: parsedValue.toStringAsFixed(1),
+      updatedAt: message.receivedAt,
+      updateCount: (previous?.updateCount ?? 0) + 1,
+    );
+  }
+
   void _appendLog(String value) {
     if (!mounted) {
       return;
@@ -1128,6 +1217,14 @@ class _AcquisitionInitializationPageState
     }
 
     return value.toString();
+  }
+
+  String _formatDashboardTime(DateTime value) {
+    final local = value.toLocal();
+    final hour = local.hour.toString().padLeft(2, '0');
+    final minute = local.minute.toString().padLeft(2, '0');
+    final second = local.second.toString().padLeft(2, '0');
+    return '$hour:$minute:$second';
   }
 
   String _deviceName(BluetoothDevice device) {
@@ -1237,7 +1334,7 @@ class _AcquisitionInitializationPageState
     return Column(
       children: [
         Expanded(
-          child: _buildMessagesLog(),
+          child: _buildLiveMeasurementsGrid(),
         ),
         _buildStopAcquisitionButton(),
         _buildOpenRemoteBanner(context),
@@ -1263,27 +1360,38 @@ class _AcquisitionInitializationPageState
     );
   }
 
-  Widget _buildMessagesLog() {
-    if (_messages.isEmpty) {
+  Widget _buildLiveMeasurementsGrid() {
+    if (_visibleMeasurements.isEmpty) {
       return const Center(
         child: Padding(
           padding: EdgeInsets.all(24),
           child: Text(
-            'Waiting for BLE notifications...',
+            'No measurements selected.',
             textAlign: TextAlign.center,
           ),
         ),
       );
     }
 
-    return ListView.separated(
+    return GridView.builder(
       padding: const EdgeInsets.all(16),
-      itemCount: _messages.length,
-      separatorBuilder: (_, _) => const Divider(height: 1),
+      itemCount: _visibleMeasurements.length,
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 2,
+        crossAxisSpacing: 12,
+        mainAxisSpacing: 12,
+        childAspectRatio: 0.9,
+      ),
       itemBuilder: (context, index) {
-        return ListTile(
-          contentPadding: EdgeInsets.zero,
-          title: Text(_messages[index].displayText),
+        final definition = _visibleMeasurements[index];
+        final value = _liveMeasurementValues[definition.prefix];
+
+        return _LiveMeasurementCard(
+          definition: definition,
+          value: value,
+          updatedAtText: value == null
+              ? 'No data received yet'
+              : _formatDashboardTime(value.updatedAt),
         );
       },
     );
@@ -1376,6 +1484,107 @@ class _AcquisitionInitializationPageState
           ),
         ),
       ),
+    );
+  }
+}
+
+class _LiveMeasurementCard extends StatelessWidget {
+  const _LiveMeasurementCard({
+    required this.definition,
+    required this.value,
+    required this.updatedAtText,
+  });
+
+  final _MeasurementDefinition definition;
+  final _LiveMeasurementValue? value;
+  final String updatedAtText;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final updateCount = value?.updateCount ?? 0;
+    final valueText = value == null
+        ? '—'
+        : '${value!.formattedValue} ${definition.unit}';
+
+    return TweenAnimationBuilder<double>(
+      key: ValueKey('${definition.prefix}-$updateCount'),
+      tween: Tween<double>(begin: updateCount == 0 ? 0 : 1, end: 0),
+      duration: const Duration(milliseconds: 420),
+      curve: Curves.easeOutCubic,
+      builder: (context, highlight, child) {
+        final backgroundColor = Color.lerp(
+          colorScheme.surface,
+          colorScheme.primaryContainer,
+          highlight * 0.55,
+        )!;
+        final borderColor = Color.lerp(
+          colorScheme.outlineVariant,
+          colorScheme.primary,
+          highlight,
+        )!;
+
+        return Transform.scale(
+          scale: 1 + (highlight * 0.025),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: backgroundColor,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: borderColor, width: 1.2),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.04 + highlight * 0.04),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    definition.label,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const Spacer(),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FittedBox(
+                      alignment: Alignment.centerLeft,
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        valueText,
+                        maxLines: 1,
+                        style: theme.textTheme.headlineSmall?.copyWith(
+                          color: colorScheme.onSurface,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    'Last update: $updatedAtText',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
