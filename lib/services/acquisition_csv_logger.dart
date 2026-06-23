@@ -117,7 +117,7 @@ class AcquisitionCsvLogger {
       return;
     }
 
-    final now = DateTime.now().toUtc();
+    final now = DateTime.now();
     _fileName = 'Acquisition_data_${_formatFileTimestamp(now)}.csv';
     final path = '${Directory.systemTemp.path}${Platform.pathSeparator}$_fileName';
     final file = File(path);
@@ -309,16 +309,16 @@ class AcquisitionCsvLogger {
   }
 
   String _formatFileTimestamp(DateTime value) {
-    final utc = value.toUtc();
+    final local = value.toLocal();
     final date = [
-      utc.year.toString().padLeft(4, '0'),
-      utc.month.toString().padLeft(2, '0'),
-      utc.day.toString().padLeft(2, '0'),
+      local.year.toString().padLeft(4, '0'),
+      local.month.toString().padLeft(2, '0'),
+      local.day.toString().padLeft(2, '0'),
     ].join('-');
     final time = [
-      utc.hour.toString().padLeft(2, '0'),
-      utc.minute.toString().padLeft(2, '0'),
-      utc.second.toString().padLeft(2, '0'),
+      local.hour.toString().padLeft(2, '0'),
+      local.minute.toString().padLeft(2, '0'),
+      local.second.toString().padLeft(2, '0'),
     ].join('-');
 
     return '${date}_$time';
