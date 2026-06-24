@@ -1204,7 +1204,7 @@ class _AcquisitionInitializationPageState
 
     final rawValue = message.value.substring(separatorIndex + 1);
     final parsedValue = double.tryParse(rawValue);
-    if (parsedValue == null || !parsedValue.isFinite) {
+    if (parsedValue == null) {
       return;
     }
 
