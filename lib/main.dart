@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:app_lares/ble_configuration_service.dart';
 import 'package:app_lares/services/acquisition_csv_logger.dart';
 import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
+import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -925,6 +927,21 @@ class _LiveMeasurementValue {
   final int updateCount;
 }
 
+class _MeasurementChartSample {
+  const _MeasurementChartSample({
+    required this.receivedAt,
+    required this.value,
+  });
+
+  final DateTime receivedAt;
+  final double value;
+}
+
+enum _LiveVisualizationMode {
+  cards,
+  charts,
+}
+
 class AcquisitionInitializationPage extends StatefulWidget {
   const AcquisitionInitializationPage({
     super.key,
@@ -951,6 +968,7 @@ class _AcquisitionInitializationPageState
 
   final List<BleNotificationMessage> _messages = [];
   final Map<String, _LiveMeasurementValue> _liveMeasurementValues = {};
+  final Map<String, List<_MeasurementChartSample>> _chartSamplesByPrefix = {};
   StreamSubscription<BleNotificationMessage>? _messagesSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   StreamSubscription<OpenRemoteMqttState>? _mqttStateSubscription;
@@ -963,6 +981,7 @@ class _AcquisitionInitializationPageState
   String? _errorMessage;
   bool _canRetry = false;
   bool _requiresReconnect = false;
+  _LiveVisualizationMode _visualizationMode = _LiveVisualizationMode.cards;
   OpenRemoteMqttState _mqttState = const OpenRemoteMqttState(
     status: OpenRemoteMqttStatus.disconnected,
   );
@@ -1068,6 +1087,7 @@ class _AcquisitionInitializationPageState
         if (!_acquisitionStarted) {
           _messages.clear();
           _liveMeasurementValues.clear();
+          _chartSamplesByPrefix.clear();
         }
       });
     }
@@ -1184,7 +1204,7 @@ class _AcquisitionInitializationPageState
 
     final rawValue = message.value.substring(separatorIndex + 1);
     final parsedValue = double.tryParse(rawValue);
-    if (parsedValue == null) {
+    if (parsedValue == null || !parsedValue.isFinite) {
       return;
     }
 
@@ -1194,6 +1214,20 @@ class _AcquisitionInitializationPageState
       updatedAt: message.receivedAt,
       updateCount: (previous?.updateCount ?? 0) + 1,
     );
+
+    final samples = _chartSamplesByPrefix.putIfAbsent(
+      definition.prefix,
+      () => [],
+    );
+    samples.add(
+      _MeasurementChartSample(
+        receivedAt: message.receivedAt,
+        value: parsedValue,
+      ),
+    );
+    if (samples.length > 100) {
+      samples.removeRange(0, samples.length - 100);
+    }
   }
 
   void _appendLog(String value) {
@@ -1333,13 +1367,51 @@ class _AcquisitionInitializationPageState
 
     return Column(
       children: [
+        _buildVisualizationModeSelector(),
         Expanded(
-          child: _buildLiveMeasurementsGrid(),
+          child: _buildLiveVisualization(),
         ),
         _buildStopAcquisitionButton(),
         _buildOpenRemoteBanner(context),
       ],
     );
+  }
+
+  Widget _buildVisualizationModeSelector() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      child: Align(
+        alignment: Alignment.centerRight,
+        child: SegmentedButton<_LiveVisualizationMode>(
+          showSelectedIcon: false,
+          segments: const [
+            ButtonSegment<_LiveVisualizationMode>(
+              value: _LiveVisualizationMode.cards,
+              icon: _CardsModeIcon(),
+              tooltip: 'Measurement cards',
+            ),
+            ButtonSegment<_LiveVisualizationMode>(
+              value: _LiveVisualizationMode.charts,
+              icon: _ChartModeIcon(),
+              tooltip: 'Line charts',
+            ),
+          ],
+          selected: {_visualizationMode},
+          onSelectionChanged: (selection) {
+            setState(() {
+              _visualizationMode = selection.first;
+            });
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLiveVisualization() {
+    return switch (_visualizationMode) {
+      _LiveVisualizationMode.cards => _buildLiveMeasurementsGrid(),
+      _LiveVisualizationMode.charts => _buildLiveMeasurementsCharts(),
+    };
   }
 
   Widget _buildStopAcquisitionButton() {
@@ -1392,6 +1464,38 @@ class _AcquisitionInitializationPageState
           updatedAtText: value == null
               ? 'No data received yet'
               : _formatDashboardTime(value.updatedAt),
+        );
+      },
+    );
+  }
+
+  Widget _buildLiveMeasurementsCharts() {
+    if (_visibleMeasurements.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text(
+            'No measurements selected.',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    }
+
+    return ListView.separated(
+      padding: const EdgeInsets.all(16),
+      itemCount: _visibleMeasurements.length,
+      separatorBuilder: (_, _) => const SizedBox(height: 12),
+      itemBuilder: (context, index) {
+        final definition = _visibleMeasurements[index];
+        final samples = _chartSamplesByPrefix[definition.prefix] ?? const [];
+        final value = _liveMeasurementValues[definition.prefix];
+
+        return _LiveMeasurementChartCard(
+          definition: definition,
+          samples: samples,
+          currentValue: value,
+          formatTime: _formatDashboardTime,
         );
       },
     );
@@ -1588,6 +1692,366 @@ class _LiveMeasurementCard extends StatelessWidget {
         );
       },
     );
+  }
+}
+
+class _LiveMeasurementChartCard extends StatelessWidget {
+  const _LiveMeasurementChartCard({
+    required this.definition,
+    required this.samples,
+    required this.currentValue,
+    required this.formatTime,
+  });
+
+  final _MeasurementDefinition definition;
+  final List<_MeasurementChartSample> samples;
+  final _LiveMeasurementValue? currentValue;
+  final String Function(DateTime value) formatTime;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final currentValueText = currentValue == null
+        ? '—'
+        : '${currentValue!.formattedValue} ${definition.unit}';
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colorScheme.surface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: colorScheme.outlineVariant),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.04),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    definition.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  definition.unit,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 180,
+              child: samples.isEmpty
+                  ? _buildEmptyChartPlaceholder(context)
+                  : _buildChart(context, currentValueText),
+            ),
+            const SizedBox(height: 8),
+            if (samples.isEmpty)
+              Text(
+                'No data received yet',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              )
+            else
+              Row(
+                children: [
+                  Text(
+                    formatTime(samples.first.receivedAt),
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    formatTime(samples.last.receivedAt),
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyChartPlaceholder(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      child: Center(
+        child: Text(
+          'No data received yet',
+          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildChart(BuildContext context, String currentValueText) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final theme = Theme.of(context);
+    final firstSampleTime = samples.first.receivedAt;
+    final spots = samples.map((sample) {
+      final seconds = sample.receivedAt
+              .difference(firstSampleTime)
+              .inMilliseconds /
+          1000;
+      return FlSpot(seconds, sample.value);
+    }).toList(growable: false);
+
+    var minY = samples.first.value;
+    var maxY = samples.first.value;
+    for (final sample in samples.skip(1)) {
+      minY = math.min(minY, sample.value);
+      maxY = math.max(maxY, sample.value);
+    }
+
+    final yRange = maxY - minY;
+    final yPadding = yRange == 0
+        ? math.max(1.0, maxY.abs() * 0.1)
+        : yRange * 0.12;
+    final maxX = math.max(1.0, spots.last.x);
+
+    return Stack(
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(top: 6, right: 4),
+          child: LineChart(
+            LineChartData(
+              minX: 0,
+              maxX: maxX,
+              minY: minY - yPadding,
+              maxY: maxY + yPadding,
+              gridData: FlGridData(
+                show: true,
+                drawVerticalLine: false,
+                getDrawingHorizontalLine: (_) => FlLine(
+                  color: colorScheme.outlineVariant.withValues(alpha: 0.7),
+                  strokeWidth: 0.8,
+                ),
+              ),
+              titlesData: FlTitlesData(
+                leftTitles: AxisTitles(
+                  axisNameSize: 24,
+                  axisNameWidget: Text(
+                    definition.unit,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  sideTitles: const SideTitles(showTitles: false),
+                ),
+                topTitles: const AxisTitles(
+                  sideTitles: SideTitles(showTitles: false),
+                ),
+                rightTitles: const AxisTitles(
+                  sideTitles: SideTitles(showTitles: false),
+                ),
+                bottomTitles: const AxisTitles(
+                  sideTitles: SideTitles(showTitles: false),
+                ),
+              ),
+              borderData: FlBorderData(
+                show: true,
+                border: Border(
+                  left: BorderSide(color: colorScheme.outlineVariant),
+                  bottom: BorderSide(color: colorScheme.outlineVariant),
+                  right: BorderSide(
+                    color: colorScheme.outlineVariant.withValues(alpha: 0.35),
+                  ),
+                  top: BorderSide(
+                    color: colorScheme.outlineVariant.withValues(alpha: 0.35),
+                  ),
+                ),
+              ),
+              lineTouchData: const LineTouchData(enabled: false),
+              lineBarsData: [
+                LineChartBarData(
+                  spots: spots,
+                  isCurved: false,
+                  color: colorScheme.primary,
+                  barWidth: 2.4,
+                  dotData: FlDotData(show: samples.length == 1),
+                  belowBarData: BarAreaData(
+                    show: true,
+                    color: colorScheme.primary.withValues(alpha: 0.08),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        Positioned(
+          top: 10,
+          right: 12,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: colorScheme.surface.withValues(alpha: 0.92),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: colorScheme.outlineVariant),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 160),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    currentValueText,
+                    maxLines: 1,
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      color: colorScheme.onSurface,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _CardsModeIcon extends StatelessWidget {
+  const _CardsModeIcon();
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.square(
+      dimension: 22,
+      child: CustomPaint(
+        painter: _CardsModeIconPainter(
+          color: IconTheme.of(context).color ??
+              Theme.of(context).colorScheme.onSurface,
+        ),
+      ),
+    );
+  }
+}
+
+class _CardsModeIconPainter extends CustomPainter {
+  const _CardsModeIconPainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.8;
+    final gap = size.width * 0.16;
+    final squareSize = (size.width - gap) / 2;
+    final radius = Radius.circular(size.width * 0.12);
+
+    for (final offset in [
+      Offset.zero,
+      Offset(squareSize + gap, 0),
+      Offset(0, squareSize + gap),
+      Offset(squareSize + gap, squareSize + gap),
+    ]) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          offset & Size(squareSize, squareSize),
+          radius,
+        ),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _CardsModeIconPainter oldDelegate) {
+    return oldDelegate.color != color;
+  }
+}
+
+class _ChartModeIcon extends StatelessWidget {
+  const _ChartModeIcon();
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.square(
+      dimension: 22,
+      child: CustomPaint(
+        painter: _ChartModeIconPainter(
+          color: IconTheme.of(context).color ??
+              Theme.of(context).colorScheme.onSurface,
+        ),
+      ),
+    );
+  }
+}
+
+class _ChartModeIconPainter extends CustomPainter {
+  const _ChartModeIconPainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final axisPaint = Paint()
+      ..color = color.withValues(alpha: 0.55)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.4
+      ..strokeCap = StrokeCap.round;
+    final linePaint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final left = size.width * 0.16;
+    final bottom = size.height * 0.82;
+    final right = size.width * 0.9;
+    final top = size.height * 0.16;
+
+    canvas.drawLine(Offset(left, top), Offset(left, bottom), axisPaint);
+    canvas.drawLine(Offset(left, bottom), Offset(right, bottom), axisPaint);
+
+    final path = Path()
+      ..moveTo(left + size.width * 0.06, bottom - size.height * 0.16)
+      ..lineTo(left + size.width * 0.22, bottom - size.height * 0.42)
+      ..lineTo(left + size.width * 0.4, bottom - size.height * 0.28)
+      ..lineTo(left + size.width * 0.58, bottom - size.height * 0.58)
+      ..lineTo(right - size.width * 0.03, bottom - size.height * 0.5);
+    canvas.drawPath(path, linePaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _ChartModeIconPainter oldDelegate) {
+    return oldDelegate.color != color;
   }
 }
 
