@@ -160,7 +160,7 @@ class OpenRemoteMqttService {
         final returnCode = client.connectionStatus?.returnCode;
         client.disconnect();
         throw OpenRemoteMqttException(
-          _messageForReturnCode(returnCode),
+          _messageForReturnCode(returnCode, config),
         );
       }
 
@@ -173,19 +173,43 @@ class OpenRemoteMqttService {
       );
     } on OpenRemoteMqttException catch (error) {
       _handleConnectError(error.message, manualAttempt: manualAttempt);
-    } on SocketException {
+    } on SocketException catch (error) {
       _handleConnectError(
-        'OpenRemote broker is not reachable.',
+        _connectionFailureMessage(
+          'OpenRemote broker is not reachable.',
+          config: _config,
+          detail: error.message,
+          hint: 'check network/VPN/firewall and OR_HOST/OR_PORT.',
+        ),
         manualAttempt: manualAttempt,
       );
-    } on HandshakeException {
+    } on HandshakeException catch (error) {
       _handleConnectError(
-        'OpenRemote TLS verification failed.',
+        _connectionFailureMessage(
+          'OpenRemote TLS verification failed.',
+          config: _config,
+          detail: error.message,
+          hint: 'check OR_USE_TLS, OR_TLS_INSECURE and the broker certificate.',
+        ),
+        manualAttempt: manualAttempt,
+      );
+    } on TimeoutException {
+      _handleConnectError(
+        _connectionFailureMessage(
+          'OpenRemote connection timed out.',
+          config: _config,
+          hint: 'check network reachability, broker status and OR_PORT.',
+        ),
         manualAttempt: manualAttempt,
       );
     } catch (error) {
       _handleConnectError(
-        _safeConnectionMessage(error),
+        _connectionFailureMessage(
+          _safeConnectionMessage(error),
+          config: _config,
+          detail: error,
+          hint: 'check the OpenRemote MQTT configuration.',
+        ),
         manualAttempt: manualAttempt,
       );
     } finally {
@@ -277,8 +301,7 @@ class OpenRemoteMqttService {
     }
 
     if (text.contains('certificate') || text.contains('handshake')) {
-      return text;
-      //return 'OpenRemote TLS verification failed.';
+      return 'OpenRemote TLS verification failed.';
     }
 
     if (text.contains('timed out') || text.contains('timeout')) {
@@ -288,21 +311,99 @@ class OpenRemoteMqttService {
     return 'Could not connect to OpenRemote.';
   }
 
-  String _messageForReturnCode(MqttConnectReturnCode? returnCode) {
+  String _connectionFailureMessage(
+    String reason, {
+    _OpenRemoteMqttConfig? config,
+    Object? detail,
+    String? hint,
+  }) {
+    final lines = <String>[reason];
+    if (config != null) {
+      lines.add(
+        'Target: ${config.host}:${config.port} '
+        '(${config.useTls ? 'TLS' : 'no TLS'}), client: ${config.clientId}.',
+      );
+    }
+    final safeDetail = _safeErrorDetail(detail, config);
+    if (safeDetail != null) {
+      lines.add('Detail: $safeDetail');
+    }
+    if (hint != null && hint.trim().isNotEmpty) {
+      lines.add('Hint: $hint');
+    }
+
+    return lines.join('\n');
+  }
+
+  String? _safeErrorDetail(Object? error, _OpenRemoteMqttConfig? config) {
+    final detail = error?.toString().trim();
+    if (detail == null || detail.isEmpty) {
+      return null;
+    }
+
+    var sanitizedDetail = detail;
+    for (final secret in [config?.username, config?.password]) {
+      if (secret != null && secret.isNotEmpty) {
+        sanitizedDetail = sanitizedDetail.replaceAll(secret, '[hidden]');
+      }
+    }
+
+    return sanitizedDetail
+        .replaceAllMapped(
+          RegExp(r'(password|passwd|pwd)=\S+', caseSensitive: false),
+          (match) => '${match.group(1)}=[hidden]',
+        )
+        .replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  String _messageForReturnCode(
+    MqttConnectReturnCode? returnCode,
+    _OpenRemoteMqttConfig config,
+  ) {
     return switch (returnCode) {
       MqttConnectReturnCode.connectionAccepted =>
         'Connected to OpenRemote',
       MqttConnectReturnCode.unacceptedProtocolVersion =>
-        'OpenRemote rejected the MQTT protocol version.',
+        _connectionFailureMessage(
+          'OpenRemote rejected the MQTT protocol version.',
+          config: config,
+          detail: returnCode?.name,
+          hint: 'the app uses MQTT 3.1.1; check broker protocol support.',
+        ),
       MqttConnectReturnCode.identifierRejected =>
-        'OpenRemote rejected the MQTT client ID.',
+        _connectionFailureMessage(
+          'OpenRemote rejected the MQTT client ID.',
+          config: config,
+          detail: returnCode?.name,
+          hint: 'check OR_CLIENT_SUFFIX and make sure the client ID is valid.',
+        ),
       MqttConnectReturnCode.brokerUnavailable =>
-        'OpenRemote broker is unavailable.',
+        _connectionFailureMessage(
+          'OpenRemote broker is unavailable.',
+          config: config,
+          detail: returnCode?.name,
+          hint: 'check broker status and OR_HOST/OR_PORT.',
+        ),
       MqttConnectReturnCode.badUsernameOrPassword =>
-        'OpenRemote authentication was rejected.',
+        _connectionFailureMessage(
+          'OpenRemote authentication was rejected.',
+          config: config,
+          detail: returnCode?.name,
+          hint: 'check OR_REALM, OR_USERNAME, OR_PASSWORD and service-user permissions.',
+        ),
       MqttConnectReturnCode.notAuthorized =>
-        'OpenRemote authentication was rejected.',
-      _ => 'OpenRemote connection failed.',
+        _connectionFailureMessage(
+          'OpenRemote authorization was rejected.',
+          config: config,
+          detail: returnCode?.name,
+          hint: 'check service-user permissions for the target asset/attribute.',
+        ),
+      _ => _connectionFailureMessage(
+          'OpenRemote connection failed.',
+          config: config,
+          detail: returnCode?.name,
+          hint: 'check broker logs and MQTT credentials.',
+        ),
     };
   }
 }

@@ -1708,10 +1708,14 @@ class _LiveMeasurementChartCard extends StatelessWidget {
   final _LiveMeasurementValue? currentValue;
   final String Function(DateTime value) formatTime;
 
+  static const int _maxVisibleSamples = 40;
+  static const int _yAxisLabelCount = 3;
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
+    final visibleSamples = _visibleSamples;
     final currentValueText = currentValue == null
         ? '—'
         : '${currentValue!.formattedValue} ${definition.unit}';
@@ -1759,12 +1763,12 @@ class _LiveMeasurementChartCard extends StatelessWidget {
             const SizedBox(height: 12),
             SizedBox(
               height: 180,
-              child: samples.isEmpty
+              child: visibleSamples.isEmpty
                   ? _buildEmptyChartPlaceholder(context)
-                  : _buildChart(context, currentValueText),
+                  : _buildChart(context, currentValueText, visibleSamples),
             ),
             const SizedBox(height: 8),
-            if (samples.isEmpty)
+            if (visibleSamples.isEmpty)
               Text(
                 'No data received yet',
                 style: theme.textTheme.bodySmall?.copyWith(
@@ -1775,14 +1779,14 @@ class _LiveMeasurementChartCard extends StatelessWidget {
               Row(
                 children: [
                   Text(
-                    formatTime(samples.first.receivedAt),
+                    formatTime(visibleSamples.first.receivedAt),
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: colorScheme.onSurfaceVariant,
                     ),
                   ),
                   const Spacer(),
                   Text(
-                    formatTime(samples.last.receivedAt),
+                    formatTime(visibleSamples.last.receivedAt),
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: colorScheme.onSurfaceVariant,
                     ),
@@ -1793,6 +1797,14 @@ class _LiveMeasurementChartCard extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  List<_MeasurementChartSample> get _visibleSamples {
+    if (samples.length <= _maxVisibleSamples) {
+      return samples;
+    }
+
+    return samples.sublist(samples.length - _maxVisibleSamples);
   }
 
   Widget _buildEmptyChartPlaceholder(BuildContext context) {
@@ -1815,11 +1827,15 @@ class _LiveMeasurementChartCard extends StatelessWidget {
     );
   }
 
-  Widget _buildChart(BuildContext context, String currentValueText) {
+  Widget _buildChart(
+    BuildContext context,
+    String currentValueText,
+    List<_MeasurementChartSample> visibleSamples,
+  ) {
     final colorScheme = Theme.of(context).colorScheme;
     final theme = Theme.of(context);
-    final firstSampleTime = samples.first.receivedAt;
-    final spots = samples.map((sample) {
+    final firstSampleTime = visibleSamples.first.receivedAt;
+    final spots = visibleSamples.map((sample) {
       final seconds = sample.receivedAt
               .difference(firstSampleTime)
               .inMilliseconds /
@@ -1827,9 +1843,9 @@ class _LiveMeasurementChartCard extends StatelessWidget {
       return FlSpot(seconds, sample.value);
     }).toList(growable: false);
 
-    var minY = samples.first.value;
-    var maxY = samples.first.value;
-    for (final sample in samples.skip(1)) {
+    var minY = visibleSamples.first.value;
+    var maxY = visibleSamples.first.value;
+    for (final sample in visibleSamples.skip(1)) {
       minY = math.min(minY, sample.value);
       maxY = math.max(maxY, sample.value);
     }
@@ -1839,6 +1855,14 @@ class _LiveMeasurementChartCard extends StatelessWidget {
         ? math.max(1.0, maxY.abs() * 0.1)
         : yRange * 0.12;
     final maxX = math.max(1.0, spots.last.x);
+    final chartMinY = minY - yPadding;
+    final chartMaxY = maxY + yPadding;
+    final yAxisValues = _buildYAxisValues(chartMinY, chartMaxY);
+    final yAxisInterval = _yAxisInterval(chartMinY, chartMaxY);
+    final yAxisLabelStyle = theme.textTheme.bodySmall?.copyWith(
+      color: colorScheme.onSurfaceVariant,
+      fontSize: 11,
+    );
 
     return Stack(
       children: [
@@ -1848,11 +1872,14 @@ class _LiveMeasurementChartCard extends StatelessWidget {
             LineChartData(
               minX: 0,
               maxX: maxX,
-              minY: minY - yPadding,
-              maxY: maxY + yPadding,
+              minY: chartMinY,
+              maxY: chartMaxY,
               gridData: FlGridData(
                 show: true,
                 drawVerticalLine: false,
+                horizontalInterval: yAxisInterval,
+                checkToShowHorizontalLine: (value) =>
+                    _isYAxisValue(value, yAxisValues),
                 getDrawingHorizontalLine: (_) => FlLine(
                   color: colorScheme.outlineVariant.withValues(alpha: 0.7),
                   strokeWidth: 0.8,
@@ -1868,7 +1895,25 @@ class _LiveMeasurementChartCard extends StatelessWidget {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
-                  sideTitles: const SideTitles(showTitles: false),
+                  sideTitles: SideTitles(
+                    showTitles: true,
+                    reservedSize: 38,
+                    interval: yAxisInterval,
+                    getTitlesWidget: (value, meta) {
+                      if (!_isYAxisValue(value, yAxisValues)) {
+                        return const SizedBox.shrink();
+                      }
+
+                      return SideTitleWidget(
+                        meta: meta,
+                        space: 6,
+                        child: Text(
+                          value.toStringAsFixed(1),
+                          style: yAxisLabelStyle,
+                        ),
+                      );
+                    },
+                  ),
                 ),
                 topTitles: const AxisTitles(
                   sideTitles: SideTitles(showTitles: false),
@@ -1900,7 +1945,7 @@ class _LiveMeasurementChartCard extends StatelessWidget {
                   isCurved: false,
                   color: colorScheme.primary,
                   barWidth: 2.4,
-                  dotData: FlDotData(show: samples.length == 1),
+                  dotData: FlDotData(show: visibleSamples.length == 1),
                   belowBarData: BarAreaData(
                     show: true,
                     color: colorScheme.primary.withValues(alpha: 0.08),
@@ -1940,6 +1985,34 @@ class _LiveMeasurementChartCard extends StatelessWidget {
         ),
       ],
     );
+  }
+
+  List<double> _buildYAxisValues(double minY, double maxY) {
+    final interval = _yAxisInterval(minY, maxY);
+
+    return List<double>.generate(
+      _yAxisLabelCount,
+      (index) => minY + interval * index,
+      growable: false,
+    );
+  }
+
+  double _yAxisInterval(double minY, double maxY) {
+    final range = (maxY - minY).abs();
+    if (!range.isFinite || range <= 0) {
+      return 1;
+    }
+
+    return range / (_yAxisLabelCount - 1);
+  }
+
+  bool _isYAxisValue(double value, List<double> yAxisValues) {
+    const tolerance = 0.000001;
+
+    return yAxisValues.any((axisValue) {
+      final scale = math.max(1.0, axisValue.abs());
+      return (value - axisValue).abs() <= tolerance * scale;
+    });
   }
 }
 
