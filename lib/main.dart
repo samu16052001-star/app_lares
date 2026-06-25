@@ -404,19 +404,22 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         (connectStatus == null || connectStatus.isGranted);
   }
 
-  Future<void> _toggleConnection(BluetoothDevice device) async {
+  Future<void> _toggleConnection(ScanResult result) async {
+    final device = result.device;
     final id = _deviceId(device);
 
     if (_connectedDeviceIds.contains(id)) {
-      await _disconnectFromDevice(device);
+      await _disconnectFromDevice(result);
       return;
     }
 
-    await _connectToDevice(device);
+    await _connectToDevice(result);
   }
 
-  Future<void> _connectToDevice(BluetoothDevice device) async {
+  Future<void> _connectToDevice(ScanResult result) async {
+    final device = result.device;
     final id = _deviceId(device);
+    final displayName = _displayDeviceName(result);
 
     setState(() {
       _connectingDeviceIds.add(id);
@@ -437,8 +440,10 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         _connectedDeviceIds.add(id);
       });
 
-      if (_isEnvDevice(device)) {
-        _openDeviceConfigurationPage(device);
+      if (_isEnvDevice(result)) {
+        await _openDeviceConfigurationPage(device);
+      } else if (_isWearableConfigurationDevice(result)) {
+        await _openWearableDeviceConfigurationPage(device);
       }
     } catch (error) {
       if (!mounted) {
@@ -446,7 +451,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       }
 
       setState(() {
-        _statusMessage = 'Could not connect to ${_deviceName(device)}: $error';
+        _statusMessage = 'Could not connect to $displayName: $error';
       });
     } finally {
       if (mounted) {
@@ -457,20 +462,117 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     }
   }
 
-  bool _isEnvDevice(BluetoothDevice device) {
-    return _deviceName(device).toLowerCase().contains('env');
+  bool _isEnvDevice(ScanResult result) {
+    return _matchesAnyDeviceName(result, const ['env']);
   }
 
-  void _openDeviceConfigurationPage(BluetoothDevice device) {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => DeviceConfigurationPage(device: device),
+  bool _isWearableConfigurationDevice(ScanResult result) {
+    return _matchesAnyDeviceName(
+      result,
+      const ['respiratorymonitor', 'imu'],
+    );
+  }
+
+  bool _isLaresFilterDevice(ScanResult result) {
+    return _matchesAnyDeviceName(
+      result,
+      const ['lares', 'respiratorymonitor', 'imu'],
+    );
+  }
+
+  bool _matchesAnyDeviceName(ScanResult result, List<String> needles) {
+    return _deviceNameCandidates(result).any((name) {
+      final normalizedName = _normalizeDeviceName(name);
+      return needles.any((needle) => normalizedName.contains(needle));
+    });
+  }
+
+  String _normalizeDeviceName(String value) {
+    return value.trim().toLowerCase();
+  }
+
+  List<String> _deviceNameCandidates(ScanResult result) {
+    final names = <String>[];
+    for (final name in [
+      result.device.platformName,
+      result.advertisementData.advName,
+      result.device.advName,
+    ]) {
+      final trimmedName = name.trim();
+      if (trimmedName.isNotEmpty && !names.contains(trimmedName)) {
+        names.add(trimmedName);
+      }
+    }
+
+    return names;
+  }
+
+  String _displayDeviceName(ScanResult result) {
+    final names = _deviceNameCandidates(result);
+    return names.isEmpty ? 'Unknown device' : names.first;
+  }
+
+  Future<void> _openDeviceConfigurationPage(BluetoothDevice device) async {
+    await _stopScanBeforeNavigation();
+    if (!mounted) {
+      return;
+    }
+
+    unawaited(
+      Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => DeviceConfigurationPage(device: device),
+        ),
       ),
     );
   }
 
-  Future<void> _disconnectFromDevice(BluetoothDevice device) async {
+  Future<void> _openWearableDeviceConfigurationPage(
+    BluetoothDevice device,
+  ) async {
+    await _stopScanBeforeNavigation();
+    if (!mounted) {
+      return;
+    }
+
+    unawaited(
+      Navigator.of(context)
+          .push(
+            MaterialPageRoute<void>(
+              builder: (_) => WearableDeviceConfigurationPage(
+                device: device,
+                onDisconnected: () => _markDeviceDisconnected(device),
+              ),
+            ),
+          )
+          .whenComplete(() => _markDeviceDisconnected(device)),
+    );
+  }
+
+  Future<void> _stopScanBeforeNavigation() async {
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {
+      // Best effort: navigation should not be blocked by a stale scan state.
+    }
+  }
+
+  void _markDeviceDisconnected(BluetoothDevice device) {
+    if (!mounted) {
+      return;
+    }
+
     final id = _deviceId(device);
+    setState(() {
+      _connectedDeviceIds.remove(id);
+      _connectingDeviceIds.remove(id);
+    });
+  }
+
+  Future<void> _disconnectFromDevice(ScanResult result) async {
+    final device = result.device;
+    final id = _deviceId(device);
+    final displayName = _displayDeviceName(result);
 
     setState(() {
       _connectingDeviceIds.add(id);
@@ -493,7 +595,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       }
 
       setState(() {
-        _statusMessage = 'Could not disconnect ${_deviceName(device)}: $error';
+        _statusMessage = 'Could not disconnect $displayName: $error';
       });
     } finally {
       if (mounted) {
@@ -508,23 +610,11 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     return device.remoteId.toString();
   }
 
-  String _deviceName(BluetoothDevice device) {
-    final platformName = device.platformName.trim();
-    return platformName.isEmpty ? 'Unknown device' : platformName;
-  }
-
-  String _visibleDeviceName(BluetoothDevice device) {
-    return device.platformName.trim();
-  }
-
   List<ScanResult> _displayDevices() {
     var devices = _scanResults.values.toList();
 
     if (_showOnlyLaresDevices) {
-      devices = devices.where((result) {
-        final name = _visibleDeviceName(result.device);
-        return name.isNotEmpty && name.toLowerCase().contains('lares');
-      }).toList();
+      devices = devices.where(_isLaresFilterDevice).toList();
     }
 
     if (_sortBySignalStrength) {
@@ -542,7 +632,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     }
 
     devices.sort(
-      (a, b) => _deviceName(a.device).compareTo(_deviceName(b.device)),
+      (a, b) => _displayDeviceName(a).compareTo(_displayDeviceName(b)),
     );
     return devices;
   }
@@ -649,12 +739,12 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
                         return ListTile(
                           contentPadding: EdgeInsets.zero,
-                          title: Text(_deviceName(device)),
+                          title: Text(_displayDeviceName(result)),
                           subtitle: Text('$id - RSSI ${result.rssi} dBm'),
                           trailing: FilledButton(
                             onPressed: isBusy
                                 ? null
-                                : () => _toggleConnection(device),
+                                : () => _toggleConnection(result),
                             child: Text(
                               isBusy
                                   ? 'Wait'
@@ -669,6 +759,64 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class WearableDeviceConfigurationPage extends StatefulWidget {
+  const WearableDeviceConfigurationPage({
+    super.key,
+    required this.device,
+    this.onDisconnected,
+  });
+
+  final BluetoothDevice device;
+  final VoidCallback? onDisconnected;
+
+  @override
+  State<WearableDeviceConfigurationPage> createState() =>
+      _WearableDeviceConfigurationPageState();
+}
+
+class _WearableDeviceConfigurationPageState
+    extends State<WearableDeviceConfigurationPage> {
+  bool _disconnectionNotified = false;
+
+  @override
+  void dispose() {
+    _notifyDisconnected();
+    unawaited(_disconnectDevice());
+    super.dispose();
+  }
+
+  void _notifyDisconnected() {
+    if (_disconnectionNotified) {
+      return;
+    }
+
+    _disconnectionNotified = true;
+    widget.onDisconnected?.call();
+  }
+
+  Future<void> _disconnectDevice() async {
+    try {
+      await widget.device.disconnect();
+    } catch (_) {
+      // The device may already be disconnected when the route is disposed.
+    } finally {
+      _notifyDisconnected();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Device Configuration'),
+      ),
+      body: const Center(
+        child: Text('Ciao Gian'),
       ),
     );
   }
