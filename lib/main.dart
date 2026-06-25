@@ -7,6 +7,7 @@ import 'package:app_lares/services/acquisition_csv_logger.dart';
 import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
+import 'package:app_lares/wearable_configuration_service.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
@@ -781,12 +782,41 @@ class WearableDeviceConfigurationPage extends StatefulWidget {
 
 class _WearableDeviceConfigurationPageState
     extends State<WearableDeviceConfigurationPage> {
+  late final WearableConfigurationBleService _service;
+
+  static const List<int> _odrValues = [12, 26, 52, 104, 208, 416];
+  static const List<int> _accGValues = [2, 4, 8, 16];
+  static const List<int> _gyrDPSValues = [125, 250, 500, 1000, 2000];
+
+  int odr = 104;
+  int mag = 0;
+  int accG = 8;
+  int gyrDPS = 500;
+  bool _isSendingConfig = false;
+  bool _isDisposing = false;
   bool _disconnectionNotified = false;
 
   @override
+  void initState() {
+    super.initState();
+    _service = WearableConfigurationBleService(
+      widget.device,
+      onStateChanged: () {
+        if (!mounted || _isDisposing) {
+          return;
+        }
+
+        setState(() {});
+      },
+    );
+    unawaited(_service.initialize());
+  }
+
+  @override
   void dispose() {
+    _isDisposing = true;
     _notifyDisconnected();
-    unawaited(_disconnectDevice());
+    unawaited(_cleanupAndDisconnect());
     super.dispose();
   }
 
@@ -799,7 +829,9 @@ class _WearableDeviceConfigurationPageState
     widget.onDisconnected?.call();
   }
 
-  Future<void> _disconnectDevice() async {
+  Future<void> _cleanupAndDisconnect() async {
+    await _service.dispose();
+
     try {
       await widget.device.disconnect();
     } catch (_) {
@@ -809,14 +841,232 @@ class _WearableDeviceConfigurationPageState
     }
   }
 
+  void _setMagnetometer(bool enabled) {
+    setState(() {
+      mag = enabled ? 1 : 0;
+    });
+  }
+
+  Future<void> _sendConfigAndOpenLog() async {
+    if (!_service.isReadyToContinue || _isSendingConfig) {
+      return;
+    }
+
+    setState(() {
+      _isSendingConfig = true;
+    });
+
+    try {
+      await _service.sendConfig(
+        odr: odr,
+        mag: mag,
+        accG: accG,
+        gyrDPS: gyrDPS,
+      );
+      if (!mounted) {
+        return;
+      }
+
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => WearableBleCommunicationLogPage(service: _service),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSendingConfig = false;
+        });
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final canContinue = _service.isReadyToContinue && !_isSendingConfig;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Device Configuration'),
       ),
-      body: const Center(
-        child: Text('Ciao Gian'),
+      body: Column(
+        children: [
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                _buildDropdownSetting(
+                  label: 'Output Data Rate (Hz)',
+                  value: odr,
+                  values: _odrValues,
+                  onChanged: (value) {
+                    setState(() {
+                      odr = value;
+                    });
+                  },
+                ),
+                const SizedBox(height: 12),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Magnetometer'),
+                  value: mag == 1,
+                  onChanged: _setMagnetometer,
+                ),
+                const SizedBox(height: 12),
+                _buildDropdownSetting(
+                  label: 'Accelerometer Full Scale Range (g)',
+                  value: accG,
+                  values: _accGValues,
+                  onChanged: (value) {
+                    setState(() {
+                      accG = value;
+                    });
+                  },
+                ),
+                const SizedBox(height: 12),
+                _buildDropdownSetting(
+                  label: 'Gyroscope Full Scale Range (dps)',
+                  value: gyrDPS,
+                  values: _gyrDPSValues,
+                  onChanged: (value) {
+                    setState(() {
+                      gyrDPS = value;
+                    });
+                  },
+                ),
+                const SizedBox(height: 20),
+                Text(
+                  'Setup Log',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 8),
+                _WearableBleLogView(
+                  logs: _service.logs,
+                  emptyText: 'BLE setup has not produced logs yet.',
+                  maxLines: 8,
+                ),
+              ],
+            ),
+          ),
+          SafeArea(
+            minimum: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            child: SizedBox(
+              width: double.infinity,
+              height: 52,
+              child: FilledButton(
+                onPressed: canContinue ? _sendConfigAndOpenLog : null,
+                child: Text(_isSendingConfig ? 'Sending...' : 'Continue'),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDropdownSetting({
+    required String label,
+    required int value,
+    required List<int> values,
+    required ValueChanged<int> onChanged,
+  }) {
+    return DropdownButtonFormField<int>(
+      initialValue: value,
+      decoration: InputDecoration(
+        labelText: label,
+        border: const OutlineInputBorder(),
+      ),
+      items: [
+        for (final option in values)
+          DropdownMenuItem<int>(
+            value: option,
+            child: Text(option.toString()),
+          ),
+      ],
+      onChanged: (selectedValue) {
+        if (selectedValue == null) {
+          return;
+        }
+
+        onChanged(selectedValue);
+      },
+    );
+  }
+}
+
+class WearableBleCommunicationLogPage extends StatelessWidget {
+  const WearableBleCommunicationLogPage({
+    super.key,
+    required this.service,
+  });
+
+  final WearableConfigurationBleService service;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('BLE Communication Log'),
+      ),
+      body: StreamBuilder<List<String>>(
+        stream: service.logsStream,
+        initialData: service.logs,
+        builder: (context, snapshot) {
+          return Padding(
+            padding: const EdgeInsets.all(16),
+            child: SingleChildScrollView(
+              child: _WearableBleLogView(
+                logs: snapshot.data ?? const [],
+                emptyText: 'Waiting for BLE notifications...',
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _WearableBleLogView extends StatelessWidget {
+  const _WearableBleLogView({
+    required this.logs,
+    required this.emptyText,
+    this.maxLines,
+  });
+
+  final List<String> logs;
+  final String emptyText;
+  final int? maxLines;
+
+  @override
+  Widget build(BuildContext context) {
+    final visibleLogs = maxLines == null || logs.length <= maxLines!
+        ? logs
+        : logs.sublist(logs.length - maxLines!);
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: SizedBox(
+        width: double.infinity,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: visibleLogs.isEmpty
+              ? Text(
+                  emptyText,
+                  style: Theme.of(context).textTheme.bodySmall,
+                )
+              : SelectableText(
+                  visibleLogs.join('\n'),
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+        ),
       ),
     );
   }
