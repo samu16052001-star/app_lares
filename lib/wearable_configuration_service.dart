@@ -17,6 +17,8 @@ enum WearableBleSequenceState {
   preparingStart,
   startSent,
   streaming,
+  stopping,
+  stopped,
   timeout,
   error,
 }
@@ -75,10 +77,16 @@ class WearableConfigurationBleService {
       WearableBleSequenceState.calibrationStartSent ||
       WearableBleSequenceState.waitingCalibrationDone ||
       WearableBleSequenceState.calibrationDone ||
-      WearableBleSequenceState.preparingStart => true,
+      WearableBleSequenceState.preparingStart ||
+      WearableBleSequenceState.streaming ||
+      WearableBleSequenceState.stopping => true,
       _ => false,
     };
   }
+
+  bool get isStopping => _sequenceState == WearableBleSequenceState.stopping;
+
+  bool get isStopped => _sequenceState == WearableBleSequenceState.stopped;
 
   bool get isReadyToContinue {
     return _mtuRequested &&
@@ -143,6 +151,39 @@ class WearableConfigurationBleService {
     }
   }
 
+  Future<void> stopAcquisition() async {
+    if (_isDisposed || isStopping || isStopped) {
+      return;
+    }
+
+    _setSequenceState(WearableBleSequenceState.stopping);
+    _sequenceTimer?.cancel();
+    _sequenceTimer = null;
+    _log('Sending STOP command.');
+
+    try {
+      await _writeCommand('STOP');
+    } catch (error) {
+      _setSequenceState(WearableBleSequenceState.error);
+      _log('STOP write error: $error');
+      rethrow;
+    }
+
+    _log('STOP command sent successfully.');
+    await _cleanupAfterStop();
+
+    try {
+      await device.disconnect();
+      _log('Wearable BLE device disconnected after STOP.');
+    } catch (error) {
+      _log('Wearable BLE disconnect after STOP error: $error');
+    }
+
+    _setSequenceState(WearableBleSequenceState.stopped);
+    _isDisposed = true;
+    await _logController.close();
+  }
+
   Future<void> dispose() async {
     if (_isDisposed) {
       return;
@@ -175,6 +216,29 @@ class WearableConfigurationBleService {
     _log('Disconnection-related BLE cleanup completed.');
     _log('Wearable BLE service disposed.');
     await _logController.close();
+  }
+
+  Future<void> _cleanupAfterStop() async {
+    try {
+      await _notificationSubscription?.cancel();
+      _log('Notification subscription cancelled.');
+    } catch (error) {
+      _log('Notification subscription cancellation error: $error');
+    }
+    _notificationSubscription = null;
+
+    final notifyCharacteristic = _notifyCharacteristic;
+    if (_notificationsEnabled && notifyCharacteristic != null) {
+      try {
+        await notifyCharacteristic.setNotifyValue(false);
+        _log('Notifications disabled.');
+      } catch (error) {
+        _log('Notification disable error: $error');
+      }
+    }
+
+    _notificationsEnabled = false;
+    _log('Disconnection-related BLE cleanup completed.');
   }
 
   Future<void> _requestMtu() async {
@@ -283,6 +347,10 @@ class WearableConfigurationBleService {
   }
 
   void _handleNotification(List<int> value) {
+    if (isStopping || isStopped) {
+      return;
+    }
+
     if (WearableAgmPacketParser.startsWithAgmHeader(value)) {
       _handleAgmPacket(value);
       return;

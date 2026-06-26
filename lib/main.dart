@@ -881,7 +881,10 @@ class _WearableDeviceConfigurationPageState
 
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
-          builder: (_) => WearableBleCommunicationLogPage(service: _service),
+          builder: (_) => WearableBleCommunicationLogPage(
+            service: _service,
+            onAcquisitionStopped: _notifyDisconnected,
+          ),
         ),
       );
     } catch (_) {
@@ -1020,38 +1023,131 @@ class _WearableDeviceConfigurationPageState
   }
 }
 
-class WearableBleCommunicationLogPage extends StatelessWidget {
+class WearableBleCommunicationLogPage extends StatefulWidget {
   const WearableBleCommunicationLogPage({
     super.key,
     required this.service,
+    required this.onAcquisitionStopped,
   });
 
   final WearableConfigurationBleService service;
+  final VoidCallback onAcquisitionStopped;
+
+  @override
+  State<WearableBleCommunicationLogPage> createState() =>
+      _WearableBleCommunicationLogPageState();
+}
+
+class _WearableBleCommunicationLogPageState
+    extends State<WearableBleCommunicationLogPage> {
+  bool _isStoppingAcquisition = false;
+
+  Future<void> _stopAcquisition() async {
+    if (_isStoppingAcquisition || widget.service.isStopping) {
+      return;
+    }
+
+    setState(() {
+      _isStoppingAcquisition = true;
+    });
+
+    try {
+      await widget.service.stopAcquisition();
+      widget.onAcquisitionStopped();
+
+      if (!mounted) {
+        return;
+      }
+
+      unawaited(
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute<void>(
+            builder: (_) => const WearableAcquisitionCompletedPage(),
+          ),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isStoppingAcquisition = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not stop acquisition')),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<List<String>>(
-      stream: service.logsStream,
-      initialData: service.logs,
+      stream: widget.service.logsStream,
+      initialData: widget.service.logs,
       builder: (context, snapshot) {
         return PopScope(
-          canPop: !service.blocksBackNavigation,
+          canPop: false,
           child: Scaffold(
             appBar: AppBar(
-              title: const Text('BLE Communication Log'),
+              title: const Text('Acquisition in progress...'),
+              automaticallyImplyLeading: false,
             ),
-            body: Padding(
-              padding: const EdgeInsets.all(16),
-              child: SingleChildScrollView(
-                child: _WearableBleLogView(
-                  logs: snapshot.data ?? const [],
-                  emptyText: 'Waiting for BLE notifications...',
+            body: Column(
+              children: [
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: SingleChildScrollView(
+                      child: _WearableBleLogView(
+                        logs: snapshot.data ?? const [],
+                        emptyText: 'Waiting for BLE notifications...',
+                      ),
+                    ),
+                  ),
                 ),
-              ),
+                _buildStopAcquisitionButton(),
+              ],
             ),
           ),
         );
       },
+    );
+  }
+
+  Widget _buildStopAcquisitionButton() {
+    final isStopping = _isStoppingAcquisition || widget.service.isStopping;
+
+    return SafeArea(
+      top: false,
+      bottom: false,
+      minimum: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      child: SizedBox(
+        width: double.infinity,
+        height: 48,
+        child: FilledButton(
+          onPressed: isStopping ? null : _stopAcquisition,
+          child: Text(isStopping ? 'Stopping...' : 'Stop acquisition'),
+        ),
+      ),
+    );
+  }
+}
+
+class WearableAcquisitionCompletedPage extends StatelessWidget {
+  const WearableAcquisitionCompletedPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Acquisition completed'),
+          automaticallyImplyLeading: false,
+        ),
+        body: const SizedBox.shrink(),
+      ),
     );
   }
 }
