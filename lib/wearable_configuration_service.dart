@@ -45,6 +45,8 @@ class WearableConfigurationBleService {
 
   final StreamController<List<String>> _logController =
       StreamController<List<String>>.broadcast();
+  final StreamController<WearableAgmReceivedSample> _agmSamplesController =
+      StreamController<WearableAgmReceivedSample>.broadcast();
   final List<String> _logs = [];
 
   BluetoothCharacteristic? _writeCharacteristic;
@@ -65,6 +67,9 @@ class WearableConfigurationBleService {
   WearableBleSequenceState _sequenceState = WearableBleSequenceState.idle;
 
   Stream<List<String>> get logsStream => _logController.stream;
+
+  Stream<WearableAgmReceivedSample> get agmSamplesStream =>
+      _agmSamplesController.stream;
 
   List<String> get logs => List.unmodifiable(_logs);
 
@@ -182,6 +187,7 @@ class WearableConfigurationBleService {
     _setSequenceState(WearableBleSequenceState.stopped);
     _isDisposed = true;
     await _logController.close();
+    await _agmSamplesController.close();
   }
 
   Future<void> dispose() async {
@@ -216,6 +222,7 @@ class WearableConfigurationBleService {
     _log('Disconnection-related BLE cleanup completed.');
     _log('Wearable BLE service disposed.');
     await _logController.close();
+    await _agmSamplesController.close();
   }
 
   Future<void> _cleanupAfterStop() async {
@@ -351,8 +358,9 @@ class WearableConfigurationBleService {
       return;
     }
 
+    final receivedAt = DateTime.now();
     if (WearableAgmPacketParser.startsWithAgmHeader(value)) {
-      _handleAgmPacket(value);
+      _handleAgmPacket(value, receivedAt);
       return;
     }
 
@@ -366,7 +374,7 @@ class WearableConfigurationBleService {
     _handleTextNotification(payload);
   }
 
-  void _handleAgmPacket(List<int> value) {
+  void _handleAgmPacket(List<int> value, DateTime receivedAt) {
     if (!WearableAgmPacketParser.hasValidLength(value)) {
       _log(
         'Invalid AGM packet length: ${value.length} bytes | ${_hexPayload(value)}',
@@ -378,6 +386,14 @@ class WearableConfigurationBleService {
       final sample = WearableAgmPacketParser.parse(value);
       if (sample.batteryPercent != null) {
         _latestBatteryPercent = sample.batteryPercent;
+      }
+      if (!_agmSamplesController.isClosed) {
+        _agmSamplesController.add(
+          WearableAgmReceivedSample(
+            receivedAt: receivedAt,
+            sample: sample,
+          ),
+        );
       }
       _log(_formatAgmSample(sample));
     } catch (error) {
@@ -582,4 +598,14 @@ class WearableConfigurationBleService {
     }
     onStateChanged?.call();
   }
+}
+
+class WearableAgmReceivedSample {
+  const WearableAgmReceivedSample({
+    required this.receivedAt,
+    required this.sample,
+  });
+
+  final DateTime receivedAt;
+  final WearableAgmSample sample;
 }

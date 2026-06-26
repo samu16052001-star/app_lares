@@ -7,6 +7,7 @@ import 'package:app_lares/services/acquisition_csv_logger.dart';
 import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
+import 'package:app_lares/services/wearable_acquisition_csv_logger.dart';
 import 'package:app_lares/wearable_configuration_service.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -444,7 +445,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       if (_isEnvDevice(result)) {
         await _openDeviceConfigurationPage(device);
       } else if (_isWearableConfigurationDevice(result)) {
-        await _openWearableDeviceConfigurationPage(device);
+        await _openWearableDeviceConfigurationPage(device, displayName);
       }
     } catch (error) {
       if (!mounted) {
@@ -530,6 +531,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
   Future<void> _openWearableDeviceConfigurationPage(
     BluetoothDevice device,
+    String deviceName,
   ) async {
     await _stopScanBeforeNavigation();
     if (!mounted) {
@@ -542,6 +544,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
             MaterialPageRoute<void>(
               builder: (_) => WearableDeviceConfigurationPage(
                 device: device,
+                deviceName: deviceName,
                 onDisconnected: () => _markDeviceDisconnected(device),
               ),
             ),
@@ -769,10 +772,12 @@ class WearableDeviceConfigurationPage extends StatefulWidget {
   const WearableDeviceConfigurationPage({
     super.key,
     required this.device,
+    required this.deviceName,
     this.onDisconnected,
   });
 
   final BluetoothDevice device;
+  final String deviceName;
   final VoidCallback? onDisconnected;
 
   @override
@@ -783,6 +788,8 @@ class WearableDeviceConfigurationPage extends StatefulWidget {
 class _WearableDeviceConfigurationPageState
     extends State<WearableDeviceConfigurationPage> {
   late final WearableConfigurationBleService _service;
+  late final WearableAcquisitionCsvLogger _csvLogger;
+  late final GpsLocationService _gpsLocationService;
 
   static const List<int> _odrValues = [12, 26, 52, 104, 208, 416];
   static const List<int> _accGValues = [2, 4, 8, 16];
@@ -797,6 +804,7 @@ class _WearableDeviceConfigurationPageState
   bool _configurationSequenceStarted = false;
   bool _isDisposing = false;
   bool _disconnectionNotified = false;
+  StreamSubscription<WearableAgmReceivedSample>? _agmSamplesSubscription;
 
   @override
   void initState() {
@@ -811,6 +819,8 @@ class _WearableDeviceConfigurationPageState
         setState(() {});
       },
     );
+    _csvLogger = WearableAcquisitionCsvLogger();
+    _gpsLocationService = GpsLocationService();
     unawaited(_service.initialize());
   }
 
@@ -832,6 +842,7 @@ class _WearableDeviceConfigurationPageState
   }
 
   Future<void> _cleanupAndDisconnect() async {
+    await _stopWearableCsvLogging();
     await _service.dispose();
 
     try {
@@ -867,7 +878,10 @@ class _WearableDeviceConfigurationPageState
       _configurationSequenceStarted = true;
     });
 
+    var csvLoggingStarted = false;
     try {
+      await _startWearableCsvLogging();
+      csvLoggingStarted = true;
       await _service.startConfigurationSequence(
         odr: odr,
         mag: mag,
@@ -883,13 +897,25 @@ class _WearableDeviceConfigurationPageState
         MaterialPageRoute<void>(
           builder: (_) => WearableBleCommunicationLogPage(
             service: _service,
+            csvLogger: _csvLogger,
+            stopWearableCsvLogging: _stopWearableCsvLogging,
             onAcquisitionStopped: _notifyDisconnected,
           ),
         ),
       );
-    } catch (_) {
+    } catch (error) {
+      await _stopWearableCsvLogging();
       if (!mounted) {
         return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not start acquisition: $error')),
+      );
+      if (!csvLoggingStarted) {
+        setState(() {
+          _configurationSequenceStarted = false;
+        });
       }
     } finally {
       if (mounted) {
@@ -898,6 +924,29 @@ class _WearableDeviceConfigurationPageState
         });
       }
     }
+  }
+
+  Future<void> _startWearableCsvLogging() async {
+    await _csvLogger.start();
+    await _gpsLocationService.start();
+    await _agmSamplesSubscription?.cancel();
+    _agmSamplesSubscription = _service.agmSamplesStream.listen((event) {
+      unawaited(
+        _csvLogger.appendAgmSample(
+          receivedAt: event.receivedAt,
+          deviceName: widget.deviceName,
+          gpsCoordinates: _gpsLocationService.currentCoordinates,
+          sample: event.sample,
+        ),
+      );
+    });
+  }
+
+  Future<void> _stopWearableCsvLogging() async {
+    await _agmSamplesSubscription?.cancel();
+    _agmSamplesSubscription = null;
+    await _gpsLocationService.stop();
+    await _csvLogger.stop();
   }
 
   @override
@@ -1027,10 +1076,14 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
   const WearableBleCommunicationLogPage({
     super.key,
     required this.service,
+    required this.csvLogger,
+    required this.stopWearableCsvLogging,
     required this.onAcquisitionStopped,
   });
 
   final WearableConfigurationBleService service;
+  final WearableAcquisitionCsvLogger csvLogger;
+  final Future<void> Function() stopWearableCsvLogging;
   final VoidCallback onAcquisitionStopped;
 
   @override
@@ -1053,16 +1106,29 @@ class _WearableBleCommunicationLogPageState
 
     try {
       await widget.service.stopAcquisition();
+      var csvFinalizeFailed = false;
+      try {
+        await widget.stopWearableCsvLogging();
+      } catch (_) {
+        csvFinalizeFailed = true;
+      }
       widget.onAcquisitionStopped();
 
       if (!mounted) {
         return;
       }
 
+      if (csvFinalizeFailed) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not finalize CSV file')),
+        );
+      }
       unawaited(
         Navigator.of(context).pushReplacement(
           MaterialPageRoute<void>(
-            builder: (_) => const WearableAcquisitionCompletedPage(),
+            builder: (_) => WearableAcquisitionCompletedPage(
+              csvLogger: widget.csvLogger,
+            ),
           ),
         ),
       );
@@ -1135,7 +1201,45 @@ class _WearableBleCommunicationLogPageState
 }
 
 class WearableAcquisitionCompletedPage extends StatelessWidget {
-  const WearableAcquisitionCompletedPage({super.key});
+  const WearableAcquisitionCompletedPage({
+    super.key,
+    required this.csvLogger,
+  });
+
+  final WearableAcquisitionCsvLogger csvLogger;
+
+  Future<void> _downloadData(BuildContext context) async {
+    try {
+      await csvLogger.exportToDownloadsOrShare();
+      if (!context.mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('CSV file saved successfully')),
+      );
+    } catch (_) {
+      if (!context.mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not save CSV file')),
+      );
+    }
+  }
+
+  void _goHome(BuildContext context) {
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute<void>(
+        builder: (_) => const SectionPage(
+          sectionName: 'user',
+          message: 'Welcome to the user section!',
+        ),
+      ),
+      (_) => false,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1146,7 +1250,33 @@ class WearableAcquisitionCompletedPage extends StatelessWidget {
           title: const Text('Acquisition completed'),
           automaticallyImplyLeading: false,
         ),
-        body: const SizedBox.shrink(),
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 360),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    FilledButton.icon(
+                      icon: const Icon(Icons.download),
+                      label: const Text('Download data'),
+                      onPressed: () => unawaited(_downloadData(context)),
+                    ),
+                    const SizedBox(height: 24),
+                    IconButton(
+                      icon: const Icon(Icons.home),
+                      iconSize: 40,
+                      onPressed: () => _goHome(context),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
