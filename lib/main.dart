@@ -1120,8 +1120,8 @@ class _WearableBleCommunicationLogPageState
 
     return SafeArea(
       top: false,
-      bottom: false,
-      minimum: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      bottom: true,
+      minimum: const EdgeInsets.fromLTRB(16, 8, 16, 24),
       child: SizedBox(
         width: double.infinity,
         height: 48,
