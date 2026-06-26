@@ -1,8 +1,25 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:ntp/ntp.dart';
+
+enum WearableBleSequenceState {
+  idle,
+  configSent,
+  waitingConfigDone,
+  configDone,
+  calibrationStartSent,
+  waitingCalibrationDone,
+  calibrationDone,
+  preparingStart,
+  startSent,
+  streaming,
+  timeout,
+  error,
+}
 
 class WearableConfigurationBleService {
   WearableConfigurationBleService(
@@ -17,6 +34,10 @@ class WearableConfigurationBleService {
   static const String notifyCharacteristicUuid =
       '00002a05-1212-efde-1523-785feabcd123';
 
+  static const Duration _configDoneTimeout = Duration(seconds: 10);
+  static const Duration _calibrationDoneTimeout = Duration(seconds: 22);
+  static const int _maxLogEntries = 200;
+
   final BluetoothDevice device;
   final VoidCallback? onStateChanged;
 
@@ -27,6 +48,7 @@ class WearableConfigurationBleService {
   BluetoothCharacteristic? _writeCharacteristic;
   BluetoothCharacteristic? _notifyCharacteristic;
   StreamSubscription<List<int>>? _notificationSubscription;
+  Timer? _sequenceTimer;
 
   bool _isDisposed = false;
   bool _mtuRequested = false;
@@ -36,10 +58,27 @@ class WearableConfigurationBleService {
   bool _writeCharacteristicFound = false;
   bool _notifyCharacteristicFound = false;
   bool _notificationsEnabled = false;
+  bool _calibrationEnabled = false;
+  int? _latestBatteryPercent;
+  WearableBleSequenceState _sequenceState = WearableBleSequenceState.idle;
 
   Stream<List<String>> get logsStream => _logController.stream;
 
   List<String> get logs => List.unmodifiable(_logs);
+
+  WearableBleSequenceState get sequenceState => _sequenceState;
+
+  bool get blocksBackNavigation {
+    return switch (_sequenceState) {
+      WearableBleSequenceState.waitingConfigDone ||
+      WearableBleSequenceState.configDone ||
+      WearableBleSequenceState.calibrationStartSent ||
+      WearableBleSequenceState.waitingCalibrationDone ||
+      WearableBleSequenceState.calibrationDone ||
+      WearableBleSequenceState.preparingStart => true,
+      _ => false,
+    };
+  }
 
   bool get isReadyToContinue {
     return _mtuRequested &&
@@ -48,7 +87,8 @@ class WearableConfigurationBleService {
         _targetServiceFound &&
         _writeCharacteristicFound &&
         _notifyCharacteristicFound &&
-        _notificationsEnabled;
+        _notificationsEnabled &&
+        _sequenceState == WearableBleSequenceState.idle;
   }
 
   Future<void> initialize() async {
@@ -69,28 +109,35 @@ class WearableConfigurationBleService {
     await _enableNotifications();
   }
 
-  Future<void> sendConfig({
+  Future<void> startConfigurationSequence({
     required int odr,
     required int mag,
     required int accG,
     required int gyrDPS,
+    required bool calibrationEnabled,
   }) async {
-    final characteristic = _writeCharacteristic;
     final command = 'CONFIG:$odr,$mag,$accG,$gyrDPS';
 
-    if (characteristic == null || !isReadyToContinue) {
+    if (!isReadyToContinue) {
       final message = 'CONFIG write blocked: BLE setup is not complete.';
       _log(message);
       throw StateError(message);
     }
 
+    _calibrationEnabled = calibrationEnabled;
+    _setSequenceState(WearableBleSequenceState.configSent);
+
     try {
-      await characteristic.write(
-        utf8.encode(command),
-        withoutResponse: true,
-      );
+      await _writeCommand(command);
       _log('CONFIG command sent: $command');
+      _setSequenceState(WearableBleSequenceState.waitingConfigDone);
+      _startTimeout(
+        timeout: _configDoneTimeout,
+        expectedPayload: 'CONFIG_DONE',
+        timeoutMessage: 'Timeout waiting for CONFIG_DONE after 10 seconds.',
+      );
     } catch (error) {
+      _setSequenceState(WearableBleSequenceState.error);
       _log('CONFIG write error: $error');
       rethrow;
     }
@@ -102,6 +149,8 @@ class WearableConfigurationBleService {
     }
 
     _isDisposed = true;
+    _sequenceTimer?.cancel();
+    _sequenceTimer = null;
     _log('Wearable BLE service disposal started.');
 
     try {
@@ -234,13 +283,215 @@ class WearableConfigurationBleService {
   }
 
   void _handleNotification(List<int> value) {
-    final payload = utf8.decode(value, allowMalformed: true);
-    if (payload.trim() == 'CONFIG_DONE') {
-      _log('Notification received: CONFIG_DONE');
+    if (WearableAgmPacketParser.startsWithAgmHeader(value)) {
+      _handleAgmPacket(value);
       return;
     }
 
-    _log('Notification received: $payload');
+    final payload = _tryDecodeText(value);
+    if (payload == null) {
+      _log('Unknown binary payload: ${_hexPayload(value)}');
+      return;
+    }
+
+    _log(payload);
+    _handleTextNotification(payload);
+  }
+
+  void _handleAgmPacket(List<int> value) {
+    if (!WearableAgmPacketParser.hasValidLength(value)) {
+      _log(
+        'Invalid AGM packet length: ${value.length} bytes | ${_hexPayload(value)}',
+      );
+      return;
+    }
+
+    try {
+      final sample = WearableAgmPacketParser.parse(value);
+      if (sample.batteryPercent != null) {
+        _latestBatteryPercent = sample.batteryPercent;
+      }
+      _log(_formatAgmSample(sample));
+    } catch (error) {
+      _log('Invalid AGM packet: $error | ${_hexPayload(value)}');
+    }
+  }
+
+  void _handleTextNotification(String payload) {
+    final trigger = payload.trim();
+
+    if (_sequenceState == WearableBleSequenceState.waitingConfigDone &&
+        trigger == 'CONFIG_DONE') {
+      _handleConfigDone();
+      return;
+    }
+
+    if (_sequenceState == WearableBleSequenceState.waitingCalibrationDone &&
+        trigger == 'CALIB_DONE') {
+      _handleCalibrationDone();
+    }
+  }
+
+  void _handleConfigDone() {
+    _sequenceTimer?.cancel();
+    _sequenceTimer = null;
+    _setSequenceState(WearableBleSequenceState.configDone);
+
+    if (_calibrationEnabled) {
+      unawaited(_sendCalibrationStart());
+      return;
+    }
+
+    unawaited(_sendStart());
+  }
+
+  Future<void> _sendCalibrationStart() async {
+    if (_isDisposed) {
+      return;
+    }
+
+    _setSequenceState(WearableBleSequenceState.calibrationStartSent);
+
+    try {
+      await _writeCommand('CALIB_ACC_START');
+      _log('CALIB_ACC_START command sent.');
+      _setSequenceState(WearableBleSequenceState.waitingCalibrationDone);
+      _startTimeout(
+        timeout: _calibrationDoneTimeout,
+        expectedPayload: 'CALIB_DONE',
+        timeoutMessage: 'Timeout waiting for CALIB_DONE after 22 seconds.',
+      );
+    } catch (error) {
+      _setSequenceState(WearableBleSequenceState.error);
+      _log('CALIB_ACC_START write error: $error');
+    }
+  }
+
+  void _handleCalibrationDone() {
+    _sequenceTimer?.cancel();
+    _sequenceTimer = null;
+    _setSequenceState(WearableBleSequenceState.calibrationDone);
+    unawaited(_sendStart());
+  }
+
+  Future<void> _sendStart() async {
+    if (_isDisposed) {
+      return;
+    }
+
+    _setSequenceState(WearableBleSequenceState.preparingStart);
+
+    try {
+      final timestamp = await _currentLocalTimestamp();
+      final command = 'START:$timestamp';
+      await _writeCommand(command);
+      _log('START command sent: $command');
+      _setSequenceState(WearableBleSequenceState.startSent);
+      _setSequenceState(WearableBleSequenceState.streaming);
+      _log('Streaming mode active.');
+    } catch (error) {
+      _setSequenceState(WearableBleSequenceState.error);
+      _log('START write error: $error');
+    }
+  }
+
+  Future<void> _writeCommand(String command) async {
+    final characteristic = _writeCharacteristic;
+    if (characteristic == null || _isDisposed) {
+      throw StateError('Write characteristic is not available.');
+    }
+
+    await characteristic.write(
+      utf8.encode(command),
+      withoutResponse: true,
+    );
+  }
+
+  void _startTimeout({
+    required Duration timeout,
+    required String expectedPayload,
+    required String timeoutMessage,
+  }) {
+    _sequenceTimer?.cancel();
+    _sequenceTimer = Timer(timeout, () {
+      if (_isDisposed) {
+        return;
+      }
+
+      _sequenceTimer = null;
+      _setSequenceState(WearableBleSequenceState.timeout);
+      _log(timeoutMessage);
+      _log('Automatic sequence stopped while waiting for $expectedPayload.');
+    });
+  }
+
+  Future<String> _currentLocalTimestamp() async {
+    DateTime localTime;
+    try {
+      localTime = (await NTP.now().timeout(const Duration(seconds: 5)))
+          .toLocal();
+    } catch (_) {
+      _log('Internet time unavailable, using device local time');
+      localTime = DateTime.now();
+    }
+
+    return _formatTimestamp(localTime);
+  }
+
+  String _formatTimestamp(DateTime value) {
+    final year = value.year.toString().padLeft(4, '0');
+    final month = value.month.toString().padLeft(2, '0');
+    final day = value.day.toString().padLeft(2, '0');
+    final hour = value.hour.toString().padLeft(2, '0');
+    final minute = value.minute.toString().padLeft(2, '0');
+    final second = value.second.toString().padLeft(2, '0');
+    return '$year-$month-$day $hour:$minute:$second';
+  }
+
+  String _formatAgmSample(WearableAgmSample sample) {
+    final batteryText = _latestBatteryPercent == null
+        ? 'N/A'
+        : '${_latestBatteryPercent!}%';
+
+    return 'AGM | '
+        't=${sample.timestampMs} ms | '
+        'acc=(${sample.accX.toStringAsFixed(3)}, '
+        '${sample.accY.toStringAsFixed(3)}, '
+        '${sample.accZ.toStringAsFixed(3)}) g | '
+        'gyr=(${sample.gyrX.toStringAsFixed(2)}, '
+        '${sample.gyrY.toStringAsFixed(2)}, '
+        '${sample.gyrZ.toStringAsFixed(2)}) dps | '
+        'mag=(${sample.magX.toStringAsFixed(2)}, '
+        '${sample.magY.toStringAsFixed(2)}, '
+        '${sample.magZ.toStringAsFixed(2)}) | '
+        'battery=$batteryText';
+  }
+
+  String? _tryDecodeText(List<int> value) {
+    try {
+      final text = utf8.decode(value, allowMalformed: false);
+      final isReadableText = text.runes.every((rune) {
+        return rune == 0x09 ||
+            rune == 0x0A ||
+            rune == 0x0D ||
+            (rune >= 0x20 && rune <= 0x7E);
+      });
+
+      return isReadableText ? text : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String _hexPayload(List<int> value) {
+    return value
+        .map((byte) => byte.toRadixString(16).padLeft(2, '0').toUpperCase())
+        .join(' ');
+  }
+
+  void _setSequenceState(WearableBleSequenceState state) {
+    _sequenceState = state;
+    _log('Sequence state: ${state.name}.');
   }
 
   bool _sameUuid(Guid value, String uuid) {
@@ -252,15 +503,11 @@ class WearableConfigurationBleService {
       return;
     }
 
-    final timestamp = DateTime.now();
-    final formattedTime =
-        '${timestamp.hour.toString().padLeft(2, '0')}:'
-        '${timestamp.minute.toString().padLeft(2, '0')}:'
-        '${timestamp.second.toString().padLeft(2, '0')}';
-    final entry = '[$formattedTime] $message';
-
-    _logs.add(entry);
-    debugPrint(entry);
+    if (_logs.length >= _maxLogEntries) {
+      _logs.removeAt(0);
+    }
+    _logs.add(message);
+    debugPrint(message);
 
     if (!_logController.isClosed) {
       _logController.add(logs);

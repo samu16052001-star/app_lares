@@ -792,7 +792,9 @@ class _WearableDeviceConfigurationPageState
   int mag = 0;
   int accG = 8;
   int gyrDPS = 500;
+  bool calibrationEnabled = false;
   bool _isSendingConfig = false;
+  bool _configurationSequenceStarted = false;
   bool _isDisposing = false;
   bool _disconnectionNotified = false;
 
@@ -847,21 +849,31 @@ class _WearableDeviceConfigurationPageState
     });
   }
 
-  Future<void> _sendConfigAndOpenLog() async {
-    if (!_service.isReadyToContinue || _isSendingConfig) {
+  void _setCalibration(bool enabled) {
+    setState(() {
+      calibrationEnabled = enabled;
+    });
+  }
+
+  Future<void> _startConfigurationSequenceAndOpenLog() async {
+    if (!_service.isReadyToContinue ||
+        _isSendingConfig ||
+        _configurationSequenceStarted) {
       return;
     }
 
     setState(() {
       _isSendingConfig = true;
+      _configurationSequenceStarted = true;
     });
 
     try {
-      await _service.sendConfig(
+      await _service.startConfigurationSequence(
         odr: odr,
         mag: mag,
         accG: accG,
         gyrDPS: gyrDPS,
+        calibrationEnabled: calibrationEnabled,
       );
       if (!mounted) {
         return;
@@ -887,7 +899,9 @@ class _WearableDeviceConfigurationPageState
 
   @override
   Widget build(BuildContext context) {
-    final canContinue = _service.isReadyToContinue && !_isSendingConfig;
+    final canContinue = _service.isReadyToContinue &&
+        !_isSendingConfig &&
+        !_configurationSequenceStarted;
 
     return Scaffold(
       appBar: AppBar(
@@ -915,6 +929,13 @@ class _WearableDeviceConfigurationPageState
                   title: const Text('Magnetometer'),
                   value: mag == 1,
                   onChanged: _setMagnetometer,
+                ),
+                const SizedBox(height: 12),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Calibration'),
+                  value: calibrationEnabled,
+                  onChanged: _setCalibration,
                 ),
                 const SizedBox(height: 12),
                 _buildDropdownSetting(
@@ -958,7 +979,8 @@ class _WearableDeviceConfigurationPageState
               width: double.infinity,
               height: 52,
               child: FilledButton(
-                onPressed: canContinue ? _sendConfigAndOpenLog : null,
+                onPressed:
+                    canContinue ? _startConfigurationSequenceAndOpenLog : null,
                 child: Text(_isSendingConfig ? 'Sending...' : 'Continue'),
               ),
             ),
@@ -1008,25 +1030,28 @@ class WearableBleCommunicationLogPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('BLE Communication Log'),
-      ),
-      body: StreamBuilder<List<String>>(
-        stream: service.logsStream,
-        initialData: service.logs,
-        builder: (context, snapshot) {
-          return Padding(
-            padding: const EdgeInsets.all(16),
-            child: SingleChildScrollView(
-              child: _WearableBleLogView(
-                logs: snapshot.data ?? const [],
-                emptyText: 'Waiting for BLE notifications...',
+    return StreamBuilder<List<String>>(
+      stream: service.logsStream,
+      initialData: service.logs,
+      builder: (context, snapshot) {
+        return PopScope(
+          canPop: !service.blocksBackNavigation,
+          child: Scaffold(
+            appBar: AppBar(
+              title: const Text('BLE Communication Log'),
+            ),
+            body: Padding(
+              padding: const EdgeInsets.all(16),
+              child: SingleChildScrollView(
+                child: _WearableBleLogView(
+                  logs: snapshot.data ?? const [],
+                  emptyText: 'Waiting for BLE notifications...',
+                ),
               ),
             ),
-          );
-        },
-      ),
+          ),
+        );
+      },
     );
   }
 }
