@@ -1011,17 +1011,6 @@ class _WearableDeviceConfigurationPageState
                     });
                   },
                 ),
-                const SizedBox(height: 20),
-                Text(
-                  'Setup Log',
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-                const SizedBox(height: 8),
-                _WearableBleLogView(
-                  logs: _service.logs,
-                  emptyText: 'BLE setup has not produced logs yet.',
-                  maxLines: 8,
-                ),
               ],
             ),
           ),
@@ -1093,7 +1082,109 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
 
 class _WearableBleCommunicationLogPageState
     extends State<WearableBleCommunicationLogPage> {
+  static const Duration _visibleChartWindow = Duration(seconds: 2);
+  static const Duration _uiRefreshInterval = Duration(milliseconds: 500);
+
+  final Map<_WearableMetric, _WearableMetricSeries> _metricSeries = {
+    for (final definition in _wearableMetricDefinitions)
+      definition.metric: _WearableMetricSeries(),
+  };
+
+  StreamSubscription<WearableAgmReceivedSample>? _agmSamplesSubscription;
+  Timer? _uiRefreshTimer;
+  DateTime? _lastUiRefreshAt;
+  DateTime? _latestSampleReceivedAt;
+  int? _latestBatteryPercent;
   bool _isStoppingAcquisition = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _agmSamplesSubscription = widget.service.agmSamplesStream.listen(
+      _handleAgmSample,
+    );
+  }
+
+  @override
+  void dispose() {
+    unawaited(_agmSamplesSubscription?.cancel());
+    _uiRefreshTimer?.cancel();
+    super.dispose();
+  }
+
+  void _handleAgmSample(WearableAgmReceivedSample event) {
+    _latestSampleReceivedAt = event.receivedAt;
+    if (event.sample.batteryPercent != null) {
+      _latestBatteryPercent = event.sample.batteryPercent;
+    }
+
+    final cutoff = event.receivedAt.subtract(_visibleChartWindow);
+    for (final definition in _wearableMetricDefinitions) {
+      final series = _metricSeries[definition.metric];
+      if (series == null) {
+        continue;
+      }
+
+      series
+        ..addSample(
+          receivedAt: event.receivedAt,
+          value: _valueForMetric(definition.metric, event),
+        )
+        ..pruneBefore(cutoff);
+    }
+
+    _requestThrottledUiRefresh();
+  }
+
+  double _valueForMetric(
+    _WearableMetric metric,
+    WearableAgmReceivedSample event,
+  ) {
+    final sample = event.sample;
+    return switch (metric) {
+      _WearableMetric.accelerometerX => sample.accX,
+      _WearableMetric.accelerometerY => sample.accY,
+      _WearableMetric.accelerometerZ => sample.accZ,
+      _WearableMetric.accelerometerMagnitude => math.sqrt(
+          (sample.accX * sample.accX) +
+              (sample.accY * sample.accY) +
+              (sample.accZ * sample.accZ),
+        ),
+      _WearableMetric.gyroscopeX => sample.gyrX,
+      _WearableMetric.gyroscopeY => sample.gyrY,
+      _WearableMetric.gyroscopeZ => sample.gyrZ,
+    };
+  }
+
+  void _requestThrottledUiRefresh() {
+    if (!mounted) {
+      return;
+    }
+
+    final now = DateTime.now();
+    final lastRefresh = _lastUiRefreshAt;
+    if (lastRefresh == null ||
+        now.difference(lastRefresh) >= _uiRefreshInterval) {
+      _lastUiRefreshAt = now;
+      setState(() {});
+      return;
+    }
+
+    if (_uiRefreshTimer != null) {
+      return;
+    }
+
+    final remaining = _uiRefreshInterval - now.difference(lastRefresh);
+    _uiRefreshTimer = Timer(remaining, () {
+      _uiRefreshTimer = null;
+      if (!mounted) {
+        return;
+      }
+
+      _lastUiRefreshAt = DateTime.now();
+      setState(() {});
+    });
+  }
 
   Future<void> _stopAcquisition() async {
     if (_isStoppingAcquisition || widget.service.isStopping) {
@@ -1148,36 +1239,78 @@ class _WearableBleCommunicationLogPageState
 
   @override
   Widget build(BuildContext context) {
-    return StreamBuilder<List<String>>(
-      stream: widget.service.logsStream,
-      initialData: widget.service.logs,
-      builder: (context, snapshot) {
-        return PopScope(
-          canPop: false,
-          child: Scaffold(
-            appBar: AppBar(
-              title: const Text('Acquisition in progress...'),
-              automaticallyImplyLeading: false,
+    return PopScope(
+      canPop: false,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Acquisition in progress...'),
+          automaticallyImplyLeading: false,
+        ),
+        body: Column(
+          children: [
+            Expanded(
+              child: _buildWearableDashboard(),
             ),
-            body: Column(
-              children: [
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: SingleChildScrollView(
-                      child: _WearableBleLogView(
-                        logs: snapshot.data ?? const [],
-                        emptyText: 'Waiting for BLE notifications...',
-                      ),
-                    ),
-                  ),
-                ),
-                _buildStopAcquisitionButton(),
-              ],
-            ),
-          ),
+            _buildStopAcquisitionButton(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWearableDashboard() {
+    return ListView.separated(
+      padding: const EdgeInsets.all(16),
+      itemCount: _wearableMetricDefinitions.length + 1,
+      separatorBuilder: (_, _) => const SizedBox(height: 12),
+      itemBuilder: (context, index) {
+        if (index == 0) {
+          return _buildBatteryBanner(context);
+        }
+
+        final definition = _wearableMetricDefinitions[index - 1];
+        return _WearableMetricChartCard(
+          definition: definition,
+          series: _metricSeries[definition.metric]!,
+          windowEnd: _latestSampleReceivedAt,
+          windowDuration: _visibleChartWindow,
+          formatTime: _formatChartTime,
         );
       },
+    );
+  }
+
+  Widget _buildBatteryBanner(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final batteryText = _latestBatteryPercent == null
+        ? 'Battery: N/A'
+        : 'Battery: $_latestBatteryPercent%';
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        child: Row(
+          children: [
+            Icon(
+              Icons.battery_std,
+              color: colorScheme.primary,
+            ),
+            const SizedBox(width: 12),
+            Text(
+              batteryText,
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1197,6 +1330,480 @@ class _WearableBleCommunicationLogPageState
         ),
       ),
     );
+  }
+
+  String _formatChartTime(DateTime value) {
+    final local = value.toLocal();
+    final hour = local.hour.toString().padLeft(2, '0');
+    final minute = local.minute.toString().padLeft(2, '0');
+    final second = local.second.toString().padLeft(2, '0');
+    return '$hour:$minute:$second';
+  }
+}
+
+enum _WearableMetric {
+  accelerometerX,
+  accelerometerY,
+  accelerometerZ,
+  accelerometerMagnitude,
+  gyroscopeX,
+  gyroscopeY,
+  gyroscopeZ,
+}
+
+const List<_WearableMetricDefinition> _wearableMetricDefinitions = [
+  _WearableMetricDefinition(
+    metric: _WearableMetric.accelerometerX,
+    label: 'Accelerometer X',
+    unit: 'g',
+    decimals: 3,
+    showZeroLine: true,
+  ),
+  _WearableMetricDefinition(
+    metric: _WearableMetric.accelerometerY,
+    label: 'Accelerometer Y',
+    unit: 'g',
+    decimals: 3,
+    showZeroLine: true,
+  ),
+  _WearableMetricDefinition(
+    metric: _WearableMetric.accelerometerZ,
+    label: 'Accelerometer Z',
+    unit: 'g',
+    decimals: 3,
+    showZeroLine: true,
+  ),
+  _WearableMetricDefinition(
+    metric: _WearableMetric.accelerometerMagnitude,
+    label: 'Accelerometer Magnitude',
+    unit: 'g',
+    decimals: 3,
+  ),
+  _WearableMetricDefinition(
+    metric: _WearableMetric.gyroscopeX,
+    label: 'Gyroscope X',
+    unit: 'dps',
+    decimals: 2,
+  ),
+  _WearableMetricDefinition(
+    metric: _WearableMetric.gyroscopeY,
+    label: 'Gyroscope Y',
+    unit: 'dps',
+    decimals: 2,
+  ),
+  _WearableMetricDefinition(
+    metric: _WearableMetric.gyroscopeZ,
+    label: 'Gyroscope Z',
+    unit: 'dps',
+    decimals: 2,
+  ),
+];
+
+class _WearableMetricDefinition {
+  const _WearableMetricDefinition({
+    required this.metric,
+    required this.label,
+    required this.unit,
+    required this.decimals,
+    this.showZeroLine = false,
+  });
+
+  final _WearableMetric metric;
+  final String label;
+  final String unit;
+  final int decimals;
+  final bool showZeroLine;
+
+  String formatValue(double value) {
+    return '${value.toStringAsFixed(decimals)} $unit';
+  }
+}
+
+class _WearableMetricSeries {
+  final List<_WearableChartSample> visibleSamples = [];
+
+  int count = 0;
+  double sum = 0;
+  double? min;
+  double? max;
+  double? latest;
+
+  double? get mean => count == 0 ? null : sum / count;
+
+  void addSample({
+    required DateTime receivedAt,
+    required double value,
+  }) {
+    visibleSamples.add(
+      _WearableChartSample(
+        receivedAt: receivedAt,
+        value: value,
+      ),
+    );
+
+    count++;
+    sum += value;
+    latest = value;
+    min = min == null ? value : math.min(min!, value);
+    max = max == null ? value : math.max(max!, value);
+  }
+
+  void pruneBefore(DateTime cutoff) {
+    while (visibleSamples.isNotEmpty &&
+        visibleSamples.first.receivedAt.isBefore(cutoff)) {
+      visibleSamples.removeAt(0);
+    }
+  }
+}
+
+class _WearableChartSample {
+  const _WearableChartSample({
+    required this.receivedAt,
+    required this.value,
+  });
+
+  final DateTime receivedAt;
+  final double value;
+}
+
+class _WearableMetricChartCard extends StatelessWidget {
+  const _WearableMetricChartCard({
+    required this.definition,
+    required this.series,
+    required this.windowEnd,
+    required this.windowDuration,
+    required this.formatTime,
+  });
+
+  final _WearableMetricDefinition definition;
+  final _WearableMetricSeries series;
+  final DateTime? windowEnd;
+  final Duration windowDuration;
+  final String Function(DateTime value) formatTime;
+
+  static const int _yAxisLabelCount = 3;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colorScheme.surface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: colorScheme.outlineVariant),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.04),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    definition.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  definition.unit,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 180,
+              child: series.visibleSamples.isEmpty || windowEnd == null
+                  ? _buildEmptyChartPlaceholder(context)
+                  : _buildChart(context),
+            ),
+            const SizedBox(height: 10),
+            _buildStatistics(context),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyChartPlaceholder(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      child: Center(
+        child: Text(
+          'No data received yet',
+          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildChart(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final theme = Theme.of(context);
+    final end = windowEnd!;
+    final start = end.subtract(windowDuration);
+    final windowSeconds = windowDuration.inMilliseconds / 1000;
+    final spots = series.visibleSamples.map((sample) {
+      final seconds = sample.receivedAt.difference(start).inMilliseconds / 1000;
+      return FlSpot(seconds.clamp(0, windowSeconds).toDouble(), sample.value);
+    }).toList(growable: false);
+
+    var minY = series.visibleSamples.first.value;
+    var maxY = series.visibleSamples.first.value;
+    for (final sample in series.visibleSamples.skip(1)) {
+      minY = math.min(minY, sample.value);
+      maxY = math.max(maxY, sample.value);
+    }
+
+    if (definition.showZeroLine) {
+      minY = math.min(minY, 0);
+      maxY = math.max(maxY, 0);
+    }
+
+    final yRange = maxY - minY;
+    final yPadding = yRange == 0
+        ? (definition.unit == 'dps' ? 0.1 : 0.01)
+        : yRange * 0.12;
+    final chartMinY = minY - yPadding;
+    final chartMaxY = maxY + yPadding;
+    final yAxisValues = _buildYAxisValues(chartMinY, chartMaxY);
+    final yAxisInterval = _yAxisInterval(chartMinY, chartMaxY);
+    final yAxisLabelStyle = theme.textTheme.bodySmall?.copyWith(
+      color: colorScheme.onSurfaceVariant,
+      fontSize: 11,
+    );
+
+    return Stack(
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(top: 6, right: 4),
+          child: LineChart(
+            LineChartData(
+              minX: 0,
+              maxX: windowSeconds,
+              minY: chartMinY,
+              maxY: chartMaxY,
+              gridData: FlGridData(
+                show: true,
+                horizontalInterval: yAxisInterval,
+                verticalInterval: 1,
+                checkToShowHorizontalLine: (value) =>
+                    _isYAxisValue(value, yAxisValues),
+                getDrawingHorizontalLine: (_) => FlLine(
+                  color: colorScheme.outlineVariant.withValues(alpha: 0.7),
+                  strokeWidth: 0.8,
+                ),
+                getDrawingVerticalLine: (_) => FlLine(
+                  color: colorScheme.outlineVariant.withValues(alpha: 0.35),
+                  strokeWidth: 0.6,
+                ),
+              ),
+              titlesData: FlTitlesData(
+                leftTitles: AxisTitles(
+                  sideTitles: SideTitles(
+                    showTitles: true,
+                    reservedSize: 48,
+                    interval: yAxisInterval,
+                    getTitlesWidget: (value, meta) {
+                      if (!_isYAxisValue(value, yAxisValues)) {
+                        return const SizedBox.shrink();
+                      }
+
+                      return SideTitleWidget(
+                        meta: meta,
+                        space: 6,
+                        child: Text(
+                          value.toStringAsFixed(definition.decimals),
+                          style: yAxisLabelStyle,
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                topTitles: const AxisTitles(
+                  sideTitles: SideTitles(showTitles: false),
+                ),
+                rightTitles: const AxisTitles(
+                  sideTitles: SideTitles(showTitles: false),
+                ),
+                bottomTitles: AxisTitles(
+                  sideTitles: SideTitles(
+                    showTitles: true,
+                    reservedSize: 28,
+                    interval: 1,
+                    getTitlesWidget: (value, meta) {
+                      final rounded = value.roundToDouble();
+                      if ((value - rounded).abs() > 0.001 ||
+                          rounded < 0 ||
+                          rounded > windowSeconds) {
+                        return const SizedBox.shrink();
+                      }
+
+                      final labelTime = start.add(
+                        Duration(milliseconds: (rounded * 1000).round()),
+                      );
+                      return SideTitleWidget(
+                        meta: meta,
+                        space: 6,
+                        child: Text(
+                          formatTime(labelTime),
+                          style: yAxisLabelStyle,
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+              extraLinesData: ExtraLinesData(
+                horizontalLines: [
+                  if (definition.showZeroLine)
+                    HorizontalLine(
+                      y: 0,
+                      color:
+                          colorScheme.onSurfaceVariant.withValues(alpha: 0.42),
+                      strokeWidth: 1,
+                      dashArray: const [6, 4],
+                    ),
+                ],
+              ),
+              borderData: FlBorderData(
+                show: true,
+                border: Border(
+                  left: BorderSide(color: colorScheme.outlineVariant),
+                  bottom: BorderSide(color: colorScheme.outlineVariant),
+                  right: BorderSide(
+                    color: colorScheme.outlineVariant.withValues(alpha: 0.35),
+                  ),
+                  top: BorderSide(
+                    color: colorScheme.outlineVariant.withValues(alpha: 0.35),
+                  ),
+                ),
+              ),
+              lineTouchData: const LineTouchData(enabled: false),
+              lineBarsData: [
+                LineChartBarData(
+                  spots: spots,
+                  isCurved: false,
+                  color: colorScheme.primary,
+                  barWidth: 2.4,
+                  dotData: FlDotData(show: spots.length == 1),
+                  belowBarData: BarAreaData(
+                    show: true,
+                    color: colorScheme.primary.withValues(alpha: 0.08),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        Positioned(
+          top: 10,
+          right: 12,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: colorScheme.surface.withValues(alpha: 0.92),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: colorScheme.outlineVariant),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              child: Text(
+                series.latest == null
+                    ? 'N/A'
+                    : definition.formatValue(series.latest!),
+                maxLines: 1,
+                style: theme.textTheme.titleSmall?.copyWith(
+                  color: colorScheme.onSurface,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStatistics(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final minText = series.min == null
+        ? 'Min: N/A'
+        : 'Min: ${definition.formatValue(series.min!)}';
+    final maxText = series.max == null
+        ? 'Max: N/A'
+        : 'Max: ${definition.formatValue(series.max!)}';
+    final meanText = series.mean == null
+        ? 'Mean: N/A'
+        : 'Mean: ${definition.formatValue(series.mean!)}';
+    final style = theme.textTheme.bodySmall?.copyWith(
+      color: colorScheme.onSurfaceVariant,
+      fontWeight: FontWeight.w600,
+    );
+
+    return Wrap(
+      spacing: 18,
+      runSpacing: 4,
+      children: [
+        Text(minText, style: style),
+        Text(maxText, style: style),
+        Text(meanText, style: style),
+      ],
+    );
+  }
+
+  List<double> _buildYAxisValues(double minY, double maxY) {
+    final interval = _yAxisInterval(minY, maxY);
+
+    return List<double>.generate(
+      _yAxisLabelCount,
+      (index) => minY + interval * index,
+      growable: false,
+    );
+  }
+
+  double _yAxisInterval(double minY, double maxY) {
+    final range = (maxY - minY).abs();
+    if (!range.isFinite || range <= 0) {
+      return 1;
+    }
+
+    return range / (_yAxisLabelCount - 1);
+  }
+
+  bool _isYAxisValue(double value, List<double> yAxisValues) {
+    const tolerance = 0.000001;
+
+    return yAxisValues.any((axisValue) {
+      final scale = math.max(1.0, axisValue.abs());
+      return (value - axisValue).abs() <= tolerance * scale;
+    });
   }
 }
 
@@ -1276,47 +1883,6 @@ class WearableAcquisitionCompletedPage extends StatelessWidget {
               ),
             ),
           ),
-        ),
-      ),
-    );
-  }
-}
-
-class _WearableBleLogView extends StatelessWidget {
-  const _WearableBleLogView({
-    required this.logs,
-    required this.emptyText,
-    this.maxLines,
-  });
-
-  final List<String> logs;
-  final String emptyText;
-  final int? maxLines;
-
-  @override
-  Widget build(BuildContext context) {
-    final visibleLogs = maxLines == null || logs.length <= maxLines!
-        ? logs
-        : logs.sublist(logs.length - maxLines!);
-
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: SizedBox(
-        width: double.infinity,
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: visibleLogs.isEmpty
-              ? Text(
-                  emptyText,
-                  style: Theme.of(context).textTheme.bodySmall,
-                )
-              : SelectableText(
-                  visibleLogs.join('\n'),
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
         ),
       ),
     );
