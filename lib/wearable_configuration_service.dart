@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:app_lares/wearable_agm_packet_parser.dart';
+import 'package:app_lares/wearable_sds_packet_parser.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:ntp/ntp.dart';
@@ -47,6 +48,8 @@ class WearableConfigurationBleService {
       StreamController<List<String>>.broadcast();
   final StreamController<WearableAgmReceivedSample> _agmSamplesController =
       StreamController<WearableAgmReceivedSample>.broadcast();
+  final StreamController<WearableSdsReceivedStatus> _sdsStatusController =
+      StreamController<WearableSdsReceivedStatus>.broadcast();
   final List<String> _logs = [];
 
   BluetoothCharacteristic? _writeCharacteristic;
@@ -63,13 +66,15 @@ class WearableConfigurationBleService {
   bool _notifyCharacteristicFound = false;
   bool _notificationsEnabled = false;
   bool _calibrationEnabled = false;
-  int? _latestBatteryPercent;
   WearableBleSequenceState _sequenceState = WearableBleSequenceState.idle;
 
   Stream<List<String>> get logsStream => _logController.stream;
 
   Stream<WearableAgmReceivedSample> get agmSamplesStream =>
       _agmSamplesController.stream;
+
+  Stream<WearableSdsReceivedStatus> get sdsStatusStream =>
+      _sdsStatusController.stream;
 
   List<String> get logs => List.unmodifiable(_logs);
 
@@ -188,6 +193,7 @@ class WearableConfigurationBleService {
     _isDisposed = true;
     await _logController.close();
     await _agmSamplesController.close();
+    await _sdsStatusController.close();
   }
 
   Future<void> dispose() async {
@@ -223,6 +229,7 @@ class WearableConfigurationBleService {
     _log('Wearable BLE service disposed.');
     await _logController.close();
     await _agmSamplesController.close();
+    await _sdsStatusController.close();
   }
 
   Future<void> _cleanupAfterStop() async {
@@ -364,6 +371,11 @@ class WearableConfigurationBleService {
       return;
     }
 
+    if (WearableSdsPacketParser.startsWithSdsHeader(value)) {
+      _handleSdsPacket(value, receivedAt);
+      return;
+    }
+
     final payload = _tryDecodeText(value);
     if (payload == null) {
       _log('Unknown binary payload: ${_hexPayload(value)}');
@@ -384,9 +396,6 @@ class WearableConfigurationBleService {
 
     try {
       final sample = WearableAgmPacketParser.parse(value);
-      if (sample.batteryPercent != null) {
-        _latestBatteryPercent = sample.batteryPercent;
-      }
       if (!_agmSamplesController.isClosed) {
         _agmSamplesController.add(
           WearableAgmReceivedSample(
@@ -398,6 +407,23 @@ class WearableConfigurationBleService {
       _log(_formatAgmSample(sample));
     } catch (error) {
       _log('Invalid AGM packet: $error | ${_hexPayload(value)}');
+    }
+  }
+
+  void _handleSdsPacket(List<int> value, DateTime receivedAt) {
+    try {
+      final status = WearableSdsPacketParser.parse(value);
+      if (!_sdsStatusController.isClosed) {
+        _sdsStatusController.add(
+          WearableSdsReceivedStatus(
+            receivedAt: receivedAt,
+            batteryPercent: status.batteryPercent,
+            flushFailureRate: status.flushFailureRate,
+          ),
+        );
+      }
+    } catch (_) {
+      // Invalid SDS packets are intentionally ignored.
     }
   }
 
@@ -533,10 +559,6 @@ class WearableConfigurationBleService {
   }
 
   String _formatAgmSample(WearableAgmSample sample) {
-    final batteryText = _latestBatteryPercent == null
-        ? 'N/A'
-        : '${_latestBatteryPercent!}%';
-
     return 'AGM | '
         't=${sample.timestampMs} ms | '
         'acc=(${sample.accX.toStringAsFixed(3)}, '
@@ -547,8 +569,7 @@ class WearableConfigurationBleService {
         '${sample.gyrZ.toStringAsFixed(2)}) dps | '
         'mag=(${sample.magX.toStringAsFixed(2)}, '
         '${sample.magY.toStringAsFixed(2)}, '
-        '${sample.magZ.toStringAsFixed(2)}) | '
-        'battery=$batteryText';
+        '${sample.magZ.toStringAsFixed(2)})';
   }
 
   String? _tryDecodeText(List<int> value) {
@@ -608,4 +629,16 @@ class WearableAgmReceivedSample {
 
   final DateTime receivedAt;
   final WearableAgmSample sample;
+}
+
+class WearableSdsReceivedStatus {
+  const WearableSdsReceivedStatus({
+    required this.receivedAt,
+    required this.batteryPercent,
+    required this.flushFailureRate,
+  });
+
+  final DateTime receivedAt;
+  final int batteryPercent;
+  final int flushFailureRate;
 }

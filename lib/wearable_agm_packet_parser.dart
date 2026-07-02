@@ -12,7 +12,6 @@ class WearableAgmSample {
     required this.magX,
     required this.magY,
     required this.magZ,
-    required this.batteryPercent,
   });
 
   final int timestampMs;
@@ -25,12 +24,10 @@ class WearableAgmSample {
   final double magX;
   final double magY;
   final double magZ;
-  final int? batteryPercent;
 }
 
 class WearableAgmPacketParser {
-  static const int packetLengthWithoutBattery = 43;
-  static const int packetLengthWithBattery = 44;
+  static const int packetLength = 43;
 
   static bool startsWithAgmHeader(List<int> payload) {
     return payload.length >= 3 &&
@@ -40,8 +37,7 @@ class WearableAgmPacketParser {
   }
 
   static bool hasValidLength(List<int> payload) {
-    return payload.length == packetLengthWithoutBattery ||
-        payload.length == packetLengthWithBattery;
+    return payload.length == packetLength;
   }
 
   static WearableAgmSample parse(List<int> payload) {
@@ -66,8 +62,6 @@ class WearableAgmPacketParser {
       magX: data.getFloat32(31, Endian.little),
       magY: data.getFloat32(35, Endian.little),
       magZ: data.getFloat32(39, Endian.little),
-      batteryPercent:
-          payload.length == packetLengthWithBattery ? data.getUint8(43) : null,
     );
   }
 }

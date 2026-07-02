@@ -1091,10 +1091,12 @@ class _WearableBleCommunicationLogPageState
   };
 
   StreamSubscription<WearableAgmReceivedSample>? _agmSamplesSubscription;
+  StreamSubscription<WearableSdsReceivedStatus>? _sdsStatusSubscription;
   Timer? _uiRefreshTimer;
   DateTime? _lastUiRefreshAt;
   DateTime? _latestSampleReceivedAt;
   int? _latestBatteryPercent;
+  int? _latestFlushFailureRate;
   bool _isStoppingAcquisition = false;
 
   @override
@@ -1103,20 +1105,21 @@ class _WearableBleCommunicationLogPageState
     _agmSamplesSubscription = widget.service.agmSamplesStream.listen(
       _handleAgmSample,
     );
+    _sdsStatusSubscription = widget.service.sdsStatusStream.listen(
+      _handleSdsStatus,
+    );
   }
 
   @override
   void dispose() {
     unawaited(_agmSamplesSubscription?.cancel());
+    unawaited(_sdsStatusSubscription?.cancel());
     _uiRefreshTimer?.cancel();
     super.dispose();
   }
 
   void _handleAgmSample(WearableAgmReceivedSample event) {
     _latestSampleReceivedAt = event.receivedAt;
-    if (event.sample.batteryPercent != null) {
-      _latestBatteryPercent = event.sample.batteryPercent;
-    }
 
     final cutoff = event.receivedAt.subtract(_visibleChartWindow);
     for (final definition in _wearableMetricDefinitions) {
@@ -1133,6 +1136,12 @@ class _WearableBleCommunicationLogPageState
         ..pruneBefore(cutoff);
     }
 
+    _requestThrottledUiRefresh();
+  }
+
+  void _handleSdsStatus(WearableSdsReceivedStatus event) {
+    _latestBatteryPercent = event.batteryPercent;
+    _latestFlushFailureRate = event.flushFailureRate;
     _requestThrottledUiRefresh();
   }
 
@@ -1265,7 +1274,7 @@ class _WearableBleCommunicationLogPageState
       separatorBuilder: (_, _) => const SizedBox(height: 12),
       itemBuilder: (context, index) {
         if (index == 0) {
-          return _buildBatteryBanner(context);
+          return _buildStatusBoxes(context);
         }
 
         final definition = _wearableMetricDefinitions[index - 1];
@@ -1280,12 +1289,46 @@ class _WearableBleCommunicationLogPageState
     );
   }
 
-  Widget _buildBatteryBanner(BuildContext context) {
-    final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
+  Widget _buildStatusBoxes(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     final batteryText = _latestBatteryPercent == null
         ? 'Battery: N/A'
         : 'Battery: $_latestBatteryPercent%';
+    final flushFailureRateText = _latestFlushFailureRate == null
+        ? 'Flush failure rate: N/A'
+        : 'Flush failure rate: $_latestFlushFailureRate';
+
+    return Row(
+      children: [
+        Expanded(
+          child: _buildStatusBox(
+            context: context,
+            icon: Icons.battery_std,
+            text: batteryText,
+            iconColor: colorScheme.primary,
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: _buildStatusBox(
+            context: context,
+            icon: Icons.warning_amber_rounded,
+            text: flushFailureRateText,
+            iconColor: colorScheme.tertiary,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStatusBox({
+    required BuildContext context,
+    required IconData icon,
+    required String text,
+    required Color iconColor,
+  }) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
 
     return DecoratedBox(
       decoration: BoxDecoration(
@@ -1298,14 +1341,16 @@ class _WearableBleCommunicationLogPageState
         child: Row(
           children: [
             Icon(
-              Icons.battery_std,
-              color: colorScheme.primary,
+              icon,
+              color: iconColor,
             ),
             const SizedBox(width: 12),
-            Text(
-              batteryText,
-              style: theme.textTheme.titleMedium?.copyWith(
-                fontWeight: FontWeight.w700,
+            Expanded(
+              child: Text(
+                text,
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
               ),
             ),
           ],
