@@ -7,7 +7,9 @@ import 'package:app_lares/services/acquisition_csv_logger.dart';
 import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
+import 'package:app_lares/services/unified_acquisition_csv_logger.dart';
 import 'package:app_lares/services/wearable_acquisition_csv_logger.dart';
+import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:app_lares/wearable_configuration_service.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -258,6 +260,638 @@ class AutomaticConfigurationPage extends StatelessWidget {
   }
 }
 
+enum KnownDeviceType {
+  environmentalMonitor,
+  respiratoryMonitor,
+  unsupported,
+}
+
+extension KnownDeviceTypeLabel on KnownDeviceType {
+  String get label {
+    return switch (this) {
+      KnownDeviceType.environmentalMonitor => 'Environmental Monitor',
+      KnownDeviceType.respiratoryMonitor => 'Respiratory Monitor / IMU',
+      KnownDeviceType.unsupported => 'Unsupported device',
+    };
+  }
+}
+
+class KnownDeviceClassifier {
+  const KnownDeviceClassifier._();
+
+  static KnownDeviceType fromNames(Iterable<String> names) {
+    final normalizedNames = names.map(_normalizeDeviceName);
+
+    if (normalizedNames.any((name) => name.contains('env'))) {
+      return KnownDeviceType.environmentalMonitor;
+    }
+
+    if (normalizedNames.any(
+      (name) => name.contains('respiratorymonitor') || name.contains('imu'),
+    )) {
+      return KnownDeviceType.respiratoryMonitor;
+    }
+
+    return KnownDeviceType.unsupported;
+  }
+
+  static bool matchesLaresFilter(Iterable<String> names) {
+    return names.map(_normalizeDeviceName).any((name) {
+      return name.contains('lares') ||
+          name.contains('env') ||
+          name.contains('respiratorymonitor') ||
+          name.contains('imu');
+    });
+  }
+
+  static String _normalizeDeviceName(String value) {
+    return value.trim().toLowerCase();
+  }
+}
+
+class WearableDeviceConfiguration {
+  const WearableDeviceConfiguration({
+    required this.odr,
+    required this.mag,
+    required this.accG,
+    required this.gyrDPS,
+    required this.calibrationEnabled,
+  });
+
+  final int odr;
+  final int mag;
+  final int accG;
+  final int gyrDPS;
+  final bool calibrationEnabled;
+}
+
+class _ConnectedDeviceSession {
+  _ConnectedDeviceSession({
+    required this.device,
+    required this.deviceId,
+    required this.deviceName,
+    required this.type,
+  });
+
+  static const Duration wearableVisibleChartWindow = Duration(seconds: 2);
+
+  final BluetoothDevice device;
+  final String deviceId;
+  final String deviceName;
+  final KnownDeviceType type;
+
+  BleConfiguration? environmentalConfiguration;
+  WearableDeviceConfiguration? wearableConfiguration;
+  BleConfigurationService? environmentalService;
+  WearableConfigurationBleService? wearableService;
+  StreamSubscription<BluetoothConnectionState>? connectionSubscription;
+  StreamSubscription<BleNotificationMessage>? environmentalMessagesSubscription;
+  StreamSubscription<WearableAgmReceivedSample>? agmSamplesSubscription;
+  StreamSubscription<WearableSdsReceivedStatus>? sdsStatusSubscription;
+
+  bool isConnected = true;
+  bool isInitializing = false;
+  bool isInitialized = false;
+  bool disconnectedDuringAcquisition = false;
+  String? errorMessage;
+
+  final List<BleNotificationMessage> environmentalMessages = [];
+  final Map<String, _LiveMeasurementValue> liveMeasurementValues = {};
+  final Map<String, List<_MeasurementChartSample>> chartSamplesByPrefix = {};
+  _LiveVisualizationMode visualizationMode = _LiveVisualizationMode.cards;
+
+  final Map<_WearableMetric, _WearableMetricSeries> wearableMetricSeries = {
+    for (final definition in _wearableMetricDefinitions)
+      definition.metric: _WearableMetricSeries(),
+  };
+  DateTime? latestWearableSampleReceivedAt;
+  int? latestBatteryPercent;
+  int? latestFlushFailureRate;
+
+  bool get isConfigured {
+    return switch (type) {
+      KnownDeviceType.environmentalMonitor => environmentalConfiguration != null,
+      KnownDeviceType.respiratoryMonitor => wearableConfiguration != null,
+      KnownDeviceType.unsupported => false,
+    };
+  }
+
+  List<_MeasurementDefinition> get visibleMeasurements {
+    final configuration = environmentalConfiguration;
+    if (configuration == null) {
+      return const [];
+    }
+
+    return _measurementDefinitions
+        .where(
+          (definition) =>
+              configuration.enabledOptions[definition.label] ?? false,
+        )
+        .toList(growable: false);
+  }
+
+  Map<String, _MeasurementDefinition> get visibleMeasurementsByPrefix {
+    return {
+      for (final definition in visibleMeasurements)
+        definition.prefix: definition,
+    };
+  }
+
+  Future<void> cancelLiveSubscriptions() async {
+    await environmentalMessagesSubscription?.cancel();
+    environmentalMessagesSubscription = null;
+    await agmSamplesSubscription?.cancel();
+    agmSamplesSubscription = null;
+    await sdsStatusSubscription?.cancel();
+    sdsStatusSubscription = null;
+  }
+
+  Future<void> cancelConnectionSubscription() async {
+    await connectionSubscription?.cancel();
+    connectionSubscription = null;
+  }
+}
+
+class _MultiDeviceSessionManager extends ChangeNotifier {
+  _MultiDeviceSessionManager();
+
+  final List<_ConnectedDeviceSession> _sessions = [];
+  final UnifiedAcquisitionCsvLogger csvLogger = UnifiedAcquisitionCsvLogger();
+  final GpsLocationService gpsLocationService = GpsLocationService();
+  final OpenRemoteMqttService mqttService = OpenRemoteMqttService();
+
+  StreamSubscription<OpenRemoteMqttState>? _mqttStateSubscription;
+  OpenRemoteMqttState mqttState = const OpenRemoteMqttState(
+    status: OpenRemoteMqttStatus.disconnected,
+  );
+  bool _initializationStarted = false;
+  bool _acquisitionStarted = false;
+  bool _isStopping = false;
+  bool _disposed = false;
+
+  List<_ConnectedDeviceSession> get sessions => List.unmodifiable(_sessions);
+
+  int get connectedCount {
+    return _sessions.where((session) => session.isConnected).length;
+  }
+
+  bool get hasConnectedDevices => connectedCount > 0;
+
+  bool get allConnectedDevicesConfigured {
+    final connectedSessions = _sessions.where((session) => session.isConnected);
+    return connectedSessions.isNotEmpty &&
+        connectedSessions.every((session) => session.isConfigured);
+  }
+
+  bool get isStopping => _isStopping;
+
+  bool get canUseOpenRemote {
+    return _sessions.length == 1 &&
+        _sessions.first.type == KnownDeviceType.environmentalMonitor;
+  }
+
+  void addConnectedSession(_ConnectedDeviceSession session) {
+    if (_sessions.any((existing) => existing.deviceId == session.deviceId)) {
+      return;
+    }
+
+    _sessions.add(session);
+    _attachConnectionListener(session);
+    notifyListeners();
+  }
+
+  Future<void> disconnectAndRemove(_ConnectedDeviceSession session) async {
+    await session.cancelConnectionSubscription();
+    await session.cancelLiveSubscriptions();
+    try {
+      await session.environmentalService?.dispose();
+    } catch (_) {}
+    try {
+      await session.wearableService?.dispose();
+    } catch (_) {}
+    try {
+      await session.device.disconnect();
+    } catch (_) {}
+    _sessions.removeWhere((candidate) => candidate.deviceId == session.deviceId);
+    notifyListeners();
+  }
+
+  void configureEnvironmental(
+    _ConnectedDeviceSession session,
+    BleConfiguration configuration,
+  ) {
+    session.environmentalConfiguration = configuration;
+    notifyListeners();
+  }
+
+  void configureWearable(
+    _ConnectedDeviceSession session,
+    WearableDeviceConfiguration configuration,
+  ) {
+    session.wearableConfiguration = configuration;
+    notifyListeners();
+  }
+
+  Future<void> initializeAllSequentially() async {
+    if (_initializationStarted) {
+      return;
+    }
+
+    _initializationStarted = true;
+    await csvLogger.start();
+    await gpsLocationService.start();
+
+    if (canUseOpenRemote) {
+      _mqttStateSubscription = mqttService.states.listen((state) {
+        mqttState = state;
+        if (state.status == OpenRemoteMqttStatus.failed &&
+            state.message != null &&
+            _sessions.isNotEmpty) {
+          _appendEnvironmentalLog(_sessions.first, 'OpenRemote: ${state.message}');
+        }
+        notifyListeners();
+      });
+    }
+
+    try {
+      for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
+        if (!session.isConnected) {
+          throw StateError('${session.deviceName} is disconnected.');
+        }
+        if (!session.isConfigured) {
+          throw StateError('${session.deviceName} is not configured.');
+        }
+
+        session
+          ..isInitializing = true
+          ..errorMessage = null;
+        notifyListeners();
+
+        switch (session.type) {
+          case KnownDeviceType.environmentalMonitor:
+            await _initializeEnvironmental(session);
+            break;
+          case KnownDeviceType.respiratoryMonitor:
+            await _initializeWearable(session);
+            break;
+          case KnownDeviceType.unsupported:
+            throw StateError('${session.deviceName} is unsupported.');
+        }
+
+        session
+          ..isInitializing = false
+          ..isInitialized = true;
+        notifyListeners();
+      }
+
+      _acquisitionStarted = true;
+      notifyListeners();
+    } catch (error) {
+      await stopAll();
+      _initializationStarted = false;
+      rethrow;
+    }
+  }
+
+  Future<void> connectOpenRemote() async {
+    if (!canUseOpenRemote ||
+        mqttState.status == OpenRemoteMqttStatus.connecting ||
+        mqttState.status == OpenRemoteMqttStatus.connected) {
+      return;
+    }
+
+    await mqttService.connect();
+  }
+
+  void setVisualizationMode(
+    _ConnectedDeviceSession session,
+    _LiveVisualizationMode mode,
+  ) {
+    session.visualizationMode = mode;
+    notifyListeners();
+  }
+
+  Future<void> stopAll() async {
+    if (_isStopping) {
+      return;
+    }
+
+    _isStopping = true;
+    notifyListeners();
+
+    for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
+      await session.cancelLiveSubscriptions();
+      switch (session.type) {
+        case KnownDeviceType.environmentalMonitor:
+          try {
+            await session.environmentalService?.dispose();
+          } catch (_) {}
+          try {
+            await session.device.disconnect();
+          } catch (_) {}
+          break;
+        case KnownDeviceType.respiratoryMonitor:
+          final service = session.wearableService;
+          if (service != null && !service.isStopped) {
+            try {
+              await service.stopAcquisition();
+            } catch (_) {
+              try {
+                await service.dispose();
+              } catch (_) {}
+            }
+          }
+          break;
+        case KnownDeviceType.unsupported:
+          try {
+            await session.device.disconnect();
+          } catch (_) {}
+          break;
+      }
+      session.isConnected = false;
+    }
+
+    await _mqttStateSubscription?.cancel();
+    _mqttStateSubscription = null;
+    try {
+      await mqttService.dispose();
+    } catch (_) {}
+    await gpsLocationService.stop();
+    await csvLogger.stop();
+    _acquisitionStarted = false;
+    _isStopping = false;
+    notifyListeners();
+  }
+
+  Future<void> disposeSessions() async {
+    if (_disposed) {
+      return;
+    }
+
+    _disposed = true;
+    for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
+      await session.cancelConnectionSubscription();
+      await session.cancelLiveSubscriptions();
+      if (!_acquisitionStarted) {
+        try {
+          await session.environmentalService?.dispose();
+        } catch (_) {}
+        try {
+          await session.wearableService?.dispose();
+        } catch (_) {}
+        try {
+          await session.device.disconnect();
+        } catch (_) {}
+      }
+    }
+    await _mqttStateSubscription?.cancel();
+    if (!_acquisitionStarted) {
+      try {
+        await mqttService.dispose();
+      } catch (_) {}
+      await csvLogger.stop();
+    }
+    await gpsLocationService.dispose();
+  }
+
+  void _attachConnectionListener(_ConnectedDeviceSession session) {
+    session.connectionSubscription = session.device.connectionState.listen(
+      (state) {
+        final isConnected = state != BluetoothConnectionState.disconnected;
+        if (session.isConnected == isConnected) {
+          return;
+        }
+
+        session.isConnected = isConnected;
+        if (!isConnected) {
+          if (_acquisitionStarted) {
+            session.disconnectedDuringAcquisition = true;
+          } else {
+            unawaited(session.cancelConnectionSubscription());
+            _sessions.removeWhere(
+              (candidate) => candidate.deviceId == session.deviceId,
+            );
+          }
+        }
+        notifyListeners();
+      },
+    );
+  }
+
+  Future<void> _initializeEnvironmental(_ConnectedDeviceSession session) async {
+    final configuration = session.environmentalConfiguration!;
+    final service = BleConfigurationService(session.device);
+    session.environmentalService = service;
+    session.environmentalMessagesSubscription = service.messages.listen(
+      (message) {
+        _handleEnvironmentalMessage(session, message);
+      },
+    );
+
+    await service.initialize(configuration);
+  }
+
+  Future<void> _initializeWearable(_ConnectedDeviceSession session) async {
+    final configuration = session.wearableConfiguration!;
+    final service = WearableConfigurationBleService(
+      session.device,
+      onStateChanged: notifyListeners,
+    );
+    session.wearableService = service;
+    session.agmSamplesSubscription = service.agmSamplesStream.listen(
+      (event) {
+        _handleWearableAgmSample(session, event);
+      },
+    );
+    session.sdsStatusSubscription = service.sdsStatusStream.listen(
+      (event) {
+        session.latestBatteryPercent = event.batteryPercent;
+        session.latestFlushFailureRate = event.flushFailureRate;
+        notifyListeners();
+      },
+    );
+
+    await service.initialize();
+    if (!service.isReadyToContinue) {
+      throw StateError('${session.deviceName} BLE setup is not complete.');
+    }
+
+    await service.startConfigurationSequence(
+      odr: configuration.odr,
+      mag: configuration.mag,
+      accG: configuration.accG,
+      gyrDPS: configuration.gyrDPS,
+      calibrationEnabled: configuration.calibrationEnabled,
+    );
+
+    final state = service.sequenceState == WearableBleSequenceState.streaming
+        ? WearableBleSequenceState.streaming
+        : await service.sequenceStateStream.firstWhere((state) {
+            return state == WearableBleSequenceState.streaming ||
+                state == WearableBleSequenceState.timeout ||
+                state == WearableBleSequenceState.error ||
+                state == WearableBleSequenceState.stopped;
+          });
+    if (state != WearableBleSequenceState.streaming) {
+      throw StateError('${session.deviceName} did not enter streaming mode.');
+    }
+  }
+
+  void _handleEnvironmentalMessage(
+    _ConnectedDeviceSession session,
+    BleNotificationMessage message,
+  ) {
+    session.environmentalMessages.add(message);
+    _updateEnvironmentalLiveMeasurement(session, message);
+    unawaited(
+      csvLogger.appendEnvironmentalMessage(
+        receivedAt: message.receivedAt,
+        deviceName: session.deviceName,
+        gpsCoordinates: gpsLocationService.currentCoordinates,
+        value: message.value,
+      ),
+    );
+    if (canUseOpenRemote) {
+      unawaited(_publishPm10IfConnected(session, message.value));
+    }
+    notifyListeners();
+  }
+
+  void _updateEnvironmentalLiveMeasurement(
+    _ConnectedDeviceSession session,
+    BleNotificationMessage message,
+  ) {
+    final separatorIndex = message.value.indexOf(':');
+    if (separatorIndex <= 0) {
+      return;
+    }
+
+    final prefix = message.value.substring(0, separatorIndex);
+    final definition = session.visibleMeasurementsByPrefix[prefix];
+    if (definition == null) {
+      return;
+    }
+
+    final rawValue = message.value.substring(separatorIndex + 1);
+    final parsedValue = double.tryParse(rawValue);
+    if (parsedValue == null) {
+      return;
+    }
+
+    final previous = session.liveMeasurementValues[definition.prefix];
+    session.liveMeasurementValues[definition.prefix] = _LiveMeasurementValue(
+      formattedValue: parsedValue.toStringAsFixed(1),
+      updatedAt: message.receivedAt,
+      updateCount: (previous?.updateCount ?? 0) + 1,
+    );
+
+    final samples = session.chartSamplesByPrefix.putIfAbsent(
+      definition.prefix,
+      () => [],
+    );
+    samples.add(
+      _MeasurementChartSample(
+        receivedAt: message.receivedAt,
+        value: parsedValue,
+      ),
+    );
+    if (samples.length > 100) {
+      samples.removeRange(0, samples.length - 100);
+    }
+  }
+
+  Future<void> _publishPm10IfConnected(
+    _ConnectedDeviceSession session,
+    String bleValue,
+  ) async {
+    if (!mqttService.isConnected) {
+      return;
+    }
+
+    final pm10 = parsePm10Value(bleValue);
+    if (pm10 == null) {
+      return;
+    }
+
+    final sent = await mqttService.publishPm10(pm10);
+    if (sent) {
+      _appendEnvironmentalLog(session, 'MQTT sent - PM10: ${_formatPm10(pm10)}');
+    }
+  }
+
+  void _appendEnvironmentalLog(
+    _ConnectedDeviceSession session,
+    String value,
+  ) {
+    session.environmentalMessages.add(
+      BleNotificationMessage(
+        receivedAt: DateTime.now(),
+        value: value,
+      ),
+    );
+  }
+
+  String _formatPm10(double value) {
+    if (value == value.truncateToDouble()) {
+      return value.toInt().toString();
+    }
+
+    return value.toString();
+  }
+
+  void _handleWearableAgmSample(
+    _ConnectedDeviceSession session,
+    WearableAgmReceivedSample event,
+  ) {
+    session.latestWearableSampleReceivedAt = event.receivedAt;
+    final cutoff = event.receivedAt.subtract(
+      _ConnectedDeviceSession.wearableVisibleChartWindow,
+    );
+    for (final definition in _wearableMetricDefinitions) {
+      final series = session.wearableMetricSeries[definition.metric];
+      if (series == null) {
+        continue;
+      }
+
+      series
+        ..addSample(
+          receivedAt: event.receivedAt,
+          value: _valueForWearableMetric(definition.metric, event.sample),
+        )
+        ..pruneBefore(cutoff);
+    }
+
+    unawaited(
+      csvLogger.appendWearableAgmSample(
+        receivedAt: event.receivedAt,
+        deviceName: session.deviceName,
+        gpsCoordinates: gpsLocationService.currentCoordinates,
+        sample: event.sample,
+      ),
+    );
+    notifyListeners();
+  }
+
+  double _valueForWearableMetric(
+    _WearableMetric metric,
+    WearableAgmSample sample,
+  ) {
+    return switch (metric) {
+      _WearableMetric.accelerometerX => sample.accX,
+      _WearableMetric.accelerometerY => sample.accY,
+      _WearableMetric.accelerometerZ => sample.accZ,
+      _WearableMetric.accelerometerMagnitude => math.sqrt(
+          (sample.accX * sample.accX) +
+              (sample.accY * sample.accY) +
+              (sample.accZ * sample.accZ),
+        ),
+      _WearableMetric.gyroscopeX => sample.gyrX,
+      _WearableMetric.gyroscopeY => sample.gyrY,
+      _WearableMetric.gyroscopeZ => sample.gyrZ,
+    };
+  }
+}
+
 class BluetoothScanningPage extends StatefulWidget {
   const BluetoothScanningPage({super.key});
 
@@ -269,7 +903,8 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   final Map<String, ScanResult> _scanResults = {};
   final Map<String, int> _discoveryOrder = {};
   final Set<String> _connectingDeviceIds = {};
-  final Set<String> _connectedDeviceIds = {};
+  final _MultiDeviceSessionManager _sessionManager =
+      _MultiDeviceSessionManager();
   StreamSubscription<List<ScanResult>>? _scanSubscription;
   StreamSubscription<bool>? _isScanningSubscription;
 
@@ -282,15 +917,26 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   @override
   void initState() {
     super.initState();
+    _sessionManager.addListener(_handleSessionManagerChanged);
     _listenToScanState();
   }
 
   @override
   void dispose() {
+    _sessionManager.removeListener(_handleSessionManagerChanged);
     _scanSubscription?.cancel();
     _isScanningSubscription?.cancel();
     FlutterBluePlus.stopScan();
+    unawaited(_sessionManager.disposeSessions());
     super.dispose();
+  }
+
+  void _handleSessionManagerChanged() {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {});
   }
 
   void _listenToScanState() {
@@ -305,11 +951,13 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     });
   }
 
-  Future<void> _startScan() async {
+  Future<void> _startScan({bool clearResults = true}) async {
     setState(() {
-      _scanResults.clear();
-      _discoveryOrder.clear();
-      _nextDiscoveryIndex = 0;
+      if (clearResults) {
+        _scanResults.clear();
+        _discoveryOrder.clear();
+        _nextDiscoveryIndex = 0;
+      }
       _statusMessage = null;
     });
 
@@ -409,9 +1057,10 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   Future<void> _toggleConnection(ScanResult result) async {
     final device = result.device;
     final id = _deviceId(device);
+    final session = _sessionForDeviceId(id);
 
-    if (_connectedDeviceIds.contains(id)) {
-      await _disconnectFromDevice(result);
+    if (session != null) {
+      await _disconnectFromSession(session);
       return;
     }
 
@@ -422,6 +1071,11 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     final device = result.device;
     final id = _deviceId(device);
     final displayName = _displayDeviceName(result);
+    final deviceType = _deviceType(result);
+
+    if (deviceType == KnownDeviceType.unsupported) {
+      return;
+    }
 
     setState(() {
       _connectingDeviceIds.add(id);
@@ -438,14 +1092,19 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         return;
       }
 
+      _sessionManager.addConnectedSession(
+        _ConnectedDeviceSession(
+          device: device,
+          deviceId: id,
+          deviceName: displayName,
+          type: deviceType,
+        ),
+      );
       setState(() {
-        _connectedDeviceIds.add(id);
+        _statusMessage = 'Connected to $displayName.';
       });
-
-      if (_isEnvDevice(result)) {
-        await _openDeviceConfigurationPage(device);
-      } else if (_isWearableConfigurationDevice(result)) {
-        await _openWearableDeviceConfigurationPage(device, displayName);
+      if (!_isScanning) {
+        unawaited(_startScan(clearResults: false));
       }
     } catch (error) {
       if (!mounted) {
@@ -464,33 +1123,8 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     }
   }
 
-  bool _isEnvDevice(ScanResult result) {
-    return _matchesAnyDeviceName(result, const ['env']);
-  }
-
-  bool _isWearableConfigurationDevice(ScanResult result) {
-    return _matchesAnyDeviceName(
-      result,
-      const ['respiratorymonitor', 'imu'],
-    );
-  }
-
   bool _isLaresFilterDevice(ScanResult result) {
-    return _matchesAnyDeviceName(
-      result,
-      const ['lares', 'respiratorymonitor', 'imu'],
-    );
-  }
-
-  bool _matchesAnyDeviceName(ScanResult result, List<String> needles) {
-    return _deviceNameCandidates(result).any((name) {
-      final normalizedName = _normalizeDeviceName(name);
-      return needles.any((needle) => normalizedName.contains(needle));
-    });
-  }
-
-  String _normalizeDeviceName(String value) {
-    return value.trim().toLowerCase();
+    return KnownDeviceClassifier.matchesLaresFilter(_deviceNameCandidates(result));
   }
 
   List<String> _deviceNameCandidates(ScanResult result) {
@@ -514,7 +1148,25 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     return names.isEmpty ? 'Unknown device' : names.first;
   }
 
-  Future<void> _openDeviceConfigurationPage(BluetoothDevice device) async {
+  KnownDeviceType _deviceType(ScanResult result) {
+    return KnownDeviceClassifier.fromNames(_deviceNameCandidates(result));
+  }
+
+  _ConnectedDeviceSession? _sessionForDeviceId(String deviceId) {
+    for (final session in _sessionManager.sessions) {
+      if (session.deviceId == deviceId) {
+        return session;
+      }
+    }
+
+    return null;
+  }
+
+  Future<void> _continueToDeviceConfiguration() async {
+    if (!_sessionManager.hasConnectedDevices) {
+      return;
+    }
+
     await _stopScanBeforeNavigation();
     if (!mounted) {
       return;
@@ -523,33 +1175,11 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     unawaited(
       Navigator.of(context).push(
         MaterialPageRoute<void>(
-          builder: (_) => DeviceConfigurationPage(device: device),
+          builder: (_) => _MultiDeviceConfigurationPage(
+            manager: _sessionManager,
+          ),
         ),
       ),
-    );
-  }
-
-  Future<void> _openWearableDeviceConfigurationPage(
-    BluetoothDevice device,
-    String deviceName,
-  ) async {
-    await _stopScanBeforeNavigation();
-    if (!mounted) {
-      return;
-    }
-
-    unawaited(
-      Navigator.of(context)
-          .push(
-            MaterialPageRoute<void>(
-              builder: (_) => WearableDeviceConfigurationPage(
-                device: device,
-                deviceName: deviceName,
-                onDisconnected: () => _markDeviceDisconnected(device),
-              ),
-            ),
-          )
-          .whenComplete(() => _markDeviceDisconnected(device)),
     );
   }
 
@@ -561,22 +1191,9 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     }
   }
 
-  void _markDeviceDisconnected(BluetoothDevice device) {
-    if (!mounted) {
-      return;
-    }
-
-    final id = _deviceId(device);
-    setState(() {
-      _connectedDeviceIds.remove(id);
-      _connectingDeviceIds.remove(id);
-    });
-  }
-
-  Future<void> _disconnectFromDevice(ScanResult result) async {
-    final device = result.device;
-    final id = _deviceId(device);
-    final displayName = _displayDeviceName(result);
+  Future<void> _disconnectFromSession(_ConnectedDeviceSession session) async {
+    final id = session.deviceId;
+    final displayName = session.deviceName;
 
     setState(() {
       _connectingDeviceIds.add(id);
@@ -584,15 +1201,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     });
 
     try {
-      await device.disconnect();
-
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _connectedDeviceIds.remove(id);
-      });
+      await _sessionManager.disconnectAndRemove(session);
     } catch (error) {
       if (!mounted) {
         return;
@@ -653,6 +1262,16 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     });
   }
 
+  Color _statusMessageColor(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final message = _statusMessage;
+    if (message != null && message.startsWith('Connected to ')) {
+      return Colors.green.shade700;
+    }
+
+    return colorScheme.error;
+  }
+
   Widget _buildScanOptionButtons(BuildContext context) {
     return Wrap(
       spacing: 12,
@@ -696,11 +1315,22 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
   @override
   Widget build(BuildContext context) {
-    final devices = _displayDevices();
+    final devices = _displayDevices()
+        .where((result) => _sessionForDeviceId(_deviceId(result.device)) == null)
+        .toList(growable: false);
+    final connectedSessions = _sessionManager.sessions;
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Scanning Bluetooth Devices'),
+        title: const Text('Scanning Bluetooth Devices...'),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 16),
+            child: Center(
+              child: Text('Connected: ${_sessionManager.connectedCount}'),
+            ),
+          ),
+        ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16),
@@ -710,7 +1340,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
             FilledButton.icon(
               icon: Icon(_isScanning ? Icons.bluetooth_searching : Icons.search),
               label: Text(_isScanning ? 'Scanning...' : 'Scan Bluetooth Devices'),
-              onPressed: _isScanning ? null : _startScan,
+              onPressed: _isScanning ? null : () => unawaited(_startScan()),
             ),
             const SizedBox(height: 12),
             _buildScanOptionButtons(context),
@@ -719,49 +1349,970 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
               Text(
                 _statusMessage!,
                 textAlign: TextAlign.center,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
+                style: TextStyle(color: _statusMessageColor(context)),
               ),
             ],
             const SizedBox(height: 16),
             Expanded(
-              child: devices.isEmpty
+              child: devices.isEmpty && connectedSessions.isEmpty
                   ? const Center(
                       child: Text(
                         'Press the scan button to find nearby Bluetooth LE devices.',
                         textAlign: TextAlign.center,
                       ),
                     )
-                  : ListView.separated(
-                      itemCount: devices.length,
-                      separatorBuilder: (_, _) => const Divider(height: 1),
-                      itemBuilder: (context, index) {
-                        final result = devices[index];
-                        final device = result.device;
-                        final id = _deviceId(device);
-                        final isConnected = _connectedDeviceIds.contains(id);
-                        final isBusy = _connectingDeviceIds.contains(id);
-
-                        return ListTile(
-                          contentPadding: EdgeInsets.zero,
-                          title: Text(_displayDeviceName(result)),
-                          subtitle: Text('$id - RSSI ${result.rssi} dBm'),
-                          trailing: FilledButton(
-                            onPressed: isBusy
-                                ? null
-                                : () => _toggleConnection(result),
-                            child: Text(
-                              isBusy
-                                  ? 'Wait'
-                                  : isConnected
-                                      ? 'Disconnect'
-                                      : 'Connect',
-                            ),
+                  : ListView(
+                      children: [
+                        if (connectedSessions.isNotEmpty) ...[
+                          Text(
+                            'Connected devices',
+                            style: Theme.of(context).textTheme.titleMedium,
                           ),
-                        );
-                      },
+                          const SizedBox(height: 8),
+                          for (final session in connectedSessions)
+                            ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: const Icon(Icons.bluetooth_connected),
+                              title: Text(session.deviceName),
+                              subtitle: Text(session.type.label),
+                              trailing: FilledButton(
+                                onPressed: _connectingDeviceIds.contains(
+                                  session.deviceId,
+                                )
+                                    ? null
+                                    : () => _disconnectFromSession(session),
+                                child: Text(
+                                  _connectingDeviceIds.contains(
+                                    session.deviceId,
+                                  )
+                                      ? 'Wait'
+                                      : 'Disconnect',
+                                ),
+                              ),
+                            ),
+                          const Divider(height: 24),
+                        ],
+                        if (devices.isNotEmpty) ...[
+                          Text(
+                            'Nearby devices',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                          const SizedBox(height: 8),
+                        ],
+                        for (final result in devices) ...[
+                          _BluetoothScanResultTile(
+                            result: result,
+                            displayName: _displayDeviceName(result),
+                            deviceId: _deviceId(result.device),
+                            deviceType: _deviceType(result),
+                            isConnected:
+                                _sessionForDeviceId(_deviceId(result.device)) !=
+                                    null,
+                            isBusy: _connectingDeviceIds.contains(
+                              _deviceId(result.device),
+                            ),
+                            onPressed: () => unawaited(_toggleConnection(result)),
+                          ),
+                          const Divider(height: 1),
+                        ],
+                      ],
                     ),
             ),
+            SafeArea(
+              top: false,
+              minimum: const EdgeInsets.fromLTRB(0, 8, 0, 0),
+              child: SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: FilledButton(
+                  onPressed: _sessionManager.hasConnectedDevices
+                      ? _continueToDeviceConfiguration
+                      : null,
+                  child: const Text('Continue'),
+                ),
+              ),
+            ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _BluetoothScanResultTile extends StatelessWidget {
+  const _BluetoothScanResultTile({
+    required this.result,
+    required this.displayName,
+    required this.deviceId,
+    required this.deviceType,
+    required this.isConnected,
+    required this.isBusy,
+    required this.onPressed,
+  });
+
+  final ScanResult result;
+  final String displayName;
+  final String deviceId;
+  final KnownDeviceType deviceType;
+  final bool isConnected;
+  final bool isBusy;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final isUnsupported = deviceType == KnownDeviceType.unsupported;
+
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      title: Text(isUnsupported ? 'Unsupported device' : displayName),
+      subtitle: Text(
+        isUnsupported
+            ? '$displayName\n$deviceId - RSSI ${result.rssi} dBm'
+            : '${deviceType.label}\n$deviceId - RSSI ${result.rssi} dBm',
+      ),
+      isThreeLine: true,
+      trailing: FilledButton(
+        onPressed: isUnsupported || isBusy ? null : onPressed,
+        child: Text(
+          isBusy
+              ? 'Wait'
+              : isConnected
+                  ? 'Disconnect'
+                  : 'Connect',
+        ),
+      ),
+    );
+  }
+}
+
+class _MultiDeviceConfigurationPage extends StatefulWidget {
+  const _MultiDeviceConfigurationPage({
+    required this.manager,
+  });
+
+  final _MultiDeviceSessionManager manager;
+
+  @override
+  State<_MultiDeviceConfigurationPage> createState() =>
+      _MultiDeviceConfigurationPageState();
+}
+
+class _MultiDeviceConfigurationPageState
+    extends State<_MultiDeviceConfigurationPage> {
+  @override
+  void initState() {
+    super.initState();
+    widget.manager.addListener(_handleManagerChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.manager.removeListener(_handleManagerChanged);
+    super.dispose();
+  }
+
+  void _handleManagerChanged() {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {});
+  }
+
+  Future<void> _openSessionConfiguration(
+    _ConnectedDeviceSession session,
+  ) async {
+    switch (session.type) {
+      case KnownDeviceType.environmentalMonitor:
+        await Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => DeviceConfigurationPage(
+              device: session.device,
+              initialConfiguration: session.environmentalConfiguration,
+              onConfigurationConfirmed: (configuration) {
+                widget.manager.configureEnvironmental(session, configuration);
+              },
+            ),
+          ),
+        );
+        return;
+      case KnownDeviceType.respiratoryMonitor:
+        await Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => WearableDeviceConfigurationPage(
+              device: session.device,
+              deviceName: session.deviceName,
+              initialConfiguration: session.wearableConfiguration,
+              onConfigurationConfirmed: (configuration) {
+                widget.manager.configureWearable(session, configuration);
+              },
+            ),
+          ),
+        );
+        return;
+      case KnownDeviceType.unsupported:
+        return;
+    }
+  }
+
+  void _openAcquisitionInitialization() {
+    if (!widget.manager.allConnectedDevicesConfigured) {
+      return;
+    }
+
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => _MultiDeviceAcquisitionInitializationPage(
+          manager: widget.manager,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sessions = widget.manager.sessions;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Device Configuration'),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: sessions.isEmpty
+                ? const Center(
+                    child: Text('No connected devices.'),
+                  )
+                : ListView.separated(
+                    padding: const EdgeInsets.all(16),
+                    itemCount: sessions.length,
+                    separatorBuilder: (_, _) => const SizedBox(height: 8),
+                    itemBuilder: (context, index) {
+                      final session = sessions[index];
+                      return Card(
+                        child: ListTile(
+                          title: Text(session.deviceName),
+                          subtitle: Text(session.type.label),
+                          leading: const Icon(Icons.bluetooth_connected),
+                          trailing: session.isConfigured
+                              ? Icon(
+                                  Icons.check_circle,
+                                  color: Colors.green.shade700,
+                                )
+                              : const Icon(Icons.chevron_right),
+                          onTap: session.isConnected
+                              ? () => _openSessionConfiguration(session)
+                              : null,
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          SafeArea(
+            minimum: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            child: SizedBox(
+              width: double.infinity,
+              height: 52,
+              child: FilledButton(
+                onPressed: widget.manager.allConnectedDevicesConfigured
+                    ? _openAcquisitionInitialization
+                    : null,
+                child: const Text('Continue'),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MultiDeviceAcquisitionInitializationPage extends StatefulWidget {
+  const _MultiDeviceAcquisitionInitializationPage({
+    required this.manager,
+  });
+
+  final _MultiDeviceSessionManager manager;
+
+  @override
+  State<_MultiDeviceAcquisitionInitializationPage> createState() =>
+      _MultiDeviceAcquisitionInitializationPageState();
+}
+
+class _MultiDeviceAcquisitionInitializationPageState
+    extends State<_MultiDeviceAcquisitionInitializationPage> {
+  bool _isInitializing = true;
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _startInitialization();
+    });
+  }
+
+  Future<void> _startInitialization() async {
+    setState(() {
+      _isInitializing = true;
+      _errorMessage = null;
+    });
+
+    try {
+      await widget.manager.initializeAllSequentially();
+      if (!mounted) {
+        return;
+      }
+
+      await Navigator.of(context).pushReplacement(
+        MaterialPageRoute<void>(
+          builder: (_) => _MultiDeviceAcquisitionPage(
+            manager: widget.manager,
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isInitializing = false;
+        _errorMessage = error.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: !_isInitializing,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Acquisition Initialization'),
+        ),
+        body: Center(
+          child: _isInitializing
+              ? const CircularProgressIndicator()
+              : Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text(
+                        _errorMessage ?? 'Could not initialize acquisition.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      FilledButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: const Text('Back'),
+                      ),
+                    ],
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MultiDeviceAcquisitionPage extends StatefulWidget {
+  const _MultiDeviceAcquisitionPage({
+    required this.manager,
+  });
+
+  final _MultiDeviceSessionManager manager;
+
+  @override
+  State<_MultiDeviceAcquisitionPage> createState() =>
+      _MultiDeviceAcquisitionPageState();
+}
+
+class _MultiDeviceAcquisitionPageState
+    extends State<_MultiDeviceAcquisitionPage> {
+  @override
+  void initState() {
+    super.initState();
+    widget.manager.addListener(_handleManagerChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.manager.removeListener(_handleManagerChanged);
+    super.dispose();
+  }
+
+  void _handleManagerChanged() {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {});
+  }
+
+  Future<void> _stopAcquisition() async {
+    if (widget.manager.isStopping) {
+      return;
+    }
+
+    try {
+      await widget.manager.stopAll();
+      if (!mounted) {
+        return;
+      }
+
+      await Navigator.of(context).pushReplacement(
+        MaterialPageRoute<void>(
+          builder: (_) => _MultiDeviceAcquisitionCompletedPage(
+            csvLogger: widget.manager.csvLogger,
+          ),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not stop acquisition')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Acquisition in progress...'),
+          automaticallyImplyLeading: false,
+        ),
+        body: Column(
+          children: [
+            _buildConnectedCounter(context),
+            Expanded(
+              child: ListView.separated(
+                padding: const EdgeInsets.all(16),
+                itemCount: widget.manager.sessions.length,
+                separatorBuilder: (_, _) => const SizedBox(height: 12),
+                itemBuilder: (context, index) {
+                  return _buildDeviceSection(
+                    context,
+                    widget.manager.sessions[index],
+                    initiallyExpanded: widget.manager.sessions.length == 1,
+                  );
+                },
+              ),
+            ),
+            if (widget.manager.canUseOpenRemote)
+              _buildOpenRemoteBanner(context),
+            _buildStopAcquisitionButton(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildConnectedCounter(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      child: Align(
+        alignment: Alignment.centerRight,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.65),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: colorScheme.outlineVariant),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Text('Connected: ${widget.manager.connectedCount}'),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeviceSection(
+    BuildContext context,
+    _ConnectedDeviceSession session, {
+    required bool initiallyExpanded,
+  }) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final disconnected = !session.isConnected;
+
+    return Card(
+      child: ExpansionTile(
+        initiallyExpanded: initiallyExpanded,
+        leading: Icon(
+          disconnected ? Icons.bluetooth_disabled : Icons.bluetooth_connected,
+          color: disconnected ? colorScheme.error : colorScheme.primary,
+        ),
+        title: Text(session.deviceName),
+        subtitle: Text(
+          disconnected ? '${session.type.label} - Disconnected' : session.type.label,
+        ),
+        childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        children: [
+          if (disconnected) _buildDisconnectedBanner(context),
+          switch (session.type) {
+            KnownDeviceType.environmentalMonitor =>
+              _buildEnvironmentalSection(context, session),
+            KnownDeviceType.respiratoryMonitor =>
+              _buildWearableSection(context, session),
+            KnownDeviceType.unsupported => const SizedBox.shrink(),
+          },
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDisconnectedBanner(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colorScheme.errorContainer,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            children: [
+              Icon(Icons.warning_amber_rounded, color: colorScheme.onErrorContainer),
+              const SizedBox(width: 8),
+              Text(
+                'Disconnected',
+                style: TextStyle(color: colorScheme.onErrorContainer),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEnvironmentalSection(
+    BuildContext context,
+    _ConnectedDeviceSession session,
+  ) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Align(
+          alignment: Alignment.centerRight,
+          child: SegmentedButton<_LiveVisualizationMode>(
+            showSelectedIcon: false,
+            segments: const [
+              ButtonSegment<_LiveVisualizationMode>(
+                value: _LiveVisualizationMode.cards,
+                icon: _CardsModeIcon(),
+                tooltip: 'Measurement cards',
+              ),
+              ButtonSegment<_LiveVisualizationMode>(
+                value: _LiveVisualizationMode.charts,
+                icon: _ChartModeIcon(),
+                tooltip: 'Line charts',
+              ),
+            ],
+            selected: {session.visualizationMode},
+            onSelectionChanged: (selection) {
+              widget.manager.setVisualizationMode(session, selection.first);
+            },
+          ),
+        ),
+        const SizedBox(height: 12),
+        switch (session.visualizationMode) {
+          _LiveVisualizationMode.cards =>
+            _buildEnvironmentalCards(context, session),
+          _LiveVisualizationMode.charts =>
+            _buildEnvironmentalCharts(context, session),
+        },
+      ],
+    );
+  }
+
+  Widget _buildEnvironmentalCards(
+    BuildContext context,
+    _ConnectedDeviceSession session,
+  ) {
+    final measurements = session.visibleMeasurements;
+    if (measurements.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(24),
+        child: Text(
+          'No measurements selected.',
+          textAlign: TextAlign.center,
+        ),
+      );
+    }
+
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: measurements.length,
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 2,
+        crossAxisSpacing: 12,
+        mainAxisSpacing: 12,
+        childAspectRatio: 0.9,
+      ),
+      itemBuilder: (context, index) {
+        final definition = measurements[index];
+        final value = session.liveMeasurementValues[definition.prefix];
+
+        return _LiveMeasurementCard(
+          definition: definition,
+          value: value,
+          updatedAtText: value == null
+              ? 'No data received yet'
+              : _formatDashboardTime(value.updatedAt),
+        );
+      },
+    );
+  }
+
+  Widget _buildEnvironmentalCharts(
+    BuildContext context,
+    _ConnectedDeviceSession session,
+  ) {
+    final measurements = session.visibleMeasurements;
+    if (measurements.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(24),
+        child: Text(
+          'No measurements selected.',
+          textAlign: TextAlign.center,
+        ),
+      );
+    }
+
+    return Column(
+      children: [
+        for (final definition in measurements) ...[
+          _LiveMeasurementChartCard(
+            definition: definition,
+            samples: session.chartSamplesByPrefix[definition.prefix] ?? const [],
+            currentValue: session.liveMeasurementValues[definition.prefix],
+            formatTime: _formatDashboardTime,
+          ),
+          const SizedBox(height: 12),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildWearableSection(
+    BuildContext context,
+    _ConnectedDeviceSession session,
+  ) {
+    return Column(
+      children: [
+        _WearableStatusBoxes(
+          batteryPercent: session.latestBatteryPercent,
+          flushFailureRate: session.latestFlushFailureRate,
+        ),
+        const SizedBox(height: 12),
+        for (final definition in _wearableMetricDefinitions) ...[
+          _WearableMetricChartCard(
+            definition: definition,
+            series: session.wearableMetricSeries[definition.metric]!,
+            windowEnd: session.latestWearableSampleReceivedAt,
+            windowDuration: _ConnectedDeviceSession.wearableVisibleChartWindow,
+            formatTime: _formatDashboardTime,
+          ),
+          const SizedBox(height: 12),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildOpenRemoteBanner(BuildContext context) {
+    final status = widget.manager.mqttState.status;
+    final canTap = status == OpenRemoteMqttStatus.disconnected ||
+        status == OpenRemoteMqttStatus.failed;
+    final colorScheme = Theme.of(context).colorScheme;
+
+    final text = switch (status) {
+      OpenRemoteMqttStatus.connecting => 'Connecting to OpenRemote...',
+      OpenRemoteMqttStatus.connected => 'Connected to OpenRemote',
+      OpenRemoteMqttStatus.failed => 'Connection failed - Tap to retry',
+      OpenRemoteMqttStatus.disconnected => 'Connect to OpenRemote',
+    };
+
+    final backgroundColor = switch (status) {
+      OpenRemoteMqttStatus.connected => Colors.green.shade50,
+      OpenRemoteMqttStatus.failed => colorScheme.errorContainer,
+      OpenRemoteMqttStatus.connecting => colorScheme.secondaryContainer,
+      OpenRemoteMqttStatus.disconnected => colorScheme.surfaceContainerHighest,
+    };
+
+    final foregroundColor = switch (status) {
+      OpenRemoteMqttStatus.connected => Colors.green.shade900,
+      OpenRemoteMqttStatus.failed => colorScheme.onErrorContainer,
+      OpenRemoteMqttStatus.connecting => colorScheme.onSecondaryContainer,
+      OpenRemoteMqttStatus.disconnected => colorScheme.onSurfaceVariant,
+    };
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      child: Material(
+        color: backgroundColor,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: canTap ? () => unawaited(widget.manager.connectOpenRemote()) : null,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            child: Row(
+              children: [
+                Image.asset(
+                  'assets/images/openremote_logo.png',
+                  width: 36,
+                  height: 36,
+                  fit: BoxFit.contain,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        text,
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                              color: foregroundColor,
+                            ),
+                      ),
+                      if (status == OpenRemoteMqttStatus.failed &&
+                          widget.manager.mqttState.message != null) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          widget.manager.mqttState.message!,
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                color: foregroundColor,
+                              ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (status == OpenRemoteMqttStatus.connecting)
+                  SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: foregroundColor,
+                    ),
+                  )
+                else if (status == OpenRemoteMqttStatus.connected)
+                  Icon(Icons.check_circle, color: foregroundColor)
+                else
+                  Icon(Icons.chevron_right, color: foregroundColor),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStopAcquisitionButton() {
+    return SafeArea(
+      top: false,
+      bottom: true,
+      minimum: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+      child: SizedBox(
+        width: double.infinity,
+        height: 48,
+        child: FilledButton(
+          onPressed: widget.manager.isStopping ? null : _stopAcquisition,
+          child: Text(
+            widget.manager.isStopping ? 'Stopping...' : 'Stop acquisition',
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _formatDashboardTime(DateTime value) {
+    final local = value.toLocal();
+    final hour = local.hour.toString().padLeft(2, '0');
+    final minute = local.minute.toString().padLeft(2, '0');
+    final second = local.second.toString().padLeft(2, '0');
+    return '$hour:$minute:$second';
+  }
+}
+
+class _WearableStatusBoxes extends StatelessWidget {
+  const _WearableStatusBoxes({
+    required this.batteryPercent,
+    required this.flushFailureRate,
+  });
+
+  final int? batteryPercent;
+  final int? flushFailureRate;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final batteryText =
+        batteryPercent == null ? 'Battery: N/A' : 'Battery: $batteryPercent%';
+    final flushFailureRateText = flushFailureRate == null
+        ? 'Flush failure rate: N/A'
+        : 'Flush failure rate: $flushFailureRate';
+
+    return Row(
+      children: [
+        Expanded(
+          child: _WearableStatusBox(
+            icon: Icons.battery_std,
+            text: batteryText,
+            iconColor: colorScheme.primary,
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: _WearableStatusBox(
+            icon: Icons.warning_amber_rounded,
+            text: flushFailureRateText,
+            iconColor: colorScheme.tertiary,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _WearableStatusBox extends StatelessWidget {
+  const _WearableStatusBox({
+    required this.icon,
+    required this.text,
+    required this.iconColor,
+  });
+
+  final IconData icon;
+  final String text;
+  final Color iconColor;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        child: Row(
+          children: [
+            Icon(icon, color: iconColor),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                text,
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MultiDeviceAcquisitionCompletedPage extends StatelessWidget {
+  const _MultiDeviceAcquisitionCompletedPage({
+    required this.csvLogger,
+  });
+
+  final UnifiedAcquisitionCsvLogger csvLogger;
+
+  Future<void> _downloadData(BuildContext context) async {
+    try {
+      await csvLogger.exportToDownloadsOrShare();
+      if (!context.mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('CSV file saved successfully')),
+      );
+    } catch (_) {
+      if (!context.mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not save CSV file')),
+      );
+    }
+  }
+
+  void _goHome(BuildContext context) {
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute<void>(
+        builder: (_) => const SectionPage(
+          sectionName: 'user',
+          message: 'Welcome to the user section!',
+        ),
+      ),
+      (_) => false,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Acquisition completed'),
+          automaticallyImplyLeading: false,
+        ),
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 360),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    FilledButton.icon(
+                      icon: const Icon(Icons.download),
+                      label: const Text('Download data'),
+                      onPressed: () => unawaited(_downloadData(context)),
+                    ),
+                    const SizedBox(height: 24),
+                    IconButton(
+                      icon: const Icon(Icons.home),
+                      iconSize: 40,
+                      onPressed: () => _goHome(context),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
         ),
       ),
     );
@@ -773,11 +2324,15 @@ class WearableDeviceConfigurationPage extends StatefulWidget {
     super.key,
     required this.device,
     required this.deviceName,
+    this.initialConfiguration,
+    this.onConfigurationConfirmed,
     this.onDisconnected,
   });
 
   final BluetoothDevice device;
   final String deviceName;
+  final WearableDeviceConfiguration? initialConfiguration;
+  final ValueChanged<WearableDeviceConfiguration>? onConfigurationConfirmed;
   final VoidCallback? onDisconnected;
 
   @override
@@ -787,9 +2342,9 @@ class WearableDeviceConfigurationPage extends StatefulWidget {
 
 class _WearableDeviceConfigurationPageState
     extends State<WearableDeviceConfigurationPage> {
-  late final WearableConfigurationBleService _service;
-  late final WearableAcquisitionCsvLogger _csvLogger;
-  late final GpsLocationService _gpsLocationService;
+  WearableConfigurationBleService? _service;
+  WearableAcquisitionCsvLogger? _csvLogger;
+  GpsLocationService? _gpsLocationService;
 
   static const List<int> _odrValues = [12, 26, 52, 104, 208, 416];
   static const List<int> _accGValues = [2, 4, 8, 16];
@@ -806,10 +2361,27 @@ class _WearableDeviceConfigurationPageState
   bool _disconnectionNotified = false;
   StreamSubscription<WearableAgmReceivedSample>? _agmSamplesSubscription;
 
+  bool get _isConfigurationOnly {
+    return widget.onConfigurationConfirmed != null;
+  }
+
   @override
   void initState() {
     super.initState();
-    _service = WearableConfigurationBleService(
+    final initialConfiguration = widget.initialConfiguration;
+    if (initialConfiguration != null) {
+      odr = initialConfiguration.odr;
+      mag = initialConfiguration.mag;
+      accG = initialConfiguration.accG;
+      gyrDPS = initialConfiguration.gyrDPS;
+      calibrationEnabled = initialConfiguration.calibrationEnabled;
+    }
+
+    if (_isConfigurationOnly) {
+      return;
+    }
+
+    final service = WearableConfigurationBleService(
       widget.device,
       onStateChanged: () {
         if (!mounted || _isDisposing) {
@@ -819,16 +2391,19 @@ class _WearableDeviceConfigurationPageState
         setState(() {});
       },
     );
+    _service = service;
     _csvLogger = WearableAcquisitionCsvLogger();
     _gpsLocationService = GpsLocationService();
-    unawaited(_service.initialize());
+    unawaited(service.initialize());
   }
 
   @override
   void dispose() {
-    _isDisposing = true;
-    _notifyDisconnected();
-    unawaited(_cleanupAndDisconnect());
+    if (!_isConfigurationOnly) {
+      _isDisposing = true;
+      _notifyDisconnected();
+      unawaited(_cleanupAndDisconnect());
+    }
     super.dispose();
   }
 
@@ -843,7 +2418,7 @@ class _WearableDeviceConfigurationPageState
 
   Future<void> _cleanupAndDisconnect() async {
     await _stopWearableCsvLogging();
-    await _service.dispose();
+    await _service?.dispose();
 
     try {
       await widget.device.disconnect();
@@ -867,7 +2442,11 @@ class _WearableDeviceConfigurationPageState
   }
 
   Future<void> _startConfigurationSequenceAndOpenLog() async {
-    if (!_service.isReadyToContinue ||
+    final service = _service;
+    final csvLogger = _csvLogger;
+    if (service == null ||
+        csvLogger == null ||
+        !service.isReadyToContinue ||
         _isSendingConfig ||
         _configurationSequenceStarted) {
       return;
@@ -882,7 +2461,7 @@ class _WearableDeviceConfigurationPageState
     try {
       await _startWearableCsvLogging();
       csvLoggingStarted = true;
-      await _service.startConfigurationSequence(
+      await service.startConfigurationSequence(
         odr: odr,
         mag: mag,
         accG: accG,
@@ -896,8 +2475,8 @@ class _WearableDeviceConfigurationPageState
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
           builder: (_) => WearableBleCommunicationLogPage(
-            service: _service,
-            csvLogger: _csvLogger,
+            service: service,
+            csvLogger: csvLogger,
             stopWearableCsvLogging: _stopWearableCsvLogging,
             onAcquisitionStopped: _notifyDisconnected,
           ),
@@ -926,16 +2505,36 @@ class _WearableDeviceConfigurationPageState
     }
   }
 
+  void _confirmConfiguration() {
+    widget.onConfigurationConfirmed?.call(
+      WearableDeviceConfiguration(
+        odr: odr,
+        mag: mag,
+        accG: accG,
+        gyrDPS: gyrDPS,
+        calibrationEnabled: calibrationEnabled,
+      ),
+    );
+    Navigator.of(context).pop();
+  }
+
   Future<void> _startWearableCsvLogging() async {
-    await _csvLogger.start();
-    await _gpsLocationService.start();
+    final csvLogger = _csvLogger;
+    final gpsLocationService = _gpsLocationService;
+    final service = _service;
+    if (csvLogger == null || gpsLocationService == null || service == null) {
+      return;
+    }
+
+    await csvLogger.start();
+    await gpsLocationService.start();
     await _agmSamplesSubscription?.cancel();
-    _agmSamplesSubscription = _service.agmSamplesStream.listen((event) {
+    _agmSamplesSubscription = service.agmSamplesStream.listen((event) {
       unawaited(
-        _csvLogger.appendAgmSample(
+        csvLogger.appendAgmSample(
           receivedAt: event.receivedAt,
           deviceName: widget.deviceName,
-          gpsCoordinates: _gpsLocationService.currentCoordinates,
+          gpsCoordinates: gpsLocationService.currentCoordinates,
           sample: event.sample,
         ),
       );
@@ -945,15 +2544,23 @@ class _WearableDeviceConfigurationPageState
   Future<void> _stopWearableCsvLogging() async {
     await _agmSamplesSubscription?.cancel();
     _agmSamplesSubscription = null;
-    await _gpsLocationService.stop();
-    await _csvLogger.stop();
+    await _gpsLocationService?.stop();
+    await _csvLogger?.stop();
   }
 
   @override
   Widget build(BuildContext context) {
-    final canContinue = _service.isReadyToContinue &&
-        !_isSendingConfig &&
-        !_configurationSequenceStarted;
+    final service = _service;
+    final canContinue = _isConfigurationOnly ||
+        (service != null &&
+            service.isReadyToContinue &&
+            !_isSendingConfig &&
+            !_configurationSequenceStarted);
+    final buttonText = _isConfigurationOnly
+        ? 'Confirm Configuration'
+        : _isSendingConfig
+            ? 'Sending...'
+            : 'Continue';
 
     return Scaffold(
       appBar: AppBar(
@@ -1020,9 +2627,12 @@ class _WearableDeviceConfigurationPageState
               width: double.infinity,
               height: 52,
               child: FilledButton(
-                onPressed:
-                    canContinue ? _startConfigurationSequenceAndOpenLog : null,
-                child: Text(_isSendingConfig ? 'Sending...' : 'Continue'),
+                onPressed: canContinue
+                    ? _isConfigurationOnly
+                        ? _confirmConfiguration
+                        : _startConfigurationSequenceAndOpenLog
+                    : null,
+                child: Text(buttonText),
               ),
             ),
           ),
@@ -1938,9 +3548,13 @@ class DeviceConfigurationPage extends StatefulWidget {
   const DeviceConfigurationPage({
     super.key,
     required this.device,
+    this.initialConfiguration,
+    this.onConfigurationConfirmed,
   });
 
   final BluetoothDevice device;
+  final BleConfiguration? initialConfiguration;
+  final ValueChanged<BleConfiguration>? onConfigurationConfirmed;
 
   @override
   State<DeviceConfigurationPage> createState() =>
@@ -1987,12 +3601,35 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
   int _samplingFrequencyIndex = 0;
   bool _isContinuing = false;
 
+  bool get _isConfigurationOnly {
+    return widget.onConfigurationConfirmed != null;
+  }
+
   int get _selectedSamplingFrequency {
     return _samplingFrequencies[_samplingFrequencyIndex];
   }
 
   bool get _allMeasurementsEnabled {
     return _measurementOptions.every((option) => _options[option] ?? false);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    final initialConfiguration = widget.initialConfiguration;
+    if (initialConfiguration == null) {
+      return;
+    }
+
+    _options
+      ..clear()
+      ..addAll(initialConfiguration.enabledOptions);
+    _samplingFrequencyIndex = _samplingFrequencies.indexOf(
+      initialConfiguration.samplingFrequencySeconds,
+    );
+    if (_samplingFrequencyIndex < 0) {
+      _samplingFrequencyIndex = 0;
+    }
   }
 
   void _setAllMeasurements(bool value) {
@@ -2020,6 +3657,17 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
       return;
     }
 
+    final configuration = BleConfiguration(
+      enabledOptions: Map<String, bool>.from(_options),
+      samplingFrequencySeconds: _selectedSamplingFrequency,
+    );
+
+    if (_isConfigurationOnly) {
+      widget.onConfigurationConfirmed?.call(configuration);
+      Navigator.of(context).pop();
+      return;
+    }
+
     setState(() {
       _isContinuing = true;
     });
@@ -2028,10 +3676,7 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
       MaterialPageRoute<void>(
         builder: (_) => AcquisitionInitializationPage(
           device: widget.device,
-          configuration: BleConfiguration(
-            enabledOptions: Map<String, bool>.from(_options),
-            samplingFrequencySeconds: _selectedSamplingFrequency,
-          ),
+          configuration: configuration,
         ),
       ),
     ).whenComplete(() {
@@ -2047,6 +3692,12 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
 
   @override
   Widget build(BuildContext context) {
+    final buttonText = _isConfigurationOnly
+        ? 'Confirm Configuration'
+        : _isContinuing
+            ? 'Opening...'
+            : 'Continue';
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Device Configuration'),
@@ -2103,7 +3754,7 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
               child: FilledButton(
                 onPressed:
                     _isContinuing ? null : _openAcquisitionInitializationPage,
-                child: Text(_isContinuing ? 'Opening...' : 'Continue'),
+                child: Text(buttonText),
               ),
             ),
           ),

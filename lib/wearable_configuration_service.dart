@@ -50,6 +50,8 @@ class WearableConfigurationBleService {
       StreamController<WearableAgmReceivedSample>.broadcast();
   final StreamController<WearableSdsReceivedStatus> _sdsStatusController =
       StreamController<WearableSdsReceivedStatus>.broadcast();
+  final StreamController<WearableBleSequenceState> _sequenceStateController =
+      StreamController<WearableBleSequenceState>.broadcast();
   final List<String> _logs = [];
 
   BluetoothCharacteristic? _writeCharacteristic;
@@ -75,6 +77,12 @@ class WearableConfigurationBleService {
 
   Stream<WearableSdsReceivedStatus> get sdsStatusStream =>
       _sdsStatusController.stream;
+
+  Stream<WearableBleSequenceState> get sequenceStateStream =>
+      _sequenceStateController.stream;
+
+  Stream<BluetoothConnectionState> get connectionState =>
+      device.connectionState;
 
   List<String> get logs => List.unmodifiable(_logs);
 
@@ -194,6 +202,7 @@ class WearableConfigurationBleService {
     await _logController.close();
     await _agmSamplesController.close();
     await _sdsStatusController.close();
+    await _sequenceStateController.close();
   }
 
   Future<void> dispose() async {
@@ -230,6 +239,7 @@ class WearableConfigurationBleService {
     await _logController.close();
     await _agmSamplesController.close();
     await _sdsStatusController.close();
+    await _sequenceStateController.close();
   }
 
   Future<void> _cleanupAfterStop() async {
@@ -596,6 +606,9 @@ class WearableConfigurationBleService {
 
   void _setSequenceState(WearableBleSequenceState state) {
     _sequenceState = state;
+    if (!_sequenceStateController.isClosed) {
+      _sequenceStateController.add(state);
+    }
     _log('Sequence state: ${state.name}.');
   }
 
