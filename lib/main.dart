@@ -3,7 +3,9 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:app_lares/ble_configuration_service.dart';
+import 'package:app_lares/services/acquisition_recovery_store.dart';
 import 'package:app_lares/services/acquisition_csv_logger.dart';
+import 'package:app_lares/services/android_acquisition_foreground_service.dart';
 import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
@@ -16,13 +18,58 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
   FlutterBluePlus.setOperationQueueMode(OperationQueueMode.perDevice);
-  runApp(const LaresApp());
+  final recoverySnapshot = await AcquisitionRecoveryStore.load();
+  runApp(LaresApp(recoverySnapshot: recoverySnapshot));
 }
 
-class LaresApp extends StatelessWidget {
-  const LaresApp({super.key});
+class LaresApp extends StatefulWidget {
+  const LaresApp({
+    super.key,
+    this.recoverySnapshot,
+  });
+
+  final AcquisitionRecoverySnapshot? recoverySnapshot;
+
+  @override
+  State<LaresApp> createState() => _LaresAppState();
+}
+
+class _LaresAppState extends State<LaresApp> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        unawaited(_ActiveAcquisitionRuntime.handleResumed());
+        break;
+      case AppLifecycleState.inactive:
+        unawaited(_ActiveAcquisitionRuntime.handleInactive());
+        break;
+      case AppLifecycleState.paused:
+        unawaited(_ActiveAcquisitionRuntime.handlePaused());
+        break;
+      case AppLifecycleState.detached:
+        unawaited(_ActiveAcquisitionRuntime.handleDetached());
+        break;
+      case AppLifecycleState.hidden:
+        unawaited(_ActiveAcquisitionRuntime.handlePaused());
+        break;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -33,7 +80,156 @@ class LaresApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         useMaterial3: true,
       ),
-      home: const AccessCodePage(),
+      home: widget.recoverySnapshot == null
+          ? const AccessCodePage()
+          : AcquisitionRecoveryPage(snapshot: widget.recoverySnapshot!),
+    );
+  }
+}
+
+class _ActiveAcquisitionRuntime {
+  static bool _isActive = false;
+  static _MultiDeviceSessionManager? _multiDeviceManager;
+
+  static void registerMultiDeviceManager(_MultiDeviceSessionManager manager) {
+    _multiDeviceManager = manager;
+  }
+
+  static Future<void> markActive() async {
+    _isActive = true;
+  }
+
+  static Future<void> markInactive() async {
+    _isActive = false;
+    _multiDeviceManager = null;
+  }
+
+  static Future<void> handlePaused() async {
+    if (!_isActive) {
+      return;
+    }
+
+    await AcquisitionRecoveryStore.updateStatus(
+      logicalRoute: 'background',
+      status: 'running_in_background',
+    );
+    await _ensureAndroidForegroundService();
+  }
+
+  static Future<void> handleInactive() async {
+    if (!_isActive) {
+      return;
+    }
+
+    await AcquisitionRecoveryStore.updateStatus(
+      logicalRoute: 'inactive',
+      status: 'running',
+    );
+  }
+
+  static Future<void> handleDetached() async {
+    if (!_isActive) {
+      return;
+    }
+
+    await AcquisitionRecoveryStore.updateStatus(
+      logicalRoute: 'detached',
+      status: 'interrupted',
+    );
+  }
+
+  static Future<void> handleResumed() async {
+    if (!_isActive) {
+      return;
+    }
+
+    await AcquisitionRecoveryStore.updateStatus(
+      logicalRoute: 'acquisition',
+      status: 'running',
+    );
+    await _ensureAndroidForegroundService();
+    await _multiDeviceManager?.refreshAfterResume();
+  }
+
+  static Future<void> _ensureAndroidForegroundService() async {
+    try {
+      await AndroidAcquisitionForegroundService.start();
+    } catch (_) {
+      // The acquisition itself remains active; the UI shows permission/service issues.
+    }
+  }
+}
+
+class AcquisitionRecoveryPage extends StatelessWidget {
+  const AcquisitionRecoveryPage({
+    super.key,
+    required this.snapshot,
+  });
+
+  final AcquisitionRecoverySnapshot snapshot;
+
+  Future<void> _dismissRecovery(BuildContext context) async {
+    await AcquisitionRecoveryStore.clear();
+    await AndroidAcquisitionForegroundService.stop();
+    if (!context.mounted) {
+      return;
+    }
+
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute<void>(
+        builder: (_) => const AccessCodePage(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final deviceText = snapshot.deviceNames.isEmpty
+        ? 'No device details available'
+        : snapshot.deviceNames.join(', ');
+    final csvText = snapshot.csvFileName == null
+        ? 'CSV details unavailable'
+        : 'CSV: ${snapshot.csvFileName}';
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Acquisition recovery'),
+      ),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Icon(
+                  Icons.warning_amber_rounded,
+                  size: 48,
+                  color: Theme.of(context).colorScheme.error,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Previous acquisition was interrupted',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Reconnect to continue.\n\nDevices: $deviceText\n$csvText',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 24),
+                FilledButton(
+                  onPressed: () => unawaited(_dismissRecovery(context)),
+                  child: const Text('Reconnect to continue'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -325,6 +521,38 @@ class WearableDeviceConfiguration {
   final bool calibrationEnabled;
 }
 
+String _summarizeEnvironmentalConfiguration(BleConfiguration configuration) {
+  final enabledOptions = configuration.enabledOptions.entries
+      .where((entry) => entry.value)
+      .map((entry) => entry.key)
+      .join(', ');
+  final enabledText = enabledOptions.isEmpty ? 'none' : enabledOptions;
+
+  return 'samplingFrequencySeconds=${configuration.samplingFrequencySeconds}; '
+      'enabled=$enabledText';
+}
+
+String _summarizeWearableConfiguration(
+  WearableDeviceConfiguration configuration,
+) {
+  return 'odr=${configuration.odr}; '
+      'mag=${configuration.mag}; '
+      'accG=${configuration.accG}; '
+      'gyrDPS=${configuration.gyrDPS}; '
+      'calibrationEnabled=${configuration.calibrationEnabled}';
+}
+
+String _mergeStatusMessage(String? current, String message) {
+  if (current == null || current.isEmpty || current == message) {
+    return message;
+  }
+  if (current.split('\n').contains(message)) {
+    return current;
+  }
+
+  return '$current\n$message';
+}
+
 class _ConnectedDeviceSession {
   _ConnectedDeviceSession({
     required this.device,
@@ -428,6 +656,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   bool _acquisitionStarted = false;
   bool _isStopping = false;
   bool _disposed = false;
+  bool _foregroundServiceStarted = false;
+  DateTime? _startedAt;
+  String? backgroundStatusMessage;
 
   List<_ConnectedDeviceSession> get sessions => List.unmodifiable(_sessions);
 
@@ -445,9 +676,32 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
   bool get isStopping => _isStopping;
 
+  bool get isAndroidBackgroundServiceActive => _foregroundServiceStarted;
+
   bool get canUseOpenRemote {
     return _sessions.length == 1 &&
         _sessions.first.type == KnownDeviceType.environmentalMonitor;
+  }
+
+  List<String> get _recoveryConfigurationSummaries {
+    return [
+      for (final session in _sessions)
+        switch (session.type) {
+          KnownDeviceType.environmentalMonitor =>
+            session.environmentalConfiguration == null
+                ? 'not configured'
+                : _summarizeEnvironmentalConfiguration(
+                    session.environmentalConfiguration!,
+                  ),
+          KnownDeviceType.respiratoryMonitor =>
+            session.wearableConfiguration == null
+                ? 'not configured'
+                : _summarizeWearableConfiguration(
+                    session.wearableConfiguration!,
+                  ),
+          KnownDeviceType.unsupported => 'unsupported',
+        },
+    ];
   }
 
   void addConnectedSession(_ConnectedDeviceSession session) {
@@ -500,6 +754,13 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _initializationStarted = true;
     await csvLogger.start();
     await gpsLocationService.start();
+    final gpsStatusMessage = gpsLocationService.statusMessage;
+    if (gpsStatusMessage != null) {
+      backgroundStatusMessage = _mergeStatusMessage(
+        backgroundStatusMessage,
+        gpsStatusMessage,
+      );
+    }
 
     if (canUseOpenRemote) {
       _mqttStateSubscription = mqttService.states.listen((state) {
@@ -545,6 +806,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       }
 
       _acquisitionStarted = true;
+      _startedAt = DateTime.now();
+      await _activateAndroidBackgroundSupport();
       notifyListeners();
     } catch (error) {
       await stopAll();
@@ -561,6 +824,26 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     await mqttService.connect();
+  }
+
+  Future<void> refreshAfterResume() async {
+    if (!_acquisitionStarted) {
+      return;
+    }
+
+    for (final session in _sessions) {
+      try {
+        final state = await session.device.connectionState.first;
+        final isConnected = state != BluetoothConnectionState.disconnected;
+        session.isConnected = isConnected;
+        if (!isConnected) {
+          session.disconnectedDuringAcquisition = true;
+        }
+      } catch (_) {}
+    }
+
+    await _activateAndroidBackgroundSupport();
+    notifyListeners();
   }
 
   void setVisualizationMode(
@@ -618,6 +901,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     } catch (_) {}
     await gpsLocationService.stop();
     await csvLogger.stop();
+    await AndroidAcquisitionForegroundService.stop();
+    await AcquisitionRecoveryStore.clear();
+    await _ActiveAcquisitionRuntime.markInactive();
+    _foregroundServiceStarted = false;
     _acquisitionStarted = false;
     _isStopping = false;
     notifyListeners();
@@ -628,30 +915,76 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    if (_acquisitionStarted) {
+      return;
+    }
+
     _disposed = true;
     for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
       await session.cancelConnectionSubscription();
       await session.cancelLiveSubscriptions();
-      if (!_acquisitionStarted) {
-        try {
-          await session.environmentalService?.dispose();
-        } catch (_) {}
-        try {
-          await session.wearableService?.dispose();
-        } catch (_) {}
-        try {
-          await session.device.disconnect();
-        } catch (_) {}
-      }
+      try {
+        await session.environmentalService?.dispose();
+      } catch (_) {}
+      try {
+        await session.wearableService?.dispose();
+      } catch (_) {}
+      try {
+        await session.device.disconnect();
+      } catch (_) {}
     }
     await _mqttStateSubscription?.cancel();
-    if (!_acquisitionStarted) {
-      try {
-        await mqttService.dispose();
-      } catch (_) {}
-      await csvLogger.stop();
-    }
+    try {
+      await mqttService.dispose();
+    } catch (_) {}
+    await csvLogger.stop();
     await gpsLocationService.dispose();
+  }
+
+  Future<void> _activateAndroidBackgroundSupport() async {
+    if (!_acquisitionStarted || !Platform.isAndroid) {
+      return;
+    }
+
+    await _requestAndroidNotificationPermission();
+    try {
+      await AndroidAcquisitionForegroundService.start();
+      _foregroundServiceStarted = true;
+    } catch (error) {
+      backgroundStatusMessage = _mergeStatusMessage(
+        backgroundStatusMessage,
+        'Android background acquisition may be unreliable: $error',
+      );
+    }
+
+    await _ActiveAcquisitionRuntime.markActive();
+    await AcquisitionRecoveryStore.saveActive(
+      acquisitionType: _sessions.length == 1
+          ? _sessions.first.type.name
+          : 'multi-device',
+      deviceNames: [for (final session in _sessions) session.deviceName],
+      deviceTypes: [for (final session in _sessions) session.type.name],
+      configurationSummaries: _recoveryConfigurationSummaries,
+      startedAt: _startedAt ?? DateTime.now(),
+      logicalRoute: 'acquisition',
+      status: 'running',
+      csvFileName: csvLogger.fileName,
+      csvFilePath: csvLogger.file?.path,
+    );
+  }
+
+  Future<void> _requestAndroidNotificationPermission() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    final status = await Permission.notification.request();
+    if (!status.isGranted) {
+      backgroundStatusMessage = _mergeStatusMessage(
+        backgroundStatusMessage,
+        'Android background acquisition may be unreliable without the persistent notification.',
+      );
+    }
   }
 
   void _attachConnectionListener(_ConnectedDeviceSession session) {
@@ -1503,6 +1836,7 @@ class _MultiDeviceConfigurationPageState
   void initState() {
     super.initState();
     widget.manager.addListener(_handleManagerChanged);
+    _ActiveAcquisitionRuntime.registerMultiDeviceManager(widget.manager);
   }
 
   @override
@@ -1797,6 +2131,7 @@ class _MultiDeviceAcquisitionPageState
         body: Column(
           children: [
             _buildConnectedCounter(context),
+            _buildBackgroundStatus(context),
             Expanded(
               child: ListView.separated(
                 padding: const EdgeInsets.all(16),
@@ -1815,6 +2150,53 @@ class _MultiDeviceAcquisitionPageState
               _buildOpenRemoteBanner(context),
             _buildStopAcquisitionButton(),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBackgroundStatus(BuildContext context) {
+    if (!Platform.isAndroid) {
+      return const SizedBox.shrink();
+    }
+
+    final colorScheme = Theme.of(context).colorScheme;
+    final warning = widget.manager.backgroundStatusMessage;
+    final text = warning ??
+        (widget.manager.isAndroidBackgroundServiceActive
+            ? 'Background acquisition active'
+            : 'Background acquisition starting');
+    final backgroundColor = warning == null
+        ? Colors.green.shade50
+        : colorScheme.errorContainer;
+    final foregroundColor = warning == null
+        ? Colors.green.shade900
+        : colorScheme.onErrorContainer;
+    final icon = warning == null
+        ? Icons.notifications_active
+        : Icons.warning_amber_rounded;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: backgroundColor,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              Icon(icon, size: 18, color: foregroundColor),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  text,
+                  style: TextStyle(color: foregroundColor),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -2357,8 +2739,10 @@ class _WearableDeviceConfigurationPageState
   bool calibrationEnabled = false;
   bool _isSendingConfig = false;
   bool _configurationSequenceStarted = false;
+  bool _wearableAcquisitionStopped = false;
   bool _isDisposing = false;
   bool _disconnectionNotified = false;
+  String? _backgroundStatusMessage;
   StreamSubscription<WearableAgmReceivedSample>? _agmSamplesSubscription;
 
   bool get _isConfigurationOnly {
@@ -2401,8 +2785,10 @@ class _WearableDeviceConfigurationPageState
   void dispose() {
     if (!_isConfigurationOnly) {
       _isDisposing = true;
-      _notifyDisconnected();
-      unawaited(_cleanupAndDisconnect());
+      if (!_configurationSequenceStarted || _wearableAcquisitionStopped) {
+        _notifyDisconnected();
+        unawaited(_cleanupAndDisconnect());
+      }
     }
     super.dispose();
   }
@@ -2457,10 +2843,8 @@ class _WearableDeviceConfigurationPageState
       _configurationSequenceStarted = true;
     });
 
-    var csvLoggingStarted = false;
     try {
       await _startWearableCsvLogging();
-      csvLoggingStarted = true;
       await service.startConfigurationSequence(
         odr: odr,
         mag: mag,
@@ -2468,6 +2852,7 @@ class _WearableDeviceConfigurationPageState
         gyrDPS: gyrDPS,
         calibrationEnabled: calibrationEnabled,
       );
+      await _activateAndroidBackgroundSupport();
       if (!mounted) {
         return;
       }
@@ -2478,12 +2863,15 @@ class _WearableDeviceConfigurationPageState
             service: service,
             csvLogger: csvLogger,
             stopWearableCsvLogging: _stopWearableCsvLogging,
-            onAcquisitionStopped: _notifyDisconnected,
+            onAcquisitionStopped: _handleWearableAcquisitionStopped,
+            backgroundStatusMessage: _backgroundStatusMessage,
           ),
         ),
       );
     } catch (error) {
       await _stopWearableCsvLogging();
+      await AndroidAcquisitionForegroundService.stop();
+      _configurationSequenceStarted = false;
       if (!mounted) {
         return;
       }
@@ -2491,11 +2879,7 @@ class _WearableDeviceConfigurationPageState
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Could not start acquisition: $error')),
       );
-      if (!csvLoggingStarted) {
-        setState(() {
-          _configurationSequenceStarted = false;
-        });
-      }
+      setState(() {});
     } finally {
       if (mounted) {
         setState(() {
@@ -2503,6 +2887,52 @@ class _WearableDeviceConfigurationPageState
         });
       }
     }
+  }
+
+  Future<void> _activateAndroidBackgroundSupport() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    final notificationStatus = await Permission.notification.request();
+    if (!notificationStatus.isGranted) {
+      _backgroundStatusMessage = _mergeStatusMessage(
+        _backgroundStatusMessage,
+        'Android background acquisition may be unreliable without the persistent notification.',
+      );
+    }
+
+    try {
+      await AndroidAcquisitionForegroundService.start();
+    } catch (error) {
+      _backgroundStatusMessage = _mergeStatusMessage(
+        _backgroundStatusMessage,
+        'Android background acquisition may be unreliable: $error',
+      );
+    }
+
+    await _ActiveAcquisitionRuntime.markActive();
+    await AcquisitionRecoveryStore.saveActive(
+      acquisitionType: KnownDeviceType.respiratoryMonitor.name,
+      deviceNames: [widget.deviceName],
+      deviceTypes: [KnownDeviceType.respiratoryMonitor.name],
+      configurationSummaries: [
+        _summarizeWearableConfiguration(
+          WearableDeviceConfiguration(
+            odr: odr,
+            mag: mag,
+            accG: accG,
+            gyrDPS: gyrDPS,
+            calibrationEnabled: calibrationEnabled,
+          ),
+        ),
+      ],
+      startedAt: DateTime.now(),
+      logicalRoute: 'acquisition',
+      status: 'running',
+      csvFileName: _csvLogger?.fileName,
+      csvFilePath: _csvLogger?.file?.path,
+    );
   }
 
   void _confirmConfiguration() {
@@ -2518,6 +2948,11 @@ class _WearableDeviceConfigurationPageState
     Navigator.of(context).pop();
   }
 
+  void _handleWearableAcquisitionStopped() {
+    _wearableAcquisitionStopped = true;
+    _notifyDisconnected();
+  }
+
   Future<void> _startWearableCsvLogging() async {
     final csvLogger = _csvLogger;
     final gpsLocationService = _gpsLocationService;
@@ -2528,6 +2963,13 @@ class _WearableDeviceConfigurationPageState
 
     await csvLogger.start();
     await gpsLocationService.start();
+    final gpsStatusMessage = gpsLocationService.statusMessage;
+    if (gpsStatusMessage != null) {
+      _backgroundStatusMessage = _mergeStatusMessage(
+        _backgroundStatusMessage,
+        gpsStatusMessage,
+      );
+    }
     await _agmSamplesSubscription?.cancel();
     _agmSamplesSubscription = service.agmSamplesStream.listen((event) {
       unawaited(
@@ -2678,12 +3120,14 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
     required this.csvLogger,
     required this.stopWearableCsvLogging,
     required this.onAcquisitionStopped,
+    this.backgroundStatusMessage,
   });
 
   final WearableConfigurationBleService service;
   final WearableAcquisitionCsvLogger csvLogger;
   final Future<void> Function() stopWearableCsvLogging;
   final VoidCallback onAcquisitionStopped;
+  final String? backgroundStatusMessage;
 
   @override
   State<WearableBleCommunicationLogPage> createState() =>
@@ -2819,6 +3263,9 @@ class _WearableBleCommunicationLogPageState
       var csvFinalizeFailed = false;
       try {
         await widget.stopWearableCsvLogging();
+        await AndroidAcquisitionForegroundService.stop();
+        await AcquisitionRecoveryStore.clear();
+        await _ActiveAcquisitionRuntime.markInactive();
       } catch (_) {
         csvFinalizeFailed = true;
       }
@@ -2870,6 +3317,7 @@ class _WearableBleCommunicationLogPageState
             Expanded(
               child: _buildWearableDashboard(),
             ),
+            _buildBackgroundStatus(),
             _buildStopAcquisitionButton(),
           ],
         ),
@@ -2964,6 +3412,52 @@ class _WearableBleCommunicationLogPageState
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBackgroundStatus() {
+    if (!Platform.isAndroid) {
+      return const SizedBox.shrink();
+    }
+
+    final warning = widget.backgroundStatusMessage;
+    final colorScheme = Theme.of(context).colorScheme;
+    final backgroundColor = warning == null
+        ? Colors.green.shade50
+        : colorScheme.errorContainer;
+    final foregroundColor = warning == null
+        ? Colors.green.shade900
+        : colorScheme.onErrorContainer;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: backgroundColor,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              Icon(
+                warning == null
+                    ? Icons.notifications_active
+                    : Icons.warning_amber_rounded,
+                size: 18,
+                color: foregroundColor,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  warning ?? 'Background acquisition active',
+                  style: TextStyle(color: foregroundColor),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -3892,6 +4386,8 @@ class _AcquisitionInitializationPageState
   String? _errorMessage;
   bool _canRetry = false;
   bool _requiresReconnect = false;
+  bool _foregroundServiceStarted = false;
+  String? _backgroundStatusMessage;
   _LiveVisualizationMode _visualizationMode = _LiveVisualizationMode.cards;
   OpenRemoteMqttState _mqttState = const OpenRemoteMqttState(
     status: OpenRemoteMqttStatus.disconnected,
@@ -3915,14 +4411,19 @@ class _AcquisitionInitializationPageState
         definition.prefix: definition,
     };
     _messagesSubscription = _service.messages.listen((message) {
-      if (!mounted || _acquisitionStopped) {
+      if (_acquisitionStopped) {
         return;
       }
 
-      setState(() {
+      if (mounted) {
+        setState(() {
+          _messages.add(message);
+          _updateLiveMeasurement(message);
+        });
+      } else {
         _messages.add(message);
         _updateLiveMeasurement(message);
-      });
+      }
       if (_acquisitionStarted && _csvLogger.isStarted) {
         unawaited(
           _csvLogger.appendBleMessage(
@@ -3972,13 +4473,21 @@ class _AcquisitionInitializationPageState
 
   @override
   void dispose() {
+    if (_acquisitionStarted && !_acquisitionStopped) {
+      super.dispose();
+      return;
+    }
+
     unawaited(_messagesSubscription?.cancel());
     unawaited(_connectionSubscription?.cancel());
     unawaited(_mqttStateSubscription?.cancel());
-    unawaited(_csvLogger.stop());
-    unawaited(_gpsLocationService.dispose());
-    unawaited(_mqttService.dispose());
-    unawaited(_service.dispose());
+    if (!_acquisitionStarted || _acquisitionStopped) {
+      unawaited(_csvLogger.stop());
+      unawaited(_gpsLocationService.dispose());
+      unawaited(_mqttService.dispose());
+      unawaited(_service.dispose());
+      unawaited(AndroidAcquisitionForegroundService.stop());
+    }
     super.dispose();
   }
 
@@ -4007,15 +4516,23 @@ class _AcquisitionInitializationPageState
       await _service.initialize(widget.configuration);
       if (!_csvLogger.isStarted) {
         await _csvLogger.start();
-        unawaited(_gpsLocationService.start());
+        await _gpsLocationService.start();
+        final gpsStatusMessage = _gpsLocationService.statusMessage;
+        if (gpsStatusMessage != null) {
+          _backgroundStatusMessage = _mergeStatusMessage(
+            _backgroundStatusMessage,
+            gpsStatusMessage,
+          );
+        }
       }
+      _acquisitionStarted = true;
+      await _activateAndroidBackgroundSupport();
       if (!mounted) {
         return;
       }
 
       setState(() {
         _isInitializing = false;
-        _acquisitionStarted = true;
       });
     } catch (error) {
       if (!mounted) {
@@ -4028,7 +4545,47 @@ class _AcquisitionInitializationPageState
         _canRetry = error is BleConfigurationException && error.canRetry;
         _requiresReconnect = false;
       });
+      await AndroidAcquisitionForegroundService.stop();
     }
+  }
+
+  Future<void> _activateAndroidBackgroundSupport() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    final notificationStatus = await Permission.notification.request();
+    if (!notificationStatus.isGranted) {
+      _backgroundStatusMessage = _mergeStatusMessage(
+        _backgroundStatusMessage,
+        'Android background acquisition may be unreliable without the persistent notification.',
+      );
+    }
+
+    try {
+      await AndroidAcquisitionForegroundService.start();
+      _foregroundServiceStarted = true;
+    } catch (error) {
+      _backgroundStatusMessage = _mergeStatusMessage(
+        _backgroundStatusMessage,
+        'Android background acquisition may be unreliable: $error',
+      );
+    }
+
+    await _ActiveAcquisitionRuntime.markActive();
+    await AcquisitionRecoveryStore.saveActive(
+      acquisitionType: 'environmentalMonitor',
+      deviceNames: [_deviceName(widget.device)],
+      deviceTypes: [KnownDeviceType.environmentalMonitor.name],
+      configurationSummaries: [
+        _summarizeEnvironmentalConfiguration(widget.configuration),
+      ],
+      startedAt: DateTime.now(),
+      logicalRoute: 'acquisition',
+      status: 'running',
+      csvFileName: _csvLogger.fileName,
+      csvFilePath: _csvLogger.file?.path,
+    );
   }
 
   Future<void> _retryInitialization() async {
@@ -4192,6 +4749,9 @@ class _AcquisitionInitializationPageState
       _messagesSubscription = null;
       await _csvLogger.stop();
       await _gpsLocationService.stop();
+      await AndroidAcquisitionForegroundService.stop();
+      await AcquisitionRecoveryStore.clear();
+      await _ActiveAcquisitionRuntime.markInactive();
 
       if (!mounted) {
         return;
@@ -4279,12 +4839,63 @@ class _AcquisitionInitializationPageState
     return Column(
       children: [
         _buildVisualizationModeSelector(),
+        _buildBackgroundStatus(),
         Expanded(
           child: _buildLiveVisualization(),
         ),
         _buildStopAcquisitionButton(),
         _buildOpenRemoteBanner(context),
       ],
+    );
+  }
+
+  Widget _buildBackgroundStatus() {
+    if (!Platform.isAndroid) {
+      return const SizedBox.shrink();
+    }
+
+    final warning = _backgroundStatusMessage;
+    final colorScheme = Theme.of(context).colorScheme;
+    final backgroundColor = warning == null
+        ? Colors.green.shade50
+        : colorScheme.errorContainer;
+    final foregroundColor = warning == null
+        ? Colors.green.shade900
+        : colorScheme.onErrorContainer;
+    final text = warning ??
+        (_foregroundServiceStarted
+            ? 'Background acquisition active'
+            : 'Background acquisition starting');
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: backgroundColor,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              Icon(
+                warning == null
+                    ? Icons.notifications_active
+                    : Icons.warning_amber_rounded,
+                size: 18,
+                color: foregroundColor,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  text,
+                  style: TextStyle(color: foregroundColor),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 

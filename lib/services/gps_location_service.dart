@@ -9,6 +9,9 @@ class GpsLocationService {
   bool _isStarted = false;
   bool _locationServicesEnabled = false;
   bool _hasLocationPermission = false;
+  String? _statusMessage;
+
+  String? get statusMessage => _statusMessage;
 
   String get currentCoordinates {
     final position = _latestPosition;
@@ -27,14 +30,19 @@ class GpsLocationService {
     }
 
     _isStarted = true;
+    _statusMessage = null;
     try {
       _locationServicesEnabled = await Geolocator.isLocationServiceEnabled();
       if (!_locationServicesEnabled) {
+        _statusMessage =
+            'Location services are disabled. GPS coordinates will be saved as NA.';
         return;
       }
 
       _hasLocationPermission = await _ensurePermission();
       if (!_hasLocationPermission) {
+        _statusMessage =
+            'Location permission denied. GPS coordinates will be saved as NA.';
         return;
       }
 
@@ -45,6 +53,7 @@ class GpsLocationService {
       _locationServicesEnabled = false;
       _hasLocationPermission = false;
       _latestPosition = null;
+      _statusMessage = 'GPS is unavailable. GPS coordinates will be saved as NA.';
     }
   }
 
@@ -84,11 +93,16 @@ class GpsLocationService {
         _locationServicesEnabled = status == ServiceStatus.enabled;
         if (!_locationServicesEnabled) {
           _latestPosition = null;
+          _statusMessage =
+              'Location services are disabled. GPS coordinates will be saved as NA.';
+        } else if (_hasLocationPermission) {
+          _statusMessage = null;
         }
       },
       onError: (_) {
         _locationServicesEnabled = false;
         _latestPosition = null;
+        _statusMessage = 'GPS is unavailable. GPS coordinates will be saved as NA.';
       },
     );
   }
