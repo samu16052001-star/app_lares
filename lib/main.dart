@@ -483,7 +483,10 @@ class KnownDeviceClassifier {
     }
 
     if (normalizedNames.any(
-      (name) => name.contains('respiratorymonitor') || name.contains('imu'),
+      (name) =>
+          name.contains('respiratorymonitor') ||
+          name.contains('resp') ||
+          name.contains('imu'),
     )) {
       return KnownDeviceType.respiratoryMonitor;
     }
@@ -496,6 +499,7 @@ class KnownDeviceClassifier {
       return name.contains('lares') ||
           name.contains('env') ||
           name.contains('respiratorymonitor') ||
+          name.contains('resp') ||
           name.contains('imu');
     });
   }

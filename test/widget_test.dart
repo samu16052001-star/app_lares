@@ -4,6 +4,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:app_lares/main.dart';
 
 void main() {
+  test('classifies LARES respiratory device names', () {
+    expect(
+      KnownDeviceClassifier.fromNames(const ['LARES_RESP_V1_03']),
+      KnownDeviceType.respiratoryMonitor,
+    );
+  });
+
   testWidgets('opens the user section with the user code', (
     WidgetTester tester,
   ) async {
