@@ -39,6 +39,7 @@ class WearableConfigurationBleService {
 
   static const Duration _configDoneTimeout = Duration(seconds: 10);
   static const Duration _calibrationDoneTimeout = Duration(seconds: 22);
+  static const Duration _periodicTimestampInterval = Duration(seconds: 60);
   static const int _maxLogEntries = 200;
 
   final BluetoothDevice device;
@@ -57,9 +58,12 @@ class WearableConfigurationBleService {
   BluetoothCharacteristic? _writeCharacteristic;
   BluetoothCharacteristic? _notifyCharacteristic;
   StreamSubscription<List<int>>? _notificationSubscription;
+  StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
   Timer? _sequenceTimer;
+  Timer? _periodicTimestampTimer;
 
   bool _isDisposed = false;
+  bool _periodicTimestampWriteInProgress = false;
   bool _mtuRequested = false;
   bool _hasBlockingMtuIssue = false;
   bool _serviceDiscoveryCompleted = false;
@@ -122,6 +126,7 @@ class WearableConfigurationBleService {
       return;
     }
 
+    _listenToConnectionState();
     await _requestMtu();
     if (_isDisposed) {
       return;
@@ -177,6 +182,7 @@ class WearableConfigurationBleService {
     _setSequenceState(WearableBleSequenceState.stopping);
     _sequenceTimer?.cancel();
     _sequenceTimer = null;
+    _stopPeriodicTimestampTimer();
     _log('Sending STOP command.');
 
     try {
@@ -213,7 +219,10 @@ class WearableConfigurationBleService {
     _isDisposed = true;
     _sequenceTimer?.cancel();
     _sequenceTimer = null;
+    _stopPeriodicTimestampTimer();
     _log('Wearable BLE service disposal started.');
+
+    await _cancelConnectionStateSubscription();
 
     try {
       await _notificationSubscription?.cancel();
@@ -243,6 +252,9 @@ class WearableConfigurationBleService {
   }
 
   Future<void> _cleanupAfterStop() async {
+    _stopPeriodicTimestampTimer();
+    await _cancelConnectionStateSubscription();
+
     try {
       await _notificationSubscription?.cancel();
       _log('Notification subscription cancelled.');
@@ -263,6 +275,23 @@ class WearableConfigurationBleService {
 
     _notificationsEnabled = false;
     _log('Disconnection-related BLE cleanup completed.');
+  }
+
+  void _listenToConnectionState() {
+    _connectionStateSubscription ??= device.connectionState.listen((state) {
+      if (state == BluetoothConnectionState.disconnected) {
+        _stopPeriodicTimestampTimer();
+      }
+    });
+  }
+
+  Future<void> _cancelConnectionStateSubscription() async {
+    try {
+      await _connectionStateSubscription?.cancel();
+    } catch (error) {
+      debugPrint('Wearable connection listener cancellation error: $error');
+    }
+    _connectionStateSubscription = null;
   }
 
   Future<void> _requestMtu() async {
@@ -406,6 +435,7 @@ class WearableConfigurationBleService {
 
     try {
       final sample = WearableAgmPacketParser.parse(value);
+      _startPeriodicTimestampTimerIfNeeded(receivedAt);
       if (!_agmSamplesController.isClosed) {
         _agmSamplesController.add(
           WearableAgmReceivedSample(
@@ -527,6 +557,60 @@ class WearableConfigurationBleService {
     );
   }
 
+  void _startPeriodicTimestampTimerIfNeeded(DateTime firstValidAgmReceivedAt) {
+    if (_periodicTimestampTimer != null || _isDisposed) {
+      return;
+    }
+
+    final firstSendAt =
+        firstValidAgmReceivedAt.add(_periodicTimestampInterval);
+    final delay = firstSendAt.difference(DateTime.now());
+    final initialDelay = delay.isNegative ? Duration.zero : delay;
+
+    _periodicTimestampTimer = Timer(initialDelay, () {
+      if (_isDisposed || !_canSendPeriodicTimestamp) {
+        _stopPeriodicTimestampTimer();
+        return;
+      }
+
+      unawaited(_sendPeriodicTimestamp());
+      _periodicTimestampTimer = Timer.periodic(
+        _periodicTimestampInterval,
+        (_) {
+          unawaited(_sendPeriodicTimestamp());
+        },
+      );
+    });
+  }
+
+  void _stopPeriodicTimestampTimer() {
+    _periodicTimestampTimer?.cancel();
+    _periodicTimestampTimer = null;
+    _periodicTimestampWriteInProgress = false;
+  }
+
+  bool get _canSendPeriodicTimestamp {
+    return !_isDisposed &&
+        _writeCharacteristic != null &&
+        _sequenceState == WearableBleSequenceState.streaming;
+  }
+
+  Future<void> _sendPeriodicTimestamp() async {
+    if (!_canSendPeriodicTimestamp || _periodicTimestampWriteInProgress) {
+      return;
+    }
+
+    _periodicTimestampWriteInProgress = true;
+    final timestamp = _formatTimestamp(DateTime.now());
+    try {
+      await _writeCommand('TIMESTAMP:$timestamp');
+    } catch (error) {
+      debugPrint('Periodic timestamp write error: $error');
+    } finally {
+      _periodicTimestampWriteInProgress = false;
+    }
+  }
+
   void _startTimeout({
     required Duration timeout,
     required String expectedPayload,
@@ -606,6 +690,9 @@ class WearableConfigurationBleService {
 
   void _setSequenceState(WearableBleSequenceState state) {
     _sequenceState = state;
+    if (_shouldStopPeriodicTimestampForState(state)) {
+      _stopPeriodicTimestampTimer();
+    }
     if (!_sequenceStateController.isClosed) {
       _sequenceStateController.add(state);
     }
@@ -631,6 +718,16 @@ class WearableConfigurationBleService {
       _logController.add(logs);
     }
     onStateChanged?.call();
+  }
+
+  bool _shouldStopPeriodicTimestampForState(WearableBleSequenceState state) {
+    return switch (state) {
+      WearableBleSequenceState.stopping ||
+      WearableBleSequenceState.stopped ||
+      WearableBleSequenceState.timeout ||
+      WearableBleSequenceState.error => true,
+      _ => false,
+    };
   }
 }
 
