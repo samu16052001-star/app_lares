@@ -24,4 +24,31 @@ class AndroidAcquisitionForegroundService {
 
     await _channel.invokeMethod<void>('stopAcquisitionForegroundService');
   }
+
+  static Future<void> showBleDisconnectionAlert(String deviceName) async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      await _channel.invokeMethod<void>(
+        'showBleDisconnectionAlert',
+        <String, Object?>{'deviceName': deviceName},
+      );
+    } catch (_) {
+      // Alert notification failures must never interrupt acquisition.
+    }
+  }
+
+  static Future<void> clearBleDisconnectionAlert() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      await _channel.invokeMethod<void>('clearBleDisconnectionAlert');
+    } catch (_) {
+      // Best effort cleanup only.
+    }
+  }
 }

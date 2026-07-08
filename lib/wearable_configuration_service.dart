@@ -42,7 +42,7 @@ class WearableConfigurationBleService {
   static const Duration _periodicTimestampInterval = Duration(seconds: 60);
   static const int _maxLogEntries = 200;
 
-  final BluetoothDevice device;
+  BluetoothDevice device;
   final VoidCallback? onStateChanged;
 
   final StreamController<List<String>> _logController =
@@ -138,6 +138,35 @@ class WearableConfigurationBleService {
     }
 
     await _enableNotifications();
+  }
+
+  Future<void> resumeNotificationsAfterReconnect({
+    BluetoothDevice? reconnectedDevice,
+  }) async {
+    if (_isDisposed) {
+      throw StateError('Wearable BLE service is disposed.');
+    }
+
+    if (reconnectedDevice != null) {
+      await _cancelConnectionStateSubscription();
+      device = reconnectedDevice;
+    }
+
+    _listenToConnectionState();
+    await _clearNotificationSubscriptionForReconnect();
+    await _discoverWearableService();
+    if (_isDisposed) {
+      return;
+    }
+
+    await _enableNotifications();
+    if (!_targetServiceFound ||
+        !_writeCharacteristicFound ||
+        !_notifyCharacteristicFound ||
+        !_notificationsEnabled) {
+      throw StateError('Wearable BLE notification resume is not complete.');
+    }
+    _resumePeriodicTimestampTimerIfStreaming();
   }
 
   Future<void> startConfigurationSequence({
@@ -277,6 +306,17 @@ class WearableConfigurationBleService {
     _log('Disconnection-related BLE cleanup completed.');
   }
 
+  Future<void> _clearNotificationSubscriptionForReconnect() async {
+    try {
+      await _notificationSubscription?.cancel();
+      _log('Notification subscription cancelled for reconnect.');
+    } catch (error) {
+      _log('Notification subscription cancellation error: $error');
+    }
+    _notificationSubscription = null;
+    _notificationsEnabled = false;
+  }
+
   void _listenToConnectionState() {
     _connectionStateSubscription ??= device.connectionState.listen((state) {
       if (state == BluetoothConnectionState.disconnected) {
@@ -323,6 +363,11 @@ class WearableConfigurationBleService {
 
   Future<void> _discoverWearableService() async {
     _log('Service discovery started.');
+    _targetServiceFound = false;
+    _writeCharacteristicFound = false;
+    _notifyCharacteristicFound = false;
+    _writeCharacteristic = null;
+    _notifyCharacteristic = null;
 
     try {
       final services = await device.discoverServices();
@@ -587,6 +632,22 @@ class WearableConfigurationBleService {
     _periodicTimestampTimer?.cancel();
     _periodicTimestampTimer = null;
     _periodicTimestampWriteInProgress = false;
+  }
+
+  void _resumePeriodicTimestampTimerIfStreaming() {
+    if (_sequenceState != WearableBleSequenceState.streaming ||
+        _periodicTimestampTimer != null ||
+        _isDisposed) {
+      return;
+    }
+
+    _periodicTimestampTimer = Timer.periodic(
+      _periodicTimestampInterval,
+      (_) {
+        unawaited(_sendPeriodicTimestamp());
+      },
+    );
+    _log('Periodic timestamp timer resumed after reconnect.');
   }
 
   bool get _canSendPeriodicTimestamp {

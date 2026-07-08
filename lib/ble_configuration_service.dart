@@ -54,7 +54,7 @@ class BleConfigurationException implements Exception {
 class BleConfigurationService {
   BleConfigurationService(this.device);
 
-  final BluetoothDevice device;
+  BluetoothDevice device;
 
   final StreamController<BleNotificationMessage> _messagesController =
       StreamController<BleNotificationMessage>.broadcast();
@@ -108,6 +108,30 @@ class BleConfigurationService {
       await _subscribeToNotifications();
     } finally {
       _isInitializing = false;
+    }
+  }
+
+  Future<void> resumeNotificationsAfterReconnect({
+    BluetoothDevice? reconnectedDevice,
+  }) async {
+    if (_disposed) {
+      throw const BleConfigurationException(
+        'BLE service is disposed.',
+        canRetry: false,
+      );
+    }
+
+    if (reconnectedDevice != null) {
+      device = reconnectedDevice;
+    }
+
+    await _clearNotificationSubscriptions();
+    _discoveredServices = await device.discoverServices();
+    await _subscribeToNotifications();
+    if (_notificationSubscriptions.isEmpty) {
+      throw const BleConfigurationException(
+        'No BLE notification characteristics found after reconnect.',
+      );
     }
   }
 

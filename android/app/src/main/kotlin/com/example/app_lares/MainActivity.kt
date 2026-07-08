@@ -37,6 +37,16 @@ class MainActivity : FlutterActivity() {
                         )
                     }
                 }
+                "showBleDisconnectionAlert" -> {
+                    val deviceName = call.argument<String>("deviceName")
+                        ?: "BLE device"
+                    LaresBleAlertNotifications.show(this, deviceName)
+                    result.success(null)
+                }
+                "clearBleDisconnectionAlert" -> {
+                    LaresBleAlertNotifications.clear(this)
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         }

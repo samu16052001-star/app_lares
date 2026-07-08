@@ -16,6 +16,7 @@ import 'package:app_lares/wearable_configuration_service.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 Future<void> main() async {
@@ -89,7 +90,10 @@ class _LaresAppState extends State<LaresApp> with WidgetsBindingObserver {
 
 class _ActiveAcquisitionRuntime {
   static bool _isActive = false;
+  static bool _isForegroundVisible = true;
   static _MultiDeviceSessionManager? _multiDeviceManager;
+
+  static bool get isForegroundVisible => _isForegroundVisible;
 
   static void registerMultiDeviceManager(_MultiDeviceSessionManager manager) {
     _multiDeviceManager = manager;
@@ -105,6 +109,7 @@ class _ActiveAcquisitionRuntime {
   }
 
   static Future<void> handlePaused() async {
+    _isForegroundVisible = false;
     if (!_isActive) {
       return;
     }
@@ -117,6 +122,7 @@ class _ActiveAcquisitionRuntime {
   }
 
   static Future<void> handleInactive() async {
+    _isForegroundVisible = false;
     if (!_isActive) {
       return;
     }
@@ -128,6 +134,7 @@ class _ActiveAcquisitionRuntime {
   }
 
   static Future<void> handleDetached() async {
+    _isForegroundVisible = false;
     if (!_isActive) {
       return;
     }
@@ -139,6 +146,7 @@ class _ActiveAcquisitionRuntime {
   }
 
   static Future<void> handleResumed() async {
+    _isForegroundVisible = true;
     if (!_isActive) {
       return;
     }
@@ -557,6 +565,314 @@ String _mergeStatusMessage(String? current, String message) {
   return '$current\n$message';
 }
 
+enum _BleReconnectStatus {
+  disconnected,
+  reconnecting,
+  failed,
+  reconnected,
+}
+
+extension _BleReconnectStatusText on _BleReconnectStatus {
+  String get label {
+    return switch (this) {
+      _BleReconnectStatus.disconnected => 'Disconnected',
+      _BleReconnectStatus.reconnecting => 'Reconnecting...',
+      _BleReconnectStatus.failed => 'Reconnection failed',
+      _BleReconnectStatus.reconnected => 'Reconnected',
+    };
+  }
+}
+
+class _BleDisconnectionAlertItem {
+  const _BleDisconnectionAlertItem({
+    required this.id,
+    required this.deviceName,
+    required this.status,
+    required this.onReconnect,
+    this.failureMessage,
+  });
+
+  final String id;
+  final String deviceName;
+  final _BleReconnectStatus status;
+  final VoidCallback onReconnect;
+  final String? failureMessage;
+
+  bool get isReconnecting => status == _BleReconnectStatus.reconnecting;
+}
+
+class _BleDisconnectionAlertDialog extends StatelessWidget {
+  const _BleDisconnectionAlertDialog({
+    required this.items,
+    required this.onClose,
+  });
+
+  final List<_BleDisconnectionAlertItem> items;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return AlertDialog(
+      titlePadding: const EdgeInsets.fromLTRB(24, 18, 8, 0),
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(
+              'BLE device disconnected',
+              style: theme.textTheme.titleLarge,
+            ),
+          ),
+          IconButton(
+            tooltip: 'Close',
+            icon: const Icon(Icons.close),
+            onPressed: onClose,
+          ),
+        ],
+      ),
+      content: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 460),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'The following device disconnected during acquisition. Move closer to the phone and tap Reconnect to resume BLE notifications.',
+            ),
+            const SizedBox(height: 16),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 340),
+              child: ListView.separated(
+                shrinkWrap: true,
+                itemCount: items.length,
+                separatorBuilder: (_, _) => const Divider(height: 20),
+                itemBuilder: (context, index) {
+                  final item = items[index];
+                  return _BleDisconnectionAlertDeviceRow(item: item);
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _BleDisconnectionAlertDeviceRow extends StatelessWidget {
+  const _BleDisconnectionAlertDeviceRow({
+    required this.item,
+  });
+
+  final _BleDisconnectionAlertItem item;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final statusColor = switch (item.status) {
+      _BleReconnectStatus.reconnecting => colorScheme.primary,
+      _BleReconnectStatus.failed => colorScheme.error,
+      _ => colorScheme.onSurfaceVariant,
+    };
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(Icons.bluetooth_disabled, color: colorScheme.error),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                item.deviceName,
+                style: theme.textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                item.status.label,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: statusColor,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              if (item.failureMessage != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  item.failureMessage!,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: colorScheme.error,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(width: 12),
+        FilledButton(
+          onPressed: item.isReconnecting ? null : item.onReconnect,
+          child: const Text('Reconnect'),
+        ),
+      ],
+    );
+  }
+}
+
+class _BleReconnectHelper {
+  const _BleReconnectHelper._();
+
+  static const Duration connectTimeout = Duration(seconds: 12);
+  static const Duration _scanTimeout = Duration(seconds: 5);
+
+  static Future<BluetoothDevice> reconnect({
+    required BluetoothDevice currentDevice,
+    required String deviceId,
+    required String deviceName,
+  }) async {
+    late final Object savedDeviceError;
+
+    try {
+      return await _connectDevice(currentDevice);
+    } catch (error) {
+      savedDeviceError = error;
+    }
+
+    final scannedDevice = await _scanForMatchingDevice(
+      deviceId: deviceId,
+      deviceName: deviceName,
+    );
+    if (scannedDevice == null) {
+      throw savedDeviceError;
+    }
+
+    return _connectDevice(scannedDevice);
+  }
+
+  static Future<BluetoothDevice> _connectDevice(BluetoothDevice device) async {
+    final state = await device.connectionState.first.timeout(
+      const Duration(seconds: 2),
+      onTimeout: () => BluetoothConnectionState.disconnected,
+    );
+    if (state != BluetoothConnectionState.disconnected) {
+      return device;
+    }
+
+    await device
+        .connect(
+          license: License.nonprofit,
+          timeout: connectTimeout,
+        )
+        .timeout(connectTimeout);
+    return device;
+  }
+
+  static Future<BluetoothDevice?> _scanForMatchingDevice({
+    required String deviceId,
+    required String deviceName,
+  }) async {
+    final hasPermissions = await _requestBluetoothReconnectPermissions();
+    if (!hasPermissions) {
+      return null;
+    }
+
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {}
+
+    BluetoothDevice? nameFallbackDevice;
+    final idMatchCompleter = Completer<BluetoothDevice>();
+    late final StreamSubscription<List<ScanResult>> scanSubscription;
+
+    scanSubscription = FlutterBluePlus.onScanResults.listen((results) {
+      for (final result in results) {
+        final resultDevice = result.device;
+        if (_deviceId(resultDevice) == deviceId) {
+          if (!idMatchCompleter.isCompleted) {
+            idMatchCompleter.complete(resultDevice);
+          }
+          return;
+        }
+
+        if (nameFallbackDevice == null &&
+            _scanResultMatchesName(result, deviceName)) {
+          nameFallbackDevice = resultDevice;
+        }
+      }
+    });
+
+    try {
+      await FlutterBluePlus.startScan(timeout: _scanTimeout);
+      try {
+        return await idMatchCompleter.future.timeout(_scanTimeout);
+      } on TimeoutException {
+        return nameFallbackDevice;
+      }
+    } finally {
+      await scanSubscription.cancel();
+      try {
+        await FlutterBluePlus.stopScan();
+      } catch (_) {}
+    }
+  }
+
+  static Future<bool> _requestBluetoothReconnectPermissions() async {
+    if (!Platform.isAndroid) {
+      return true;
+    }
+
+    final statuses = await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.locationWhenInUse,
+    ].request();
+
+    final scanStatus = statuses[Permission.bluetoothScan];
+    final connectStatus = statuses[Permission.bluetoothConnect];
+
+    return (scanStatus == null || scanStatus.isGranted) &&
+        (connectStatus == null || connectStatus.isGranted);
+  }
+
+  static bool _scanResultMatchesName(ScanResult result, String deviceName) {
+    final expected = _normalizeDeviceNameForReconnect(deviceName);
+    if (expected.isEmpty) {
+      return false;
+    }
+
+    return _scanResultNameCandidates(result).any((name) {
+      return _normalizeDeviceNameForReconnect(name) == expected;
+    });
+  }
+
+  static List<String> _scanResultNameCandidates(ScanResult result) {
+    final names = <String>[];
+    for (final name in [
+      result.device.platformName,
+      result.advertisementData.advName,
+      result.device.advName,
+    ]) {
+      final trimmedName = name.trim();
+      if (trimmedName.isNotEmpty && !names.contains(trimmedName)) {
+        names.add(trimmedName);
+      }
+    }
+
+    return names;
+  }
+
+  static String _deviceId(BluetoothDevice device) {
+    return device.remoteId.toString();
+  }
+}
+
+String _normalizeDeviceNameForReconnect(String value) {
+  return value.trim().toLowerCase();
+}
+
 class _ConnectedDeviceSession {
   _ConnectedDeviceSession({
     required this.device,
@@ -567,7 +883,7 @@ class _ConnectedDeviceSession {
 
   static const Duration wearableVisibleChartWindow = Duration(seconds: 2);
 
-  final BluetoothDevice device;
+  BluetoothDevice device;
   final String deviceId;
   final String deviceName;
   final KnownDeviceType type;
@@ -585,6 +901,9 @@ class _ConnectedDeviceSession {
   bool isInitializing = false;
   bool isInitialized = false;
   bool disconnectedDuringAcquisition = false;
+  int disconnectionAlertVersion = 0;
+  _BleReconnectStatus reconnectStatus = _BleReconnectStatus.disconnected;
+  String? reconnectFailureMessage;
   String? errorMessage;
 
   final List<BleNotificationMessage> environmentalMessages = [];
@@ -665,6 +984,16 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   String? backgroundStatusMessage;
 
   List<_ConnectedDeviceSession> get sessions => List.unmodifiable(_sessions);
+
+  List<_ConnectedDeviceSession> get disconnectedSessionsDuringAcquisition {
+    return _sessions
+        .where(
+          (session) =>
+              session.disconnectedDuringAcquisition &&
+              session.reconnectStatus != _BleReconnectStatus.reconnected,
+        )
+        .toList(growable: false);
+  }
 
   int get connectedCount {
     return _sessions.where((session) => session.isConnected).length;
@@ -839,15 +1168,95 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       try {
         final state = await session.device.connectionState.first;
         final isConnected = state != BluetoothConnectionState.disconnected;
+        if (isConnected && session.disconnectedDuringAcquisition) {
+          continue;
+        }
+        final wasConnected = session.isConnected;
         session.isConnected = isConnected;
-        if (!isConnected) {
-          session.disconnectedDuringAcquisition = true;
+        if (!isConnected && wasConnected) {
+          _markSessionDisconnectedDuringAcquisition(session);
         }
       } catch (_) {}
     }
 
     await _activateAndroidBackgroundSupport();
     notifyListeners();
+  }
+
+  Future<void> reconnectDisconnectedSession(
+    _ConnectedDeviceSession session,
+  ) async {
+    if (!_acquisitionStarted ||
+        session.reconnectStatus == _BleReconnectStatus.reconnecting ||
+        !disconnectedSessionsDuringAcquisition.contains(session)) {
+      return;
+    }
+
+    session
+      ..reconnectStatus = _BleReconnectStatus.reconnecting
+      ..reconnectFailureMessage = null;
+    notifyListeners();
+
+    try {
+      final reconnectedDevice = await _BleReconnectHelper.reconnect(
+        currentDevice: session.device,
+        deviceId: session.deviceId,
+        deviceName: session.deviceName,
+      );
+
+      final deviceReferenceChanged = !identical(reconnectedDevice, session.device);
+      if (deviceReferenceChanged) {
+        await session.cancelConnectionSubscription();
+        session.device = reconnectedDevice;
+        _attachConnectionListener(session);
+      } else {
+        session.device = reconnectedDevice;
+      }
+
+      switch (session.type) {
+        case KnownDeviceType.environmentalMonitor:
+          final service = session.environmentalService;
+          if (service == null) {
+            throw StateError('Environmental BLE service is not available.');
+          }
+          await service.resumeNotificationsAfterReconnect(
+            reconnectedDevice: reconnectedDevice,
+          );
+          break;
+        case KnownDeviceType.respiratoryMonitor:
+          final service = session.wearableService;
+          if (service == null) {
+            throw StateError('Wearable BLE service is not available.');
+          }
+          await service.resumeNotificationsAfterReconnect(
+            reconnectedDevice: reconnectedDevice,
+          );
+          break;
+        case KnownDeviceType.unsupported:
+          throw StateError('${session.deviceName} is unsupported.');
+      }
+
+      session
+        ..isConnected = true
+        ..disconnectedDuringAcquisition = false
+        ..reconnectStatus = _BleReconnectStatus.reconnected
+        ..reconnectFailureMessage = null;
+      if (disconnectedSessionsDuringAcquisition.isEmpty) {
+        unawaited(AndroidAcquisitionForegroundService.clearBleDisconnectionAlert());
+      }
+      notifyListeners();
+    } catch (_) {
+      try {
+        await session.device.disconnect();
+      } catch (_) {}
+      session
+        ..isConnected = false
+        ..disconnectedDuringAcquisition = true
+        ..reconnectStatus = _BleReconnectStatus.failed
+        ..reconnectFailureMessage =
+            'Could not reconnect to ${session.deviceName}. Move closer and try again.';
+      notifyListeners();
+    }
   }
 
   void setVisualizationMode(
@@ -905,6 +1314,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     } catch (_) {}
     await gpsLocationService.stop();
     await csvLogger.stop();
+    await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
     await AndroidAcquisitionForegroundService.stop();
     await AcquisitionRecoveryStore.clear();
     await _ActiveAcquisitionRuntime.markInactive();
@@ -995,6 +1405,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     session.connectionSubscription = session.device.connectionState.listen(
       (state) {
         final isConnected = state != BluetoothConnectionState.disconnected;
+        if (isConnected &&
+            _acquisitionStarted &&
+            session.disconnectedDuringAcquisition) {
+          return;
+        }
         if (session.isConnected == isConnected) {
           return;
         }
@@ -1002,7 +1417,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         session.isConnected = isConnected;
         if (!isConnected) {
           if (_acquisitionStarted) {
-            session.disconnectedDuringAcquisition = true;
+            _markSessionDisconnectedDuringAcquisition(session);
           } else {
             unawaited(session.cancelConnectionSubscription());
             _sessions.removeWhere(
@@ -1013,6 +1428,24 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         notifyListeners();
       },
     );
+  }
+
+  void _markSessionDisconnectedDuringAcquisition(
+    _ConnectedDeviceSession session,
+  ) {
+    session
+      ..disconnectedDuringAcquisition = true
+      ..disconnectionAlertVersion += 1
+      ..reconnectStatus = _BleReconnectStatus.disconnected
+      ..reconnectFailureMessage = null;
+
+    if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
+      unawaited(
+        AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
+          session.deviceName,
+        ),
+      );
+    }
   }
 
   Future<void> _initializeEnvironmental(_ConnectedDeviceSession session) async {
@@ -2073,17 +2506,40 @@ class _MultiDeviceAcquisitionPage extends StatefulWidget {
 }
 
 class _MultiDeviceAcquisitionPageState
-    extends State<_MultiDeviceAcquisitionPage> {
+    extends State<_MultiDeviceAcquisitionPage> with WidgetsBindingObserver {
+  final Set<String> _dismissedBleAlertKeys = {};
+  Timer? _bleAlertBeepTimer;
+  BuildContext? _bleAlertDialogContext;
+  bool _bleAlertDialogOpen = false;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     widget.manager.addListener(_handleManagerChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _syncBleDisconnectionAlertDialog();
+    });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     widget.manager.removeListener(_handleManagerChanged);
+    _stopBleAlertAlarm();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _syncBleDisconnectionAlertDialog();
+      });
+      return;
+    }
+
+    _stopBleAlertAlarm();
   }
 
   void _handleManagerChanged() {
@@ -2092,6 +2548,129 @@ class _MultiDeviceAcquisitionPageState
     }
 
     setState(() {});
+    _syncBleDisconnectionAlertDialog();
+  }
+
+  void _syncBleDisconnectionAlertDialog() {
+    if (!mounted || !Platform.isAndroid) {
+      return;
+    }
+
+    final disconnectedSessions =
+        widget.manager.disconnectedSessionsDuringAcquisition;
+    if (_bleAlertDialogOpen) {
+      if (disconnectedSessions.isEmpty) {
+        _closeBleAlertDialog(dismissCurrentDevices: false);
+      }
+      return;
+    }
+
+    if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
+      return;
+    }
+
+    final visibleSessions = disconnectedSessions.where((session) {
+      return !_dismissedBleAlertKeys.contains(_bleAlertKey(session));
+    }).toList(growable: false);
+    if (visibleSessions.isEmpty) {
+      return;
+    }
+
+    _showBleAlertDialog();
+  }
+
+  void _showBleAlertDialog() {
+    if (_bleAlertDialogOpen || !mounted) {
+      return;
+    }
+
+    _bleAlertDialogOpen = true;
+    _startBleAlertAlarm();
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          _bleAlertDialogContext = dialogContext;
+          return AnimatedBuilder(
+            animation: widget.manager,
+            builder: (context, _) {
+              final items = widget.manager.disconnectedSessionsDuringAcquisition
+                  .map(_bleAlertItemForSession)
+                  .toList(growable: false);
+              return _BleDisconnectionAlertDialog(
+                items: items,
+                onClose: () {
+                  _closeBleAlertDialog(dismissCurrentDevices: true);
+                },
+              );
+            },
+          );
+        },
+      ).whenComplete(() {
+        _bleAlertDialogOpen = false;
+        _bleAlertDialogContext = null;
+        _stopBleAlertAlarm();
+        if (mounted) {
+          setState(() {});
+        }
+      }),
+    );
+  }
+
+  _BleDisconnectionAlertItem _bleAlertItemForSession(
+    _ConnectedDeviceSession session,
+  ) {
+    return _BleDisconnectionAlertItem(
+      id: session.deviceId,
+      deviceName: session.deviceName,
+      status: session.reconnectStatus,
+      failureMessage: session.reconnectFailureMessage,
+      onReconnect: () {
+        unawaited(widget.manager.reconnectDisconnectedSession(session));
+      },
+    );
+  }
+
+  void _closeBleAlertDialog({required bool dismissCurrentDevices}) {
+    if (dismissCurrentDevices) {
+      for (final session in widget.manager.disconnectedSessionsDuringAcquisition) {
+        _dismissedBleAlertKeys.add(_bleAlertKey(session));
+      }
+    }
+
+    _stopBleAlertAlarm();
+    final dialogContext = _bleAlertDialogContext;
+    _bleAlertDialogContext = null;
+    if (dialogContext != null) {
+      Navigator.of(dialogContext).pop();
+    }
+  }
+
+  void _startBleAlertAlarm() {
+    _stopBleAlertAlarm();
+    _playBleAlertCue();
+    _bleAlertBeepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _playBleAlertCue();
+    });
+  }
+
+  void _stopBleAlertAlarm() {
+    _bleAlertBeepTimer?.cancel();
+    _bleAlertBeepTimer = null;
+  }
+
+  void _playBleAlertCue() {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
+    unawaited(HapticFeedback.vibrate().catchError((_) {}));
+  }
+
+  String _bleAlertKey(_ConnectedDeviceSession session) {
+    return '${session.deviceId}:${session.disconnectionAlertVersion}';
   }
 
   Future<void> _stopAcquisition() async {
@@ -2249,7 +2828,8 @@ class _MultiDeviceAcquisitionPageState
         ),
         childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
         children: [
-          if (disconnected) _buildDisconnectedBanner(context),
+          if (session.disconnectedDuringAcquisition)
+            _buildDisconnectedBanner(context, session),
           switch (session.type) {
             KnownDeviceType.environmentalMonitor =>
               _buildEnvironmentalSection(context, session),
@@ -2262,7 +2842,10 @@ class _MultiDeviceAcquisitionPageState
     );
   }
 
-  Widget _buildDisconnectedBanner(BuildContext context) {
+  Widget _buildDisconnectedBanner(
+    BuildContext context,
+    _ConnectedDeviceSession session,
+  ) {
     final colorScheme = Theme.of(context).colorScheme;
 
     return Padding(
@@ -2278,9 +2861,11 @@ class _MultiDeviceAcquisitionPageState
             children: [
               Icon(Icons.warning_amber_rounded, color: colorScheme.onErrorContainer),
               const SizedBox(width: 8),
-              Text(
-                'Disconnected',
-                style: TextStyle(color: colorScheme.onErrorContainer),
+              Expanded(
+                child: Text(
+                  session.reconnectFailureMessage ?? session.reconnectStatus.label,
+                  style: TextStyle(color: colorScheme.onErrorContainer),
+                ),
               ),
             ],
           ),
@@ -2866,6 +3451,7 @@ class _WearableDeviceConfigurationPageState
           builder: (_) => WearableBleCommunicationLogPage(
             service: service,
             csvLogger: csvLogger,
+            deviceName: widget.deviceName,
             stopWearableCsvLogging: _stopWearableCsvLogging,
             onAcquisitionStopped: _handleWearableAcquisitionStopped,
             backgroundStatusMessage: _backgroundStatusMessage,
@@ -2874,6 +3460,7 @@ class _WearableDeviceConfigurationPageState
       );
     } catch (error) {
       await _stopWearableCsvLogging();
+      await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
       await AndroidAcquisitionForegroundService.stop();
       _configurationSequenceStarted = false;
       if (!mounted) {
@@ -3122,6 +3709,7 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
     super.key,
     required this.service,
     required this.csvLogger,
+    required this.deviceName,
     required this.stopWearableCsvLogging,
     required this.onAcquisitionStopped,
     this.backgroundStatusMessage,
@@ -3129,6 +3717,7 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
 
   final WearableConfigurationBleService service;
   final WearableAcquisitionCsvLogger csvLogger;
+  final String deviceName;
   final Future<void> Function() stopWearableCsvLogging;
   final VoidCallback onAcquisitionStopped;
   final String? backgroundStatusMessage;
@@ -3139,7 +3728,7 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
 }
 
 class _WearableBleCommunicationLogPageState
-    extends State<WearableBleCommunicationLogPage> {
+    extends State<WearableBleCommunicationLogPage> with WidgetsBindingObserver {
   static const Duration _visibleChartWindow = Duration(seconds: 2);
   static const Duration _uiRefreshInterval = Duration(milliseconds: 500);
 
@@ -3150,30 +3739,72 @@ class _WearableBleCommunicationLogPageState
 
   StreamSubscription<WearableAgmReceivedSample>? _agmSamplesSubscription;
   StreamSubscription<WearableSdsReceivedStatus>? _sdsStatusSubscription;
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+  final Set<String> _dismissedBleAlertKeys = {};
+  final ValueNotifier<int> _bleAlertRevision = ValueNotifier<int>(0);
   Timer? _uiRefreshTimer;
+  Timer? _bleAlertBeepTimer;
+  BuildContext? _bleAlertDialogContext;
   DateTime? _lastUiRefreshAt;
   DateTime? _latestSampleReceivedAt;
   int? _latestBatteryPercent;
   int? _latestFlushFailureRate;
+  bool _bleDisconnectedDuringAcquisition = false;
+  bool _bleAlertDialogOpen = false;
+  int _bleDisconnectionAlertVersion = 0;
+  _BleReconnectStatus _bleReconnectStatus = _BleReconnectStatus.disconnected;
+  String? _bleReconnectFailureMessage;
   bool _isStoppingAcquisition = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _agmSamplesSubscription = widget.service.agmSamplesStream.listen(
       _handleAgmSample,
     );
     _sdsStatusSubscription = widget.service.sdsStatusStream.listen(
       _handleSdsStatus,
     );
+    _attachWearableConnectionListener();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(_agmSamplesSubscription?.cancel());
     unawaited(_sdsStatusSubscription?.cancel());
+    unawaited(_connectionSubscription?.cancel());
     _uiRefreshTimer?.cancel();
+    _stopWearableBleAlertAlarm();
+    _bleAlertRevision.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _syncWearableBleDisconnectionAlertDialog();
+      });
+      return;
+    }
+
+    _stopWearableBleAlertAlarm();
+  }
+
+  void _attachWearableConnectionListener() {
+    unawaited(_connectionSubscription?.cancel());
+    _connectionSubscription = widget.service.connectionState.listen((state) {
+      if (_isStoppingAcquisition ||
+          widget.service.isStopping ||
+          widget.service.isStopped ||
+          state != BluetoothConnectionState.disconnected) {
+        return;
+      }
+
+      _markWearableBleDisconnected();
+    });
   }
 
   void _handleAgmSample(WearableAgmReceivedSample event) {
@@ -3201,6 +3832,208 @@ class _WearableBleCommunicationLogPageState
     _latestBatteryPercent = event.batteryPercent;
     _latestFlushFailureRate = event.flushFailureRate;
     _requestThrottledUiRefresh();
+  }
+
+  void _markWearableBleDisconnected() {
+    if (_bleDisconnectedDuringAcquisition &&
+        _bleReconnectStatus != _BleReconnectStatus.reconnected) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _bleDisconnectedDuringAcquisition = true;
+        _bleDisconnectionAlertVersion += 1;
+        _bleReconnectStatus = _BleReconnectStatus.disconnected;
+        _bleReconnectFailureMessage = null;
+      });
+    } else {
+      _bleDisconnectedDuringAcquisition = true;
+      _bleDisconnectionAlertVersion += 1;
+      _bleReconnectStatus = _BleReconnectStatus.disconnected;
+      _bleReconnectFailureMessage = null;
+    }
+    _notifyWearableBleAlertChanged();
+
+    if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
+      unawaited(
+        AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
+          widget.deviceName,
+        ),
+      );
+      return;
+    }
+
+    _syncWearableBleDisconnectionAlertDialog();
+  }
+
+  Future<void> _reconnectWearableAfterDisconnection() async {
+    if (_bleReconnectStatus == _BleReconnectStatus.reconnecting ||
+        _isStoppingAcquisition ||
+        widget.service.isStopping ||
+        widget.service.isStopped) {
+      return;
+    }
+
+    setState(() {
+      _bleReconnectStatus = _BleReconnectStatus.reconnecting;
+      _bleReconnectFailureMessage = null;
+    });
+    _notifyWearableBleAlertChanged();
+
+    try {
+      final currentDevice = widget.service.device;
+      final reconnectedDevice = await _BleReconnectHelper.reconnect(
+        currentDevice: currentDevice,
+        deviceId: currentDevice.remoteId.toString(),
+        deviceName: widget.deviceName,
+      );
+      await widget.service.resumeNotificationsAfterReconnect(
+        reconnectedDevice: reconnectedDevice,
+      );
+      _attachWearableConnectionListener();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _bleDisconnectedDuringAcquisition = false;
+        _bleReconnectStatus = _BleReconnectStatus.reconnected;
+        _bleReconnectFailureMessage = null;
+      });
+      _notifyWearableBleAlertChanged();
+      unawaited(AndroidAcquisitionForegroundService.clearBleDisconnectionAlert());
+      _closeWearableBleAlertDialog(dismissCurrentDevice: false);
+    } catch (_) {
+      try {
+        await widget.service.device.disconnect();
+      } catch (_) {}
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _bleDisconnectedDuringAcquisition = true;
+        _bleReconnectStatus = _BleReconnectStatus.failed;
+        _bleReconnectFailureMessage =
+            'Could not reconnect to ${widget.deviceName}. Move closer and try again.';
+      });
+      _notifyWearableBleAlertChanged();
+    }
+  }
+
+  void _syncWearableBleDisconnectionAlertDialog() {
+    if (!mounted || !Platform.isAndroid) {
+      return;
+    }
+
+    if (_bleAlertDialogOpen) {
+      if (!_bleDisconnectedDuringAcquisition) {
+        _closeWearableBleAlertDialog(dismissCurrentDevice: false);
+      }
+      return;
+    }
+
+    if (!_ActiveAcquisitionRuntime.isForegroundVisible ||
+        !_bleDisconnectedDuringAcquisition ||
+        _dismissedBleAlertKeys.contains(_wearableBleAlertKey)) {
+      return;
+    }
+
+    _showWearableBleAlertDialog();
+  }
+
+  void _showWearableBleAlertDialog() {
+    if (_bleAlertDialogOpen || !mounted) {
+      return;
+    }
+
+    _bleAlertDialogOpen = true;
+    _startWearableBleAlertAlarm();
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          _bleAlertDialogContext = dialogContext;
+          return ValueListenableBuilder<int>(
+            valueListenable: _bleAlertRevision,
+            builder: (_, _, _) {
+              return _BleDisconnectionAlertDialog(
+                items: [_wearableBleAlertItem],
+                onClose: () {
+                  _closeWearableBleAlertDialog(dismissCurrentDevice: true);
+                },
+              );
+            },
+          );
+        },
+      ).whenComplete(() {
+        _bleAlertDialogOpen = false;
+        _bleAlertDialogContext = null;
+        _stopWearableBleAlertAlarm();
+        if (mounted) {
+          setState(() {});
+        }
+      }),
+    );
+  }
+
+  _BleDisconnectionAlertItem get _wearableBleAlertItem {
+    return _BleDisconnectionAlertItem(
+      id: widget.service.device.remoteId.toString(),
+      deviceName: widget.deviceName,
+      status: _bleReconnectStatus,
+      failureMessage: _bleReconnectFailureMessage,
+      onReconnect: () {
+        unawaited(_reconnectWearableAfterDisconnection());
+      },
+    );
+  }
+
+  void _closeWearableBleAlertDialog({required bool dismissCurrentDevice}) {
+    if (dismissCurrentDevice && _bleDisconnectedDuringAcquisition) {
+      _dismissedBleAlertKeys.add(_wearableBleAlertKey);
+    }
+
+    _stopWearableBleAlertAlarm();
+    final dialogContext = _bleAlertDialogContext;
+    _bleAlertDialogContext = null;
+    if (dialogContext != null) {
+      Navigator.of(dialogContext).pop();
+    }
+  }
+
+  void _startWearableBleAlertAlarm() {
+    _stopWearableBleAlertAlarm();
+    _playWearableBleAlertCue();
+    _bleAlertBeepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _playWearableBleAlertCue();
+    });
+  }
+
+  void _stopWearableBleAlertAlarm() {
+    _bleAlertBeepTimer?.cancel();
+    _bleAlertBeepTimer = null;
+  }
+
+  void _playWearableBleAlertCue() {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
+    unawaited(HapticFeedback.vibrate().catchError((_) {}));
+  }
+
+  void _notifyWearableBleAlertChanged() {
+    _bleAlertRevision.value += 1;
+  }
+
+  String get _wearableBleAlertKey {
+    return '${widget.service.device.remoteId}:$_bleDisconnectionAlertVersion';
   }
 
   double _valueForMetric(
@@ -3267,6 +4100,7 @@ class _WearableBleCommunicationLogPageState
       var csvFinalizeFailed = false;
       try {
         await widget.stopWearableCsvLogging();
+        await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
         await AndroidAcquisitionForegroundService.stop();
         await AcquisitionRecoveryStore.clear();
         await _ActiveAcquisitionRuntime.markInactive();
@@ -3318,12 +4152,47 @@ class _WearableBleCommunicationLogPageState
         ),
         body: Column(
           children: [
+            if (_bleDisconnectedDuringAcquisition)
+              _buildWearableBleDisconnectedBanner(),
             Expanded(
               child: _buildWearableDashboard(),
             ),
             _buildBackgroundStatus(),
             _buildStopAcquisitionButton(),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWearableBleDisconnectedBanner() {
+    final colorScheme = Theme.of(context).colorScheme;
+    final message = _bleReconnectFailureMessage ?? _bleReconnectStatus.label;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colorScheme.errorContainer,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            children: [
+              Icon(
+                Icons.warning_amber_rounded,
+                color: colorScheme.onErrorContainer,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  message,
+                  style: TextStyle(color: colorScheme.onErrorContainer),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -4367,7 +5236,9 @@ class AcquisitionInitializationPage extends StatefulWidget {
 }
 
 class _AcquisitionInitializationPageState
-    extends State<AcquisitionInitializationPage> {
+    extends State<AcquisitionInitializationPage> with WidgetsBindingObserver {
+  late BluetoothDevice _activeDevice;
+  late final String _deviceDisplayName;
   late final BleConfigurationService _service;
   late final OpenRemoteMqttService _mqttService;
   late final AcquisitionCsvLogger _csvLogger;
@@ -4391,6 +5262,15 @@ class _AcquisitionInitializationPageState
   bool _canRetry = false;
   bool _requiresReconnect = false;
   bool _foregroundServiceStarted = false;
+  bool _bleDisconnectedDuringActiveAcquisition = false;
+  int _bleDisconnectionAlertVersion = 0;
+  _BleReconnectStatus _bleReconnectStatus = _BleReconnectStatus.disconnected;
+  String? _bleReconnectFailureMessage;
+  final Set<String> _dismissedBleAlertKeys = {};
+  final ValueNotifier<int> _bleAlertRevision = ValueNotifier<int>(0);
+  Timer? _bleAlertBeepTimer;
+  BuildContext? _bleAlertDialogContext;
+  bool _bleAlertDialogOpen = false;
   String? _backgroundStatusMessage;
   _LiveVisualizationMode _visualizationMode = _LiveVisualizationMode.cards;
   OpenRemoteMqttState _mqttState = const OpenRemoteMqttState(
@@ -4400,7 +5280,10 @@ class _AcquisitionInitializationPageState
   @override
   void initState() {
     super.initState();
-    _service = BleConfigurationService(widget.device);
+    WidgetsBinding.instance.addObserver(this);
+    _activeDevice = widget.device;
+    _deviceDisplayName = _deviceName(_activeDevice);
+    _service = BleConfigurationService(_activeDevice);
     _mqttService = OpenRemoteMqttService();
     _csvLogger = AcquisitionCsvLogger();
     _gpsLocationService = GpsLocationService();
@@ -4432,7 +5315,7 @@ class _AcquisitionInitializationPageState
         unawaited(
           _csvLogger.appendBleMessage(
             receivedAt: message.receivedAt,
-            deviceName: _deviceName(widget.device),
+            deviceName: _deviceDisplayName,
             gpsCoordinates: _gpsLocationService.currentCoordinates,
             value: message.value,
           ),
@@ -4440,21 +5323,7 @@ class _AcquisitionInitializationPageState
       }
       unawaited(_publishPm10IfConnected(message.value));
     });
-    _connectionSubscription = _service.connectionState.listen((state) {
-      if (!mounted ||
-          _acquisitionStopped ||
-          state != BluetoothConnectionState.disconnected) {
-        return;
-      }
-
-      setState(() {
-        _isInitializing = false;
-        _errorMessage = 'BLE device disconnected.';
-        _canRetry = true;
-        _requiresReconnect = true;
-      });
-      _initializationStarted = false;
-    });
+    _attachConnectionListener();
     _mqttStateSubscription = _mqttService.states.listen((state) {
       if (!mounted) {
         return;
@@ -4476,7 +5345,84 @@ class _AcquisitionInitializationPageState
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _syncSingleBleDisconnectionAlertDialog();
+      });
+      return;
+    }
+
+    _stopSingleBleAlertAlarm();
+  }
+
+  void _attachConnectionListener() {
+    unawaited(_connectionSubscription?.cancel());
+    _connectionSubscription = _service.connectionState.listen((state) {
+      if (_acquisitionStopped ||
+          state != BluetoothConnectionState.disconnected) {
+        return;
+      }
+
+      if (_acquisitionStarted) {
+        _markSingleBleDisconnectedDuringAcquisition();
+        return;
+      }
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isInitializing = false;
+        _errorMessage = 'BLE device disconnected.';
+        _canRetry = true;
+        _requiresReconnect = true;
+      });
+      _initializationStarted = false;
+    });
+  }
+
+  void _markSingleBleDisconnectedDuringAcquisition() {
+    if (_bleDisconnectedDuringActiveAcquisition &&
+        _bleReconnectStatus != _BleReconnectStatus.reconnected) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _isInitializing = false;
+        _bleDisconnectedDuringActiveAcquisition = true;
+        _bleDisconnectionAlertVersion += 1;
+        _bleReconnectStatus = _BleReconnectStatus.disconnected;
+        _bleReconnectFailureMessage = null;
+      });
+    } else {
+      _bleDisconnectedDuringActiveAcquisition = true;
+      _bleDisconnectionAlertVersion += 1;
+      _bleReconnectStatus = _BleReconnectStatus.disconnected;
+      _bleReconnectFailureMessage = null;
+    }
+    _notifySingleBleAlertChanged();
+    _initializationStarted = false;
+
+    if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
+      unawaited(
+        AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
+          _deviceDisplayName,
+        ),
+      );
+      return;
+    }
+
+    _syncSingleBleDisconnectionAlertDialog();
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _stopSingleBleAlertAlarm();
+    _bleAlertRevision.dispose();
     if (_acquisitionStarted && !_acquisitionStopped) {
       super.dispose();
       return;
@@ -4508,6 +5454,9 @@ class _AcquisitionInitializationPageState
         _errorMessage = null;
         _canRetry = false;
         _requiresReconnect = false;
+        _bleDisconnectedDuringActiveAcquisition = false;
+        _bleReconnectStatus = _BleReconnectStatus.disconnected;
+        _bleReconnectFailureMessage = null;
         if (!_acquisitionStarted) {
           _messages.clear();
           _liveMeasurementValues.clear();
@@ -4549,6 +5498,7 @@ class _AcquisitionInitializationPageState
         _canRetry = error is BleConfigurationException && error.canRetry;
         _requiresReconnect = false;
       });
+      await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
       await AndroidAcquisitionForegroundService.stop();
     }
   }
@@ -4579,7 +5529,7 @@ class _AcquisitionInitializationPageState
     await _ActiveAcquisitionRuntime.markActive();
     await AcquisitionRecoveryStore.saveActive(
       acquisitionType: 'environmentalMonitor',
-      deviceNames: [_deviceName(widget.device)],
+      deviceNames: [_deviceDisplayName],
       deviceTypes: [KnownDeviceType.environmentalMonitor.name],
       configurationSummaries: [
         _summarizeEnvironmentalConfiguration(widget.configuration),
@@ -4602,6 +5552,11 @@ class _AcquisitionInitializationPageState
   }
 
   Future<void> _reconnectAndRestartInitialization() async {
+    if (_acquisitionStarted && _bleDisconnectedDuringActiveAcquisition) {
+      await _reconnectSingleEnvironmentalAfterDisconnection();
+      return;
+    }
+
     if (_isInitializing) {
       return;
     }
@@ -4615,7 +5570,7 @@ class _AcquisitionInitializationPageState
     }
 
     try {
-      await widget.device.connect(
+      await _activeDevice.connect(
         license: License.nonprofit,
         timeout: const Duration(seconds: 12),
       );
@@ -4628,11 +5583,178 @@ class _AcquisitionInitializationPageState
 
       setState(() {
         _isInitializing = false;
-        _errorMessage = 'Could not reconnect to ${_deviceName(widget.device)}: $error';
+        _errorMessage = 'Could not reconnect to $_deviceDisplayName: $error';
         _canRetry = true;
         _requiresReconnect = true;
       });
     }
+  }
+
+  Future<void> _reconnectSingleEnvironmentalAfterDisconnection() async {
+    if (_bleReconnectStatus == _BleReconnectStatus.reconnecting ||
+        _acquisitionStopped) {
+      return;
+    }
+
+    setState(() {
+      _bleReconnectStatus = _BleReconnectStatus.reconnecting;
+      _bleReconnectFailureMessage = null;
+    });
+    _notifySingleBleAlertChanged();
+
+    try {
+      final reconnectedDevice = await _BleReconnectHelper.reconnect(
+        currentDevice: _activeDevice,
+        deviceId: _activeDevice.remoteId.toString(),
+        deviceName: _deviceDisplayName,
+      );
+      _activeDevice = reconnectedDevice;
+      await _service.resumeNotificationsAfterReconnect(
+        reconnectedDevice: reconnectedDevice,
+      );
+      _attachConnectionListener();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _bleDisconnectedDuringActiveAcquisition = false;
+        _bleReconnectStatus = _BleReconnectStatus.reconnected;
+        _bleReconnectFailureMessage = null;
+      });
+      _notifySingleBleAlertChanged();
+      unawaited(AndroidAcquisitionForegroundService.clearBleDisconnectionAlert());
+      _closeSingleBleAlertDialog(dismissCurrentDevice: false);
+    } catch (_) {
+      try {
+        await _activeDevice.disconnect();
+      } catch (_) {}
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _bleDisconnectedDuringActiveAcquisition = true;
+        _bleReconnectStatus = _BleReconnectStatus.failed;
+        _bleReconnectFailureMessage =
+            'Could not reconnect to $_deviceDisplayName. Move closer and try again.';
+      });
+      _notifySingleBleAlertChanged();
+    }
+  }
+
+  void _syncSingleBleDisconnectionAlertDialog() {
+    if (!mounted || !Platform.isAndroid) {
+      return;
+    }
+
+    if (_bleAlertDialogOpen) {
+      if (!_bleDisconnectedDuringActiveAcquisition) {
+        _closeSingleBleAlertDialog(dismissCurrentDevice: false);
+      }
+      return;
+    }
+
+    if (!_ActiveAcquisitionRuntime.isForegroundVisible ||
+        !_bleDisconnectedDuringActiveAcquisition ||
+        _dismissedBleAlertKeys.contains(_singleBleAlertKey)) {
+      return;
+    }
+
+    _showSingleBleAlertDialog();
+  }
+
+  void _showSingleBleAlertDialog() {
+    if (_bleAlertDialogOpen || !mounted) {
+      return;
+    }
+
+    _bleAlertDialogOpen = true;
+    _startSingleBleAlertAlarm();
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          _bleAlertDialogContext = dialogContext;
+          return ValueListenableBuilder<int>(
+            valueListenable: _bleAlertRevision,
+            builder: (_, _, _) {
+              return _BleDisconnectionAlertDialog(
+                items: [_singleBleAlertItem],
+                onClose: () {
+                  _closeSingleBleAlertDialog(dismissCurrentDevice: true);
+                },
+              );
+            },
+          );
+        },
+      ).whenComplete(() {
+        _bleAlertDialogOpen = false;
+        _bleAlertDialogContext = null;
+        _stopSingleBleAlertAlarm();
+        if (mounted) {
+          setState(() {});
+        }
+      }),
+    );
+  }
+
+  _BleDisconnectionAlertItem get _singleBleAlertItem {
+    return _BleDisconnectionAlertItem(
+      id: _activeDevice.remoteId.toString(),
+      deviceName: _deviceDisplayName,
+      status: _bleReconnectStatus,
+      failureMessage: _bleReconnectFailureMessage,
+      onReconnect: () {
+        unawaited(_reconnectSingleEnvironmentalAfterDisconnection());
+      },
+    );
+  }
+
+  void _closeSingleBleAlertDialog({required bool dismissCurrentDevice}) {
+    if (dismissCurrentDevice && _bleDisconnectedDuringActiveAcquisition) {
+      _dismissedBleAlertKeys.add(_singleBleAlertKey);
+    }
+
+    _stopSingleBleAlertAlarm();
+    final dialogContext = _bleAlertDialogContext;
+    _bleAlertDialogContext = null;
+    if (dialogContext != null) {
+      Navigator.of(dialogContext).pop();
+    }
+  }
+
+  void _startSingleBleAlertAlarm() {
+    _stopSingleBleAlertAlarm();
+    _playSingleBleAlertCue();
+    _bleAlertBeepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _playSingleBleAlertCue();
+    });
+  }
+
+  void _stopSingleBleAlertAlarm() {
+    _bleAlertBeepTimer?.cancel();
+    _bleAlertBeepTimer = null;
+  }
+
+  void _playSingleBleAlertCue() {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
+    unawaited(HapticFeedback.vibrate().catchError((_) {}));
+  }
+
+  void _notifySingleBleAlertChanged() {
+    _bleAlertRevision.value += 1;
+  }
+
+  String get _singleBleAlertKey {
+    return '${_activeDevice.remoteId}:$_bleDisconnectionAlertVersion';
   }
 
   Future<void> _connectOpenRemote() async {
@@ -4753,6 +5875,7 @@ class _AcquisitionInitializationPageState
       _messagesSubscription = null;
       await _csvLogger.stop();
       await _gpsLocationService.stop();
+      await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
       await AndroidAcquisitionForegroundService.stop();
       await AcquisitionRecoveryStore.clear();
       await _ActiveAcquisitionRuntime.markInactive();
@@ -4783,7 +5906,7 @@ class _AcquisitionInitializationPageState
 
   @override
   Widget build(BuildContext context) {
-    final title = _isInitializing || _errorMessage != null
+    final title = _isInitializing || (_errorMessage != null && !_acquisitionStarted)
         ? 'Acquisition Initialization'
         : 'Acquisition in progress...';
 
@@ -4812,7 +5935,7 @@ class _AcquisitionInitializationPageState
       );
     }
 
-    if (_errorMessage != null) {
+    if (_errorMessage != null && !_acquisitionStarted) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -4843,6 +5966,8 @@ class _AcquisitionInitializationPageState
     return Column(
       children: [
         _buildVisualizationModeSelector(),
+        if (_bleDisconnectedDuringActiveAcquisition)
+          _buildSingleBleDisconnectedBanner(),
         _buildBackgroundStatus(),
         Expanded(
           child: _buildLiveVisualization(),
@@ -4850,6 +5975,39 @@ class _AcquisitionInitializationPageState
         _buildStopAcquisitionButton(),
         _buildOpenRemoteBanner(context),
       ],
+    );
+  }
+
+  Widget _buildSingleBleDisconnectedBanner() {
+    final colorScheme = Theme.of(context).colorScheme;
+    final message = _bleReconnectFailureMessage ?? _bleReconnectStatus.label;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colorScheme.errorContainer,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          child: Row(
+            children: [
+              Icon(
+                Icons.warning_amber_rounded,
+                color: colorScheme.onErrorContainer,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  message,
+                  style: TextStyle(color: colorScheme.onErrorContainer),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
