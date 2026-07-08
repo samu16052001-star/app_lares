@@ -1160,7 +1160,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   Future<void> refreshAfterResume() async {
-    if (!_acquisitionStarted) {
+    if (!_acquisitionStarted || _isStopping) {
       return;
     }
 
@@ -1416,6 +1416,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
         session.isConnected = isConnected;
         if (!isConnected) {
+          if (_isStopping) {
+            notifyListeners();
+            return;
+          }
+
           if (_acquisitionStarted) {
             _markSessionDisconnectedDuringAcquisition(session);
           } else {
@@ -1433,6 +1438,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   void _markSessionDisconnectedDuringAcquisition(
     _ConnectedDeviceSession session,
   ) {
+    if (_isStopping) {
+      return;
+    }
+
     session
       ..disconnectedDuringAcquisition = true
       ..disconnectionAlertVersion += 1
@@ -3834,6 +3843,10 @@ class _WearableBleCommunicationLogPageState
   }
 
   void _markWearableBleDisconnected() {
+    if (_isStoppingAcquisition || widget.service.isStopping) {
+      return;
+    }
+
     if (_bleDisconnectedDuringAcquisition &&
         _bleReconnectStatus != _BleReconnectStatus.reconnected) {
       return;
@@ -5361,6 +5374,7 @@ class _AcquisitionInitializationPageState
     unawaited(_connectionSubscription?.cancel());
     _connectionSubscription = _service.connectionState.listen((state) {
       if (_acquisitionStopped ||
+          _isStoppingAcquisition ||
           state != BluetoothConnectionState.disconnected) {
         return;
       }
@@ -5385,6 +5399,10 @@ class _AcquisitionInitializationPageState
   }
 
   void _markSingleBleDisconnectedDuringAcquisition() {
+    if (_isStoppingAcquisition || _acquisitionStopped) {
+      return;
+    }
+
     if (_bleDisconnectedDuringActiveAcquisition &&
         _bleReconnectStatus != _BleReconnectStatus.reconnected) {
       return;
