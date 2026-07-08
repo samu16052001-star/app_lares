@@ -1439,13 +1439,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       ..reconnectStatus = _BleReconnectStatus.disconnected
       ..reconnectFailureMessage = null;
 
-    if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
-      unawaited(
-        AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
-          session.deviceName,
-        ),
-      );
-    }
+    unawaited(
+      AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
+        session.deviceName,
+      ),
+    );
   }
 
   Future<void> _initializeEnvironmental(_ConnectedDeviceSession session) async {
@@ -2665,6 +2663,7 @@ class _MultiDeviceAcquisitionPageState
       return;
     }
 
+    unawaited(AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue());
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
@@ -3855,12 +3854,13 @@ class _WearableBleCommunicationLogPageState
     }
     _notifyWearableBleAlertChanged();
 
+    unawaited(
+      AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
+        widget.deviceName,
+      ),
+    );
+
     if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
-      unawaited(
-        AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
-          widget.deviceName,
-        ),
-      );
       return;
     }
 
@@ -4024,6 +4024,7 @@ class _WearableBleCommunicationLogPageState
       return;
     }
 
+    unawaited(AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue());
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
@@ -5406,12 +5407,13 @@ class _AcquisitionInitializationPageState
     _notifySingleBleAlertChanged();
     _initializationStarted = false;
 
+    unawaited(
+      AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
+        _deviceDisplayName,
+      ),
+    );
+
     if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
-      unawaited(
-        AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
-          _deviceDisplayName,
-        ),
-      );
       return;
     }
 
@@ -5745,6 +5747,7 @@ class _AcquisitionInitializationPageState
       return;
     }
 
+    unawaited(AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue());
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }

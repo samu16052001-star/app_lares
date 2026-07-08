@@ -51,4 +51,16 @@ class AndroidAcquisitionForegroundService {
       // Best effort cleanup only.
     }
   }
+
+  static Future<void> playBleDisconnectionAlarmCue() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      await _channel.invokeMethod<void>('playBleDisconnectionAlarmCue');
+    } catch (_) {
+      // Audio/vibration failures must never interrupt acquisition.
+    }
+  }
 }

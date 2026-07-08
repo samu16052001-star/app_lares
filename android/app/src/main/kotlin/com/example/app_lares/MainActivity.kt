@@ -47,6 +47,10 @@ class MainActivity : FlutterActivity() {
                     LaresBleAlertNotifications.clear(this)
                     result.success(null)
                 }
+                "playBleDisconnectionAlarmCue" -> {
+                    LaresBleAlertNotifications.playAlarmCue(this)
+                    result.success(null)
+                }
                 else -> result.notImplemented()
             }
         }
