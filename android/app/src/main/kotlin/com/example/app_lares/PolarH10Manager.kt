@@ -7,12 +7,15 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
+import com.polar.androidcommunications.api.ble.model.DisInfo
+import com.polar.androidcommunications.api.ble.model.gatt.client.pmd.PmdMeasurementType
 import com.polar.sdk.api.PolarBleApi
 import com.polar.sdk.api.PolarBleApiCallback
 import com.polar.sdk.api.PolarBleApiDefaultImpl
 import com.polar.sdk.api.model.EcgSample
 import com.polar.sdk.api.model.FecgSample
 import com.polar.sdk.api.model.PolarDeviceInfo
+import com.polar.sdk.api.model.PolarHealthThermometerData
 import com.polar.sdk.api.model.PolarSensorSetting
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.EventChannel
@@ -156,6 +159,17 @@ class PolarH10Manager(
                     "level" to level
                 )
             )
+        }
+
+        override fun disInformationReceived(identifier: String, disInfo: DisInfo) {
+            // Device information is not displayed or logged for Polar H10 yet.
+        }
+
+        override fun htsNotificationReceived(
+            identifier: String,
+            data: PolarHealthThermometerData
+        ) {
+            // Health thermometer notifications are unrelated to H10 HR/ECG acquisition.
         }
     }
 
@@ -356,7 +370,7 @@ class PolarH10Manager(
             } catch (_: Exception) {
             }
             try {
-                api.stopStreaming(identifier, PolarBleApi.PolarDeviceDataType.ECG)
+                api.stopStreaming(identifier, PmdMeasurementType.ECG)
             } catch (_: Exception) {
             }
         }
@@ -503,7 +517,7 @@ class PolarH10Manager(
         }
     }
 
-    private fun ensureHrAvailable(identifier: String) {
+    private suspend fun ensureHrAvailable(identifier: String) {
         try {
             val dataTypes = api.getAvailableHRServiceDataTypes(identifier)
             if (!dataTypes.contains(PolarBleApi.PolarDeviceDataType.HR)) {
@@ -522,7 +536,7 @@ class PolarH10Manager(
         }
     }
 
-    private fun prepareEcgSettings(identifier: String): PolarSensorSetting {
+    private suspend fun prepareEcgSettings(identifier: String): PolarSensorSetting {
         try {
             val dataTypes = api.getAvailableOnlineStreamDataTypes(identifier)
             if (!dataTypes.contains(PolarBleApi.PolarDeviceDataType.ECG)) {
@@ -586,7 +600,7 @@ class PolarH10Manager(
         }
     }
 
-    private fun startEcgStream(identifier: String) {
+    private suspend fun startEcgStream(identifier: String) {
         val settings = cachedEcgSettings ?: prepareEcgSettings(identifier)
         ecgJob = scope.launch(Dispatchers.Default) {
             try {
