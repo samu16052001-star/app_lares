@@ -3,6 +3,11 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:app_lares/ble_configuration_service.dart';
+import 'package:app_lares/polar_h10/polar_h10_configuration.dart';
+import 'package:app_lares/polar_h10/polar_h10_configuration_page.dart';
+import 'package:app_lares/polar_h10/polar_h10_event.dart';
+import 'package:app_lares/polar_h10/polar_h10_models.dart';
+import 'package:app_lares/polar_h10/polar_h10_platform_service.dart';
 import 'package:app_lares/services/acquisition_recovery_store.dart';
 import 'package:app_lares/services/acquisition_csv_logger.dart';
 import 'package:app_lares/services/android_acquisition_foreground_service.dart';
@@ -13,6 +18,7 @@ import 'package:app_lares/services/unified_acquisition_csv_logger.dart';
 import 'package:app_lares/services/wearable_acquisition_csv_logger.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:app_lares/wearable_configuration_service.dart';
+import 'package:app_lares/widgets/polar_h10_live_section.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
@@ -467,6 +473,7 @@ class AutomaticConfigurationPage extends StatelessWidget {
 enum KnownDeviceType {
   environmentalMonitor,
   respiratoryMonitor,
+  polarH10,
   unsupported,
 }
 
@@ -475,6 +482,7 @@ extension KnownDeviceTypeLabel on KnownDeviceType {
     return switch (this) {
       KnownDeviceType.environmentalMonitor => 'Environmental Monitor',
       KnownDeviceType.respiratoryMonitor => 'Respiratory Monitor / IMU',
+      KnownDeviceType.polarH10 => 'Polar H10',
       KnownDeviceType.unsupported => 'Unsupported device',
     };
   }
@@ -499,21 +507,34 @@ class KnownDeviceClassifier {
       return KnownDeviceType.respiratoryMonitor;
     }
 
+    if (normalizedNames.any(_looksLikePolarH10Name)) {
+      return KnownDeviceType.polarH10;
+    }
+
     return KnownDeviceType.unsupported;
   }
 
-  static bool matchesLaresFilter(Iterable<String> names) {
+  static bool matchesSupportedFilter(Iterable<String> names) {
     return names.map(_normalizeDeviceName).any((name) {
       return name.contains('lares') ||
           name.contains('env') ||
           name.contains('respiratorymonitor') ||
           name.contains('resp') ||
-          name.contains('imu');
+          name.contains('imu') ||
+          _looksLikePolarH10Name(name);
     });
+  }
+
+  static bool matchesLaresFilter(Iterable<String> names) {
+    return matchesSupportedFilter(names);
   }
 
   static String _normalizeDeviceName(String value) {
     return value.trim().toLowerCase();
+  }
+
+  static bool _looksLikePolarH10Name(String name) {
+    return name.contains('polar') && name.contains('h10');
   }
 }
 
@@ -552,6 +573,16 @@ String _summarizeWearableConfiguration(
       'accG=${configuration.accG}; '
       'gyrDPS=${configuration.gyrDPS}; '
       'calibrationEnabled=${configuration.calibrationEnabled}';
+}
+
+String _summarizePolarH10Configuration(
+  PolarH10Configuration configuration,
+) {
+  final streams = [
+    if (configuration.hrEnabled) 'HR',
+    if (configuration.rawEcgEnabled) 'Raw ECG',
+  ].join(', ');
+  return 'streams=$streams';
 }
 
 String _mergeStatusMessage(String? current, String message) {
@@ -875,27 +906,36 @@ String _normalizeDeviceNameForReconnect(String value) {
 
 class _ConnectedDeviceSession {
   _ConnectedDeviceSession({
-    required this.device,
+    this.device,
     required this.deviceId,
     required this.deviceName,
     required this.type,
+    this.polarAddress,
+    this.polarRssi,
   });
 
   static const Duration wearableVisibleChartWindow = Duration(seconds: 2);
+  static const int polarVisibleEcgSampleCount = 650;
+  static const Duration polarUiRefreshInterval = Duration(milliseconds: 250);
 
-  BluetoothDevice device;
+  BluetoothDevice? device;
   final String deviceId;
   final String deviceName;
   final KnownDeviceType type;
+  String? polarDeviceId;
+  String? polarAddress;
+  int? polarRssi;
 
   BleConfiguration? environmentalConfiguration;
   WearableDeviceConfiguration? wearableConfiguration;
+  PolarH10Configuration? polarConfiguration;
   BleConfigurationService? environmentalService;
   WearableConfigurationBleService? wearableService;
   StreamSubscription<BluetoothConnectionState>? connectionSubscription;
   StreamSubscription<BleNotificationMessage>? environmentalMessagesSubscription;
   StreamSubscription<WearableAgmReceivedSample>? agmSamplesSubscription;
   StreamSubscription<WearableSdsReceivedStatus>? sdsStatusSubscription;
+  StreamSubscription<PolarH10Event>? polarEventsSubscription;
 
   bool isConnected = true;
   bool isInitializing = false;
@@ -918,11 +958,40 @@ class _ConnectedDeviceSession {
   DateTime? latestWearableSampleReceivedAt;
   int? latestBatteryPercent;
   int? latestFlushFailureRate;
+  PolarH10Status polarStatus = PolarH10Status.disconnected;
+  PolarH10HrSample? latestPolarHrSample;
+  int? latestPolarBatteryPercent;
+  final List<PolarH10EcgSample> polarEcgSamples = [];
+  Timer? polarUiRefreshTimer;
+  DateTime? lastPolarUiRefreshAt;
+  bool polarStreamsStarted = false;
+
+  bool get isPolarManaged => type == KnownDeviceType.polarH10;
+
+  BluetoothDevice get bleDevice {
+    final bleDevice = device;
+    if (bleDevice == null) {
+      throw StateError('$deviceName is managed by the Polar SDK.');
+    }
+
+    return bleDevice;
+  }
+
+  PolarH10DeviceIdentity get polarIdentity {
+    return PolarH10DeviceIdentity(
+      deviceId: deviceId,
+      displayName: deviceName,
+      polarDeviceId: polarDeviceId,
+      address: polarAddress ?? deviceId,
+      rssi: polarRssi,
+    );
+  }
 
   bool get isConfigured {
     return switch (type) {
       KnownDeviceType.environmentalMonitor => environmentalConfiguration != null,
       KnownDeviceType.respiratoryMonitor => wearableConfiguration != null,
+      KnownDeviceType.polarH10 => polarConfiguration?.isValid ?? false,
       KnownDeviceType.unsupported => false,
     };
   }
@@ -955,6 +1024,10 @@ class _ConnectedDeviceSession {
     agmSamplesSubscription = null;
     await sdsStatusSubscription?.cancel();
     sdsStatusSubscription = null;
+    await polarEventsSubscription?.cancel();
+    polarEventsSubscription = null;
+    polarUiRefreshTimer?.cancel();
+    polarUiRefreshTimer = null;
   }
 
   Future<void> cancelConnectionSubscription() async {
@@ -1032,6 +1105,12 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
                 : _summarizeWearableConfiguration(
                     session.wearableConfiguration!,
                   ),
+          KnownDeviceType.polarH10 =>
+            session.polarConfiguration == null
+                ? 'not configured'
+                : _summarizePolarH10Configuration(
+                    session.polarConfiguration!,
+                  ),
           KnownDeviceType.unsupported => 'unsupported',
         },
     ];
@@ -1043,7 +1122,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     _sessions.add(session);
-    _attachConnectionListener(session);
+    if (!session.isPolarManaged) {
+      _attachConnectionListener(session);
+    }
     notifyListeners();
   }
 
@@ -1056,9 +1137,15 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     try {
       await session.wearableService?.dispose();
     } catch (_) {}
-    try {
-      await session.device.disconnect();
-    } catch (_) {}
+    if (session.isPolarManaged) {
+      try {
+        await PolarH10PlatformService.instance.stop();
+      } catch (_) {}
+    } else {
+      try {
+        await session.bleDevice.disconnect();
+      } catch (_) {}
+    }
     _sessions.removeWhere((candidate) => candidate.deviceId == session.deviceId);
     notifyListeners();
   }
@@ -1076,6 +1163,14 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     WearableDeviceConfiguration configuration,
   ) {
     session.wearableConfiguration = configuration;
+    notifyListeners();
+  }
+
+  void configurePolarH10(
+    _ConnectedDeviceSession session,
+    PolarH10Configuration configuration,
+  ) {
+    session.polarConfiguration = configuration;
     notifyListeners();
   }
 
@@ -1128,6 +1223,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           case KnownDeviceType.respiratoryMonitor:
             await _initializeWearable(session);
             break;
+          case KnownDeviceType.polarH10:
+            await _initializePolarH10(session);
+            break;
           case KnownDeviceType.unsupported:
             throw StateError('${session.deviceName} is unsupported.');
         }
@@ -1164,9 +1262,18 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
-    for (final session in _sessions) {
+    if (_sessions.any((session) => session.isPolarManaged)) {
       try {
-        final state = await session.device.connectionState.first;
+        await PolarH10PlatformService.instance.foregroundEntered();
+      } catch (_) {}
+    }
+
+    for (final session in _sessions) {
+      if (session.isPolarManaged) {
+        continue;
+      }
+      try {
+        final state = await session.bleDevice.connectionState.first;
         final isConnected = state != BluetoothConnectionState.disconnected;
         if (isConnected && session.disconnectedDuringAcquisition) {
           continue;
@@ -1197,9 +1304,33 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       ..reconnectFailureMessage = null;
     notifyListeners();
 
+    if (session.isPolarManaged) {
+      try {
+        await _reconnectPolarH10(session);
+        session
+          ..isConnected = true
+          ..disconnectedDuringAcquisition = false
+          ..reconnectStatus = _BleReconnectStatus.reconnected
+          ..reconnectFailureMessage = null;
+        if (disconnectedSessionsDuringAcquisition.isEmpty) {
+          unawaited(AndroidAcquisitionForegroundService.clearBleDisconnectionAlert());
+        }
+        notifyListeners();
+      } catch (_) {
+        session
+          ..isConnected = false
+          ..disconnectedDuringAcquisition = true
+          ..reconnectStatus = _BleReconnectStatus.failed
+          ..reconnectFailureMessage =
+              'Could not reconnect to ${session.deviceName}. Make sure the strap is worn and another app is not connected.';
+        notifyListeners();
+      }
+      return;
+    }
+
     try {
       final reconnectedDevice = await _BleReconnectHelper.reconnect(
-        currentDevice: session.device,
+        currentDevice: session.bleDevice,
         deviceId: session.deviceId,
         deviceName: session.deviceName,
       );
@@ -1232,6 +1363,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
             reconnectedDevice: reconnectedDevice,
           );
           break;
+        case KnownDeviceType.polarH10:
+          throw StateError('${session.deviceName} is managed by the Polar SDK.');
         case KnownDeviceType.unsupported:
           throw StateError('${session.deviceName} is unsupported.');
       }
@@ -1247,7 +1380,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       notifyListeners();
     } catch (_) {
       try {
-        await session.device.disconnect();
+        await session.bleDevice.disconnect();
       } catch (_) {}
       session
         ..isConnected = false
@@ -1283,7 +1416,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
             await session.environmentalService?.dispose();
           } catch (_) {}
           try {
-            await session.device.disconnect();
+            await session.bleDevice.disconnect();
           } catch (_) {}
           break;
         case KnownDeviceType.respiratoryMonitor:
@@ -1298,9 +1431,14 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
             }
           }
           break;
+        case KnownDeviceType.polarH10:
+          try {
+            await PolarH10PlatformService.instance.stop();
+          } catch (_) {}
+          break;
         case KnownDeviceType.unsupported:
           try {
-            await session.device.disconnect();
+            await session.bleDevice.disconnect();
           } catch (_) {}
           break;
       }
@@ -1343,9 +1481,15 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       try {
         await session.wearableService?.dispose();
       } catch (_) {}
-      try {
-        await session.device.disconnect();
-      } catch (_) {}
+      if (session.isPolarManaged) {
+        try {
+          await PolarH10PlatformService.instance.stop();
+        } catch (_) {}
+      } else {
+        try {
+          await session.bleDevice.disconnect();
+        } catch (_) {}
+      }
     }
     await _mqttStateSubscription?.cancel();
     try {
@@ -1402,7 +1546,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   void _attachConnectionListener(_ConnectedDeviceSession session) {
-    session.connectionSubscription = session.device.connectionState.listen(
+    if (session.isPolarManaged) {
+      return;
+    }
+
+    session.connectionSubscription = session.bleDevice.connectionState.listen(
       (state) {
         final isConnected = state != BluetoothConnectionState.disconnected;
         if (isConnected &&
@@ -1457,7 +1605,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
   Future<void> _initializeEnvironmental(_ConnectedDeviceSession session) async {
     final configuration = session.environmentalConfiguration!;
-    final service = BleConfigurationService(session.device);
+    final service = BleConfigurationService(session.bleDevice);
     session.environmentalService = service;
     session.environmentalMessagesSubscription = service.messages.listen(
       (message) {
@@ -1471,7 +1619,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   Future<void> _initializeWearable(_ConnectedDeviceSession session) async {
     final configuration = session.wearableConfiguration!;
     final service = WearableConfigurationBleService(
-      session.device,
+      session.bleDevice,
       onStateChanged: notifyListeners,
     );
     session.wearableService = service;
@@ -1512,6 +1660,249 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (state != WearableBleSequenceState.streaming) {
       throw StateError('${session.deviceName} did not enter streaming mode.');
     }
+  }
+
+  Future<void> _initializePolarH10(_ConnectedDeviceSession session) async {
+    final configuration = session.polarConfiguration;
+    if (configuration == null || !configuration.isValid) {
+      throw StateError('${session.deviceName} Polar H10 configuration is invalid.');
+    }
+
+    session
+      ..polarStatus = PolarH10Status.preparing
+      ..polarStreamsStarted = false;
+    await session.polarEventsSubscription?.cancel();
+    session.polarEventsSubscription =
+        PolarH10PlatformService.instance.events.listen(
+      (event) {
+        _handlePolarH10Event(session, event);
+      },
+    );
+
+    await PolarH10PlatformService.instance.prepare(
+      identity: session.polarIdentity,
+      configuration: configuration,
+    );
+  }
+
+  Future<void> startPolarStreamsForAcquisition() async {
+    if (!_acquisitionStarted || _isStopping) {
+      return;
+    }
+
+    for (final session in _sessions.where((session) => session.isPolarManaged)) {
+      if (session.polarStreamsStarted || !session.isInitialized) {
+        continue;
+      }
+
+      final configuration = session.polarConfiguration;
+      if (configuration == null || !configuration.isValid) {
+        session.errorMessage = '${session.deviceName} Polar H10 configuration is invalid.';
+        continue;
+      }
+
+      try {
+        await PolarH10PlatformService.instance.startStreams(
+          identity: session.polarIdentity,
+          configuration: configuration,
+        );
+        session
+          ..polarStreamsStarted = true
+          ..polarStatus = _polarStreamingStatus(configuration)
+          ..isConnected = true;
+      } catch (error) {
+        session
+          ..polarStatus = PolarH10Status.error
+          ..errorMessage = error.toString()
+          ..isConnected = false
+          ..polarStreamsStarted = false;
+        _markSessionDisconnectedDuringAcquisition(session);
+        session.reconnectFailureMessage = error.toString();
+      }
+      notifyListeners();
+    }
+  }
+
+  Future<void> _reconnectPolarH10(_ConnectedDeviceSession session) async {
+    final configuration = session.polarConfiguration;
+    if (configuration == null || !configuration.isValid) {
+      throw StateError('${session.deviceName} Polar H10 configuration is invalid.');
+    }
+
+    await session.polarEventsSubscription?.cancel();
+    session.polarEventsSubscription =
+        PolarH10PlatformService.instance.events.listen(
+      (event) {
+        _handlePolarH10Event(session, event);
+      },
+    );
+    await PolarH10PlatformService.instance.reconnectAndStart(
+      identity: session.polarIdentity,
+      configuration: configuration,
+    );
+    session
+      ..polarStreamsStarted = true
+      ..polarStatus = _polarStreamingStatus(configuration);
+  }
+
+  PolarH10Status _polarStreamingStatus(PolarH10Configuration configuration) {
+    if (configuration.hrEnabled && configuration.rawEcgEnabled) {
+      return PolarH10Status.streaming;
+    }
+    if (configuration.hrEnabled) {
+      return PolarH10Status.streamingHr;
+    }
+    return PolarH10Status.streamingEcg;
+  }
+
+  void _handlePolarH10Event(
+    _ConnectedDeviceSession session,
+    PolarH10Event event,
+  ) {
+    switch (event) {
+      case final PolarH10ConnectionStateEvent connectionEvent:
+        _handlePolarH10ConnectionState(session, connectionEvent);
+        break;
+      case final PolarH10HrSampleEvent hrEvent:
+        _handlePolarH10HrSample(session, hrEvent.sample);
+        break;
+      case final PolarH10EcgSamplesEvent ecgEvent:
+        _handlePolarH10EcgSamples(session, ecgEvent.samples);
+        break;
+      case final PolarH10BatteryLevelEvent batteryEvent:
+        session.latestPolarBatteryPercent = batteryEvent.level;
+        notifyListeners();
+        break;
+      case final PolarH10ErrorEvent errorEvent:
+        _handlePolarH10Error(session, errorEvent);
+        break;
+    }
+  }
+
+  void _handlePolarH10ConnectionState(
+    _ConnectedDeviceSession session,
+    PolarH10ConnectionStateEvent event,
+  ) {
+    session.polarStatus = event.status;
+    if (event.deviceId != null && event.deviceId!.isNotEmpty) {
+      session.polarDeviceId = event.deviceId;
+    }
+    if (event.address != null && event.address!.isNotEmpty) {
+      session.polarAddress = event.address;
+    }
+
+    switch (event.status) {
+      case PolarH10Status.connected:
+      case PolarH10Status.preparing:
+      case PolarH10Status.streamingHr:
+      case PolarH10Status.streamingEcg:
+      case PolarH10Status.streaming:
+      case PolarH10Status.reconnecting:
+        session.isConnected = true;
+        break;
+      case PolarH10Status.disconnected:
+        final wasConnected = session.isConnected;
+        session
+          ..isConnected = false
+          ..polarStreamsStarted = false;
+        if (_acquisitionStarted && wasConnected && !_isStopping) {
+          _markSessionDisconnectedDuringAcquisition(session);
+        }
+        break;
+      case PolarH10Status.error:
+        session.errorMessage = event.message;
+        break;
+    }
+
+    notifyListeners();
+  }
+
+  void _handlePolarH10HrSample(
+    _ConnectedDeviceSession session,
+    PolarH10HrSample sample,
+  ) {
+    session
+      ..latestPolarHrSample = sample
+      ..isConnected = true;
+    unawaited(
+      csvLogger.appendPolarHrSample(
+        receivedAt: sample.receivedAt,
+        deviceName: session.deviceName,
+        gpsCoordinates: gpsLocationService.currentCoordinates,
+        hrBpm: sample.hrBpm,
+      ),
+    );
+    notifyListeners();
+  }
+
+  void _handlePolarH10EcgSamples(
+    _ConnectedDeviceSession session,
+    List<PolarH10EcgSample> samples,
+  ) {
+    if (samples.isEmpty) {
+      return;
+    }
+
+    session
+      ..isConnected = true
+      ..polarEcgSamples.addAll(samples);
+    if (session.polarEcgSamples.length >
+        _ConnectedDeviceSession.polarVisibleEcgSampleCount) {
+      session.polarEcgSamples.removeRange(
+        0,
+        session.polarEcgSamples.length -
+            _ConnectedDeviceSession.polarVisibleEcgSampleCount,
+      );
+    }
+
+    unawaited(
+      csvLogger.appendPolarEcgSamples(
+        deviceName: session.deviceName,
+        gpsCoordinatesBySample: [
+          for (var index = 0; index < samples.length; index += 1)
+            gpsLocationService.currentCoordinates,
+        ],
+        samples: samples,
+      ),
+    );
+    _schedulePolarUiRefresh(session);
+  }
+
+  void _handlePolarH10Error(
+    _ConnectedDeviceSession session,
+    PolarH10ErrorEvent event,
+  ) {
+    session
+      ..polarStatus = PolarH10Status.error
+      ..errorMessage = event.message
+      ..polarStreamsStarted = false
+      ..isConnected = false;
+    if (_acquisitionStarted && !_isStopping && !session.disconnectedDuringAcquisition) {
+      _markSessionDisconnectedDuringAcquisition(session);
+      session.reconnectFailureMessage = event.message;
+    }
+    notifyListeners();
+  }
+
+  void _schedulePolarUiRefresh(_ConnectedDeviceSession session) {
+    final now = DateTime.now();
+    final lastRefreshAt = session.lastPolarUiRefreshAt;
+    if (lastRefreshAt == null ||
+        now.difference(lastRefreshAt) >=
+            _ConnectedDeviceSession.polarUiRefreshInterval) {
+      session.lastPolarUiRefreshAt = now;
+      notifyListeners();
+      return;
+    }
+
+    session.polarUiRefreshTimer ??= Timer(
+      _ConnectedDeviceSession.polarUiRefreshInterval - now.difference(lastRefreshAt),
+      () {
+        session.polarUiRefreshTimer = null;
+        session.lastPolarUiRefreshAt = DateTime.now();
+        notifyListeners();
+      },
+    );
   }
 
   void _handleEnvironmentalMessage(
@@ -1687,7 +2078,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
   int _nextDiscoveryIndex = 0;
   bool _isScanning = false;
-  bool _showOnlyLaresDevices = false;
+  bool _showOnlySupportedDevices = false;
   bool _sortBySignalStrength = false;
   String? _statusMessage;
 
@@ -1860,6 +2251,37 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     });
 
     try {
+      if (deviceType == KnownDeviceType.polarH10) {
+        if (_sessionManager.sessions.any(
+          (session) => session.type == KnownDeviceType.polarH10,
+        )) {
+          setState(() {
+            _statusMessage = 'Only one Polar H10 can be selected at a time.';
+          });
+          return;
+        }
+        if (!mounted) {
+          return;
+        }
+
+        _sessionManager.addConnectedSession(
+          _ConnectedDeviceSession(
+            deviceId: id,
+            deviceName: displayName,
+            type: deviceType,
+            polarAddress: id,
+            polarRssi: result.rssi,
+          )..isConnected = true,
+        );
+        setState(() {
+          _statusMessage = 'Connected to $displayName.';
+        });
+        if (!_isScanning) {
+          unawaited(_startScan(clearResults: false));
+        }
+        return;
+      }
+
       await device.connect(
         license: License.nonprofit,
         timeout: const Duration(seconds: 12),
@@ -1900,8 +2322,10 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     }
   }
 
-  bool _isLaresFilterDevice(ScanResult result) {
-    return KnownDeviceClassifier.matchesLaresFilter(_deviceNameCandidates(result));
+  bool _isSupportedFilterDevice(ScanResult result) {
+    return KnownDeviceClassifier.matchesSupportedFilter(
+      _deviceNameCandidates(result),
+    );
   }
 
   List<String> _deviceNameCandidates(ScanResult result) {
@@ -2003,8 +2427,8 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   List<ScanResult> _displayDevices() {
     var devices = _scanResults.values.toList();
 
-    if (_showOnlyLaresDevices) {
-      devices = devices.where(_isLaresFilterDevice).toList();
+    if (_showOnlySupportedDevices) {
+      devices = devices.where(_isSupportedFilterDevice).toList();
     }
 
     if (_sortBySignalStrength) {
@@ -2027,9 +2451,9 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     return devices;
   }
 
-  void _toggleLaresFilter() {
+  void _toggleSupportedFilter() {
     setState(() {
-      _showOnlyLaresDevices = !_showOnlyLaresDevices;
+      _showOnlySupportedDevices = !_showOnlySupportedDevices;
     });
   }
 
@@ -2056,9 +2480,9 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       children: [
         _buildScanOptionButton(
           context,
-          label: 'LARES Devices',
-          selected: _showOnlyLaresDevices,
-          onPressed: _toggleLaresFilter,
+          label: 'Supported Devices',
+          selected: _showOnlySupportedDevices,
+          onPressed: _toggleSupportedFilter,
         ),
         _buildScanOptionButton(
           context,
@@ -2305,7 +2729,7 @@ class _MultiDeviceConfigurationPageState
         await Navigator.of(context).push(
           MaterialPageRoute<void>(
             builder: (_) => DeviceConfigurationPage(
-              device: session.device,
+              device: session.bleDevice,
               initialConfiguration: session.environmentalConfiguration,
               onConfigurationConfirmed: (configuration) {
                 widget.manager.configureEnvironmental(session, configuration);
@@ -2318,11 +2742,24 @@ class _MultiDeviceConfigurationPageState
         await Navigator.of(context).push(
           MaterialPageRoute<void>(
             builder: (_) => WearableDeviceConfigurationPage(
-              device: session.device,
+              device: session.bleDevice,
               deviceName: session.deviceName,
               initialConfiguration: session.wearableConfiguration,
               onConfigurationConfirmed: (configuration) {
                 widget.manager.configureWearable(session, configuration);
+              },
+            ),
+          ),
+        );
+        return;
+      case KnownDeviceType.polarH10:
+        await Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => PolarH10ConfigurationPage(
+              deviceName: session.deviceName,
+              initialConfiguration: session.polarConfiguration,
+              onConfigurationConfirmed: (configuration) {
+                widget.manager.configurePolarH10(session, configuration);
               },
             ),
           ),
@@ -2526,6 +2963,7 @@ class _MultiDeviceAcquisitionPageState
     widget.manager.addListener(_handleManagerChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _syncBleDisconnectionAlertDialog();
+      unawaited(widget.manager.startPolarStreamsForAcquisition());
     });
   }
 
@@ -2843,6 +3281,8 @@ class _MultiDeviceAcquisitionPageState
               _buildEnvironmentalSection(context, session),
             KnownDeviceType.respiratoryMonitor =>
               _buildWearableSection(context, session),
+            KnownDeviceType.polarH10 =>
+              _buildPolarH10Section(context, session),
             KnownDeviceType.unsupported => const SizedBox.shrink(),
           },
         ],
@@ -3014,6 +3454,30 @@ class _MultiDeviceAcquisitionPageState
           const SizedBox(height: 12),
         ],
       ],
+    );
+  }
+
+  Widget _buildPolarH10Section(
+    BuildContext context,
+    _ConnectedDeviceSession session,
+  ) {
+    final configuration = session.polarConfiguration;
+    if (configuration == null) {
+      return const Padding(
+        padding: EdgeInsets.all(24),
+        child: Text(
+          'Polar H10 is not configured.',
+          textAlign: TextAlign.center,
+        ),
+      );
+    }
+
+    return PolarH10LiveSection(
+      configuration: configuration,
+      status: session.polarStatus,
+      latestHrSample: session.latestPolarHrSample,
+      ecgSamples: session.polarEcgSamples,
+      batteryPercent: session.latestPolarBatteryPercent,
     );
   }
 

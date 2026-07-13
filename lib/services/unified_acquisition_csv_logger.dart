@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:app_lares/polar_h10/polar_h10_models.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:share_plus/share_plus.dart';
 
@@ -121,6 +122,59 @@ class UnifiedAcquisitionCsvLogger {
           _escapeCsvField(gpsCoordinates),
         ].join(';'),
       );
+      await sink.flush();
+    });
+  }
+
+  Future<void> appendPolarHrSample({
+    required DateTime receivedAt,
+    required String deviceName,
+    required String gpsCoordinates,
+    required int hrBpm,
+  }) {
+    return _enqueue(() async {
+      final sink = _sink;
+      if (!_isStarted || _isStopped || sink == null) {
+        return;
+      }
+
+      sink.writeln(
+        [
+          _escapeCsvField(_formatWearableTimestamp(receivedAt)),
+          _escapeCsvField(_polarDeviceName(deviceName)),
+          _escapeCsvField('HR=$hrBpm'),
+          _escapeCsvField(gpsCoordinates),
+        ].join(';'),
+      );
+      await sink.flush();
+    });
+  }
+
+  Future<void> appendPolarEcgSamples({
+    required String deviceName,
+    required List<String> gpsCoordinatesBySample,
+    required List<PolarH10EcgSample> samples,
+  }) {
+    return _enqueue(() async {
+      final sink = _sink;
+      if (!_isStarted || _isStopped || sink == null || samples.isEmpty) {
+        return;
+      }
+
+      for (var index = 0; index < samples.length; index += 1) {
+        final sample = samples[index];
+        final gpsCoordinates = index < gpsCoordinatesBySample.length
+            ? gpsCoordinatesBySample[index]
+            : 'NA';
+        sink.writeln(
+          [
+            _escapeCsvField(_formatWearableTimestamp(sample.receivedAt)),
+            _escapeCsvField(_polarDeviceName(deviceName)),
+            _escapeCsvField('ECG_raw=${sample.ecgMicrovolts}'),
+            _escapeCsvField(gpsCoordinates),
+          ].join(';'),
+        );
+      }
       await sink.flush();
     });
   }
@@ -276,6 +330,11 @@ class UnifiedAcquisitionCsvLogger {
         'gyr=(${sample.gyrX.toStringAsFixed(3)}, '
         '${sample.gyrY.toStringAsFixed(3)}, '
         '${sample.gyrZ.toStringAsFixed(3)}) dps';
+  }
+
+  String _polarDeviceName(String deviceName) {
+    final trimmedName = deviceName.trim();
+    return trimmedName.isEmpty ? 'POLAR_H10' : trimmedName;
   }
 
   String _escapeCsvField(String value) {
