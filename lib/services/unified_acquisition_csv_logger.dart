@@ -168,7 +168,7 @@ class UnifiedAcquisitionCsvLogger {
             : 'NA';
         sink.writeln(
           [
-            _escapeCsvField(_formatWearableTimestamp(sample.receivedAt)),
+            _escapeCsvField(_formatWearableTimestamp(sample.sampleTimestamp)),
             _escapeCsvField(_polarDeviceName(deviceName)),
             _escapeCsvField('ECG_raw=${sample.ecgMicrovolts}'),
             _escapeCsvField(gpsCoordinates),

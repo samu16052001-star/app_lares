@@ -22,12 +22,11 @@ class PolarH10LiveSection extends StatelessWidget {
   final int? batteryPercent;
 
   static const int maxVisibleEcgSamples = 650;
+  static const Duration visibleEcgWindow = Duration(seconds: 5);
 
   @override
   Widget build(BuildContext context) {
-    final visibleEcgSamples = ecgSamples.length <= maxVisibleEcgSamples
-        ? ecgSamples
-        : ecgSamples.sublist(ecgSamples.length - maxVisibleEcgSamples);
+    final visibleEcgSamples = _visibleEcgSamples;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -46,6 +45,51 @@ class PolarH10LiveSection extends StatelessWidget {
         ],
       ],
     );
+  }
+
+  List<PolarH10EcgSample> get _visibleEcgSamples {
+    if (ecgSamples.isEmpty) {
+      return const [];
+    }
+
+    final indexedSamples = [
+      for (var index = 0; index < ecgSamples.length; index += 1)
+        MapEntry(index, ecgSamples[index]),
+    ]..sort((a, b) {
+        final timestampComparison =
+            a.value.sampleTimestamp.compareTo(b.value.sampleTimestamp);
+        if (timestampComparison != 0) {
+          return timestampComparison;
+        }
+
+        return a.key.compareTo(b.key);
+      });
+    final orderedSamples = [
+      for (final entry in indexedSamples) entry.value,
+    ];
+    final hasSdkTimestamps =
+        orderedSamples.any((sample) => !sample.timestampFallbackUsed);
+
+    if (hasSdkTimestamps) {
+      final windowEnd = orderedSamples.last.sampleTimestamp;
+      final cutoff = windowEnd.subtract(visibleEcgWindow);
+      final windowSamples = orderedSamples
+          .where((sample) => !sample.sampleTimestamp.isBefore(cutoff))
+          .toList(growable: false);
+      return _limitVisibleSamples(windowSamples);
+    }
+
+    return _limitVisibleSamples(orderedSamples);
+  }
+
+  List<PolarH10EcgSample> _limitVisibleSamples(
+    List<PolarH10EcgSample> samples,
+  ) {
+    if (samples.length <= maxVisibleEcgSamples) {
+      return samples;
+    }
+
+    return samples.sublist(samples.length - maxVisibleEcgSamples);
   }
 }
 
@@ -294,15 +338,15 @@ class _PolarEcgChartCard extends StatelessWidget {
   Widget _buildChart(BuildContext context) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
-    final firstSampleTime = samples.first.receivedAt;
-    final lastSampleTime = samples.last.receivedAt;
+    final firstSampleTime = samples.first.sampleTimestamp;
+    final lastSampleTime = samples.last.sampleTimestamp;
     final maxX = math.max(
       1.0,
       lastSampleTime.difference(firstSampleTime).inMilliseconds / 1000,
     );
     final spots = samples.map((sample) {
       final seconds =
-          sample.receivedAt.difference(firstSampleTime).inMicroseconds /
+          sample.sampleTimestamp.difference(firstSampleTime).inMicroseconds /
               Duration.microsecondsPerSecond;
       return FlSpot(seconds.clamp(0, maxX).toDouble(), sample.ecgMicrovolts.toDouble());
     }).toList(growable: false);

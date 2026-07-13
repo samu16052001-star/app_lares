@@ -915,6 +915,7 @@ class _ConnectedDeviceSession {
   });
 
   static const Duration wearableVisibleChartWindow = Duration(seconds: 2);
+  static const Duration polarVisibleEcgWindow = Duration(seconds: 5);
   static const int polarVisibleEcgSampleCount = 650;
   static const Duration polarUiRefreshInterval = Duration(milliseconds: 250);
 
@@ -1846,14 +1847,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     session
       ..isConnected = true
       ..polarEcgSamples.addAll(samples);
-    if (session.polarEcgSamples.length >
-        _ConnectedDeviceSession.polarVisibleEcgSampleCount) {
-      session.polarEcgSamples.removeRange(
-        0,
-        session.polarEcgSamples.length -
-            _ConnectedDeviceSession.polarVisibleEcgSampleCount,
-      );
-    }
+    _prunePolarEcgSamples(session);
 
     unawaited(
       csvLogger.appendPolarEcgSamples(
@@ -1866,6 +1860,32 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       ),
     );
     _schedulePolarUiRefresh(session);
+  }
+
+  void _prunePolarEcgSamples(_ConnectedDeviceSession session) {
+    final samples = session.polarEcgSamples;
+    if (samples.isEmpty) {
+      return;
+    }
+
+    final hasSdkTimestamps =
+        samples.any((sample) => !sample.timestampFallbackUsed);
+    if (hasSdkTimestamps) {
+      final latestSampleTimestamp = samples
+          .map((sample) => sample.sampleTimestamp)
+          .reduce((a, b) => a.isAfter(b) ? a : b);
+      final cutoff = latestSampleTimestamp.subtract(
+        _ConnectedDeviceSession.polarVisibleEcgWindow,
+      );
+      samples.removeWhere((sample) => sample.sampleTimestamp.isBefore(cutoff));
+    }
+
+    if (samples.length > _ConnectedDeviceSession.polarVisibleEcgSampleCount) {
+      samples.removeRange(
+        0,
+        samples.length - _ConnectedDeviceSession.polarVisibleEcgSampleCount,
+      );
+    }
   }
 
   void _handlePolarH10Error(

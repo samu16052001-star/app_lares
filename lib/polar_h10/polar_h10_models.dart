@@ -64,12 +64,16 @@ class PolarH10HrSample {
 
 class PolarH10EcgSample {
   const PolarH10EcgSample({
+    required this.sampleTimestamp,
     required this.receivedAt,
     required this.ecgMicrovolts,
     this.sdkTimestamp,
+    this.timestampFallbackUsed = false,
   });
 
+  final DateTime sampleTimestamp;
   final DateTime receivedAt;
   final int ecgMicrovolts;
   final int? sdkTimestamp;
+  final bool timestampFallbackUsed;
 }

@@ -11,6 +11,10 @@ class PolarH10PlatformService {
   PolarH10PlatformService._();
 
   static final PolarH10PlatformService instance = PolarH10PlatformService._();
+  static final DateTime _polarTimestampEpochUtc = DateTime.utc(2000);
+  static final DateTime _minimumReasonablePolarTimestampUtc =
+      DateTime.utc(2020);
+  static const Duration _maximumEcgTimestampReceptionSkew = Duration(hours: 12);
 
   static const MethodChannel _controlChannel =
       MethodChannel('app_lares/polar_h10_control');
@@ -141,22 +145,65 @@ class PolarH10PlatformService {
     }
 
     final receivedAt = _dateTimeFromMillis(raw['receivedAtMillis']);
-    final samplingRateHz =
-        (_asNum(raw['samplingRateHz']) ?? 130).clamp(1, 1000).toDouble();
-    final intervalUs = (Duration.microsecondsPerSecond / samplingRateHz).round();
-    final firstSampleUs =
-        receivedAt.microsecondsSinceEpoch - intervalUs * (rawSamples.length - 1);
 
-    return List<PolarH10EcgSample>.generate(rawSamples.length, (index) {
-      final sample = Map<Object?, Object?>.from(rawSamples[index] as Map);
-      return PolarH10EcgSample(
-        receivedAt: DateTime.fromMicrosecondsSinceEpoch(
-          firstSampleUs + intervalUs * index,
-        ),
-        ecgMicrovolts: _asInt(sample['value']) ?? 0,
-        sdkTimestamp: _asInt(sample['sdkTimestamp']),
-      );
-    }, growable: false);
+    return [
+      for (final rawSample in rawSamples)
+        _parseSingleEcgSample(rawSample, receivedAt),
+    ];
+  }
+
+  PolarH10EcgSample _parseSingleEcgSample(
+    Object? rawSample,
+    DateTime receivedAt,
+  ) {
+    final sample = rawSample is Map
+        ? Map<Object?, Object?>.from(rawSample)
+        : const <Object?, Object?>{};
+    final sdkTimestamp = _asInt(sample['sdkTimestamp']);
+    final sampleTimestamp = _dateTimeFromPolarSdkTimestamp(
+      sdkTimestamp,
+      receivedAt: receivedAt,
+    );
+
+    return PolarH10EcgSample(
+      sampleTimestamp: sampleTimestamp ?? receivedAt,
+      receivedAt: receivedAt,
+      ecgMicrovolts: _asInt(sample['value']) ?? 0,
+      sdkTimestamp: sdkTimestamp,
+      timestampFallbackUsed: sampleTimestamp == null,
+    );
+  }
+
+  DateTime? _dateTimeFromPolarSdkTimestamp(
+    int? sdkTimestamp, {
+    required DateTime receivedAt,
+  }) {
+    if (sdkTimestamp == null || sdkTimestamp <= 0) {
+      return null;
+    }
+
+    // Polar SDK ECG sample timestamps are nanoseconds since the Polar epoch.
+    final microsecondsSincePolarEpoch = sdkTimestamp ~/ 1000;
+    final candidate = _polarTimestampEpochUtc.add(
+      Duration(microseconds: microsecondsSincePolarEpoch),
+    );
+    if (!_isReasonableEcgSampleTimestamp(candidate, receivedAt)) {
+      return null;
+    }
+
+    return candidate;
+  }
+
+  bool _isReasonableEcgSampleTimestamp(
+    DateTime candidate,
+    DateTime receivedAt,
+  ) {
+    if (candidate.isBefore(_minimumReasonablePolarTimestampUtc)) {
+      return false;
+    }
+
+    final skew = candidate.difference(receivedAt.toUtc()).abs();
+    return skew <= _maximumEcgTimestampReceptionSkew;
   }
 
   DateTime _dateTimeFromMillis(Object? value) {
@@ -188,11 +235,4 @@ class PolarH10PlatformService {
     };
   }
 
-  num? _asNum(Object? value) {
-    return switch (value) {
-      num() => value,
-      String() => num.tryParse(value),
-      _ => null,
-    };
-  }
 }
