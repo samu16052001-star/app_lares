@@ -145,17 +145,29 @@ class PolarH10PlatformService {
     }
 
     final receivedAt = _dateTimeFromMillis(raw['receivedAtMillis']);
+    final samplingRateHz =
+        (_asNum(raw['samplingRateHz']) ?? 130).clamp(1, 1000).toDouble();
+    final intervalUs = (Duration.microsecondsPerSecond / samplingRateHz).round();
+    final firstDisplaySampleUs =
+        receivedAt.microsecondsSinceEpoch - intervalUs * (rawSamples.length - 1);
 
     return [
-      for (final rawSample in rawSamples)
-        _parseSingleEcgSample(rawSample, receivedAt),
+      for (var index = 0; index < rawSamples.length; index += 1)
+        _parseSingleEcgSample(
+          rawSamples[index],
+          receivedAt: receivedAt,
+          displayTimestamp: DateTime.fromMicrosecondsSinceEpoch(
+            firstDisplaySampleUs + intervalUs * index,
+          ),
+        ),
     ];
   }
 
   PolarH10EcgSample _parseSingleEcgSample(
-    Object? rawSample,
-    DateTime receivedAt,
-  ) {
+    Object? rawSample, {
+    required DateTime receivedAt,
+    required DateTime displayTimestamp,
+  }) {
     final sample = rawSample is Map
         ? Map<Object?, Object?>.from(rawSample)
         : const <Object?, Object?>{};
@@ -168,6 +180,7 @@ class PolarH10PlatformService {
     return PolarH10EcgSample(
       sampleTimestamp: sampleTimestamp ?? receivedAt,
       receivedAt: receivedAt,
+      displayTimestamp: displayTimestamp,
       ecgMicrovolts: _asInt(sample['value']) ?? 0,
       sdkTimestamp: sdkTimestamp,
       timestampFallbackUsed: sampleTimestamp == null,
@@ -235,4 +248,11 @@ class PolarH10PlatformService {
     };
   }
 
+  num? _asNum(Object? value) {
+    return switch (value) {
+      num() => value,
+      String() => num.tryParse(value),
+      _ => null,
+    };
+  }
 }

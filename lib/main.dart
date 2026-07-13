@@ -1868,17 +1868,13 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
-    final hasSdkTimestamps =
-        samples.any((sample) => !sample.timestampFallbackUsed);
-    if (hasSdkTimestamps) {
-      final latestSampleTimestamp = samples
-          .map((sample) => sample.sampleTimestamp)
-          .reduce((a, b) => a.isAfter(b) ? a : b);
-      final cutoff = latestSampleTimestamp.subtract(
-        _ConnectedDeviceSession.polarVisibleEcgWindow,
-      );
-      samples.removeWhere((sample) => sample.sampleTimestamp.isBefore(cutoff));
-    }
+    final latestDisplayTimestamp = samples
+        .map((sample) => sample.displayTimestamp)
+        .reduce((a, b) => a.isAfter(b) ? a : b);
+    final cutoff = latestDisplayTimestamp.subtract(
+      _ConnectedDeviceSession.polarVisibleEcgWindow,
+    );
+    samples.removeWhere((sample) => sample.displayTimestamp.isBefore(cutoff));
 
     if (samples.length > _ConnectedDeviceSession.polarVisibleEcgSampleCount) {
       samples.removeRange(

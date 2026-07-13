@@ -57,7 +57,7 @@ class PolarH10LiveSection extends StatelessWidget {
         MapEntry(index, ecgSamples[index]),
     ]..sort((a, b) {
         final timestampComparison =
-            a.value.sampleTimestamp.compareTo(b.value.sampleTimestamp);
+            a.value.displayTimestamp.compareTo(b.value.displayTimestamp);
         if (timestampComparison != 0) {
           return timestampComparison;
         }
@@ -67,19 +67,13 @@ class PolarH10LiveSection extends StatelessWidget {
     final orderedSamples = [
       for (final entry in indexedSamples) entry.value,
     ];
-    final hasSdkTimestamps =
-        orderedSamples.any((sample) => !sample.timestampFallbackUsed);
+    final windowEnd = orderedSamples.last.displayTimestamp;
+    final cutoff = windowEnd.subtract(visibleEcgWindow);
+    final windowSamples = orderedSamples
+        .where((sample) => !sample.displayTimestamp.isBefore(cutoff))
+        .toList(growable: false);
 
-    if (hasSdkTimestamps) {
-      final windowEnd = orderedSamples.last.sampleTimestamp;
-      final cutoff = windowEnd.subtract(visibleEcgWindow);
-      final windowSamples = orderedSamples
-          .where((sample) => !sample.sampleTimestamp.isBefore(cutoff))
-          .toList(growable: false);
-      return _limitVisibleSamples(windowSamples);
-    }
-
-    return _limitVisibleSamples(orderedSamples);
+    return _limitVisibleSamples(windowSamples);
   }
 
   List<PolarH10EcgSample> _limitVisibleSamples(
@@ -338,15 +332,15 @@ class _PolarEcgChartCard extends StatelessWidget {
   Widget _buildChart(BuildContext context) {
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
-    final firstSampleTime = samples.first.sampleTimestamp;
-    final lastSampleTime = samples.last.sampleTimestamp;
+    final firstSampleTime = samples.first.displayTimestamp;
+    final lastSampleTime = samples.last.displayTimestamp;
     final maxX = math.max(
       1.0,
       lastSampleTime.difference(firstSampleTime).inMilliseconds / 1000,
     );
     final spots = samples.map((sample) {
       final seconds =
-          sample.sampleTimestamp.difference(firstSampleTime).inMicroseconds /
+          sample.displayTimestamp.difference(firstSampleTime).inMicroseconds /
               Duration.microsecondsPerSecond;
       return FlSpot(seconds.clamp(0, maxX).toDouble(), sample.ecgMicrovolts.toDouble());
     }).toList(growable: false);

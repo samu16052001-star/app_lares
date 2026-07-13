@@ -66,14 +66,26 @@ class PolarH10EcgSample {
   const PolarH10EcgSample({
     required this.sampleTimestamp,
     required this.receivedAt,
+    required this.displayTimestamp,
     required this.ecgMicrovolts,
     this.sdkTimestamp,
     this.timestampFallbackUsed = false,
   });
 
+  /// Polar SDK/device ECG sample timestamp. Used for CSV logging.
   final DateTime sampleTimestamp;
+
+  /// Phone timestamp when the ECG SDK event/batch was received.
   final DateTime receivedAt;
+
+  /// Phone-based reconstructed timestamp used only for live ECG charting.
+  /// This timestamp must not be used for CSV logging.
+  final DateTime displayTimestamp;
+
   final int ecgMicrovolts;
   final int? sdkTimestamp;
+
+  /// True when sampleTimestamp fell back to receivedAt because the Polar
+  /// SDK/device timestamp was missing or invalid.
   final bool timestampFallbackUsed;
 }
