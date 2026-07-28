@@ -620,6 +620,7 @@ class _BleDisconnectionAlertItem {
     required this.deviceName,
     required this.status,
     required this.onReconnect,
+    this.reconnectEnabled = true,
     this.failureMessage,
   });
 
@@ -627,9 +628,12 @@ class _BleDisconnectionAlertItem {
   final String deviceName;
   final _BleReconnectStatus status;
   final VoidCallback onReconnect;
+  final bool reconnectEnabled;
   final String? failureMessage;
 
   bool get isReconnecting => status == _BleReconnectStatus.reconnecting;
+
+  bool get canReconnect => reconnectEnabled && !isReconnecting;
 }
 
 class _BleDisconnectionAlertDialog extends StatelessWidget {
@@ -669,7 +673,7 @@ class _BleDisconnectionAlertDialog extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'The following device disconnected during acquisition. Move closer to the phone and tap Reconnect to resume BLE notifications.',
+              'The app will automatically attempt to reconnect every 10 seconds. You can also move closer to the phone and tap Reconnect to retry immediately.',
             ),
             const SizedBox(height: 16),
             ConstrainedBox(
@@ -745,7 +749,7 @@ class _BleDisconnectionAlertDeviceRow extends StatelessWidget {
         ),
         const SizedBox(width: 12),
         FilledButton(
-          onPressed: item.isReconnecting ? null : item.onReconnect,
+          onPressed: item.canReconnect ? item.onReconnect : null,
           child: const Text('Reconnect'),
         ),
       ],
@@ -900,6 +904,150 @@ class _BleReconnectHelper {
   }
 }
 
+class _BleAutoReconnectCoordinator {
+  _BleAutoReconnectCoordinator({
+    required this.runAutomaticCycle,
+    required this.hasPendingWork,
+    required this.canContinue,
+    this.onStateChanged,
+  });
+
+  static const Duration retryDelay = Duration(seconds: 10);
+
+  final Future<void> Function() runAutomaticCycle;
+  final bool Function() hasPendingWork;
+  final bool Function() canContinue;
+  final VoidCallback? onStateChanged;
+
+  Timer? _retryTimer;
+  bool _active = false;
+  bool _operationInProgress = false;
+  int _generation = 0;
+
+  bool get isActive => _active;
+
+  bool get isOperationInProgress => _operationInProgress;
+
+  void start() {
+    if (_active || !_canRun) {
+      return;
+    }
+
+    _active = true;
+    _generation += 1;
+    unawaited(_startOperation(_generation, runAutomaticCycle));
+  }
+
+  Future<void> requestImmediate({
+    Future<void> Function()? operation,
+  }) {
+    if (!_canRun) {
+      return Future<void>.value();
+    }
+
+    if (!_active) {
+      _active = true;
+      _generation += 1;
+    }
+
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    if (_operationInProgress) {
+      _notify();
+      return Future<void>.value();
+    }
+
+    return _startOperation(_generation, operation ?? runAutomaticCycle);
+  }
+
+  void cancel({bool notify = true}) {
+    _active = false;
+    _generation += 1;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    if (notify) {
+      _notify();
+    }
+  }
+
+  bool get _canRun => canContinue() && hasPendingWork();
+
+  Future<void> _startOperation(
+    int generation,
+    Future<void> Function() operation,
+  ) {
+    if (!_isCurrent(generation) || _operationInProgress || !_canRun) {
+      return Future<void>.value();
+    }
+
+    _operationInProgress = true;
+    _notify();
+    return _completeOperation(generation, operation);
+  }
+
+  Future<void> _completeOperation(
+    int generation,
+    Future<void> Function() operation,
+  ) async {
+    try {
+      await operation();
+    } catch (_) {
+      // Individual reconnection attempts own their visible failure state.
+    } finally {
+      _operationInProgress = false;
+      _notify();
+    }
+
+    if (!_isCurrent(generation)) {
+      return;
+    }
+
+    if (!_canRun) {
+      _finish(generation);
+      return;
+    }
+
+    _scheduleRetry(generation);
+  }
+
+  void _scheduleRetry(int generation) {
+    if (!_isCurrent(generation) || !_canRun) {
+      return;
+    }
+
+    _retryTimer?.cancel();
+    _retryTimer = Timer(retryDelay, () {
+      _retryTimer = null;
+      _notify();
+      if (!_isCurrent(generation) || !_canRun) {
+        return;
+      }
+
+      unawaited(_startOperation(generation, runAutomaticCycle));
+    });
+    _notify();
+  }
+
+  void _finish(int generation) {
+    if (_generation != generation) {
+      return;
+    }
+
+    _active = false;
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _notify();
+  }
+
+  bool _isCurrent(int generation) {
+    return _active && _generation == generation;
+  }
+
+  void _notify() {
+    onStateChanged?.call();
+  }
+}
+
 String _normalizeDeviceNameForReconnect(String value) {
   return value.trim().toLowerCase();
 }
@@ -1038,12 +1186,21 @@ class _ConnectedDeviceSession {
 }
 
 class _MultiDeviceSessionManager extends ChangeNotifier {
-  _MultiDeviceSessionManager();
+  _MultiDeviceSessionManager() {
+    _bleAutoReconnectCoordinator = _BleAutoReconnectCoordinator(
+      runAutomaticCycle: _runAutomaticBleReconnectCycle,
+      hasPendingWork: _hasAutomaticBleReconnectTargets,
+      canContinue: _canContinueAutomaticBleReconnect,
+      onStateChanged: notifyListeners,
+    );
+  }
 
   final List<_ConnectedDeviceSession> _sessions = [];
   final UnifiedAcquisitionCsvLogger csvLogger = UnifiedAcquisitionCsvLogger();
   final GpsLocationService gpsLocationService = GpsLocationService();
   final OpenRemoteMqttService mqttService = OpenRemoteMqttService();
+  late final _BleAutoReconnectCoordinator _bleAutoReconnectCoordinator;
+  final Set<String> _dismissedBleAutoReconnectAlertKeys = {};
 
   StreamSubscription<OpenRemoteMqttState>? _mqttStateSubscription;
   OpenRemoteMqttState mqttState = const OpenRemoteMqttState(
@@ -1082,6 +1239,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   bool get isStopping => _isStopping;
+
+  bool get isBleReconnectOperationInProgress =>
+      _bleAutoReconnectCoordinator.isOperationInProgress;
 
   bool get isAndroidBackgroundServiceActive => _foregroundServiceStarted;
 
@@ -1294,9 +1454,47 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   Future<void> reconnectDisconnectedSession(
     _ConnectedDeviceSession session,
   ) async {
-    if (!_acquisitionStarted ||
-        session.reconnectStatus == _BleReconnectStatus.reconnecting ||
-        !disconnectedSessionsDuringAcquisition.contains(session)) {
+    if (!_canAttemptBleReconnect(session)) {
+      return;
+    }
+
+    await _bleAutoReconnectCoordinator.requestImmediate(
+      operation: () => _reconnectDisconnectedSessionOnce(session),
+    );
+  }
+
+  void dismissAutomaticBleReconnectForSessions(
+    Iterable<_ConnectedDeviceSession> sessions,
+  ) {
+    for (final session in sessions) {
+      _dismissedBleAutoReconnectAlertKeys.add(_bleAutoReconnectAlertKey(session));
+    }
+    _bleAutoReconnectCoordinator.cancel();
+  }
+
+  void cancelAutomaticBleReconnect() {
+    _bleAutoReconnectCoordinator.cancel();
+  }
+
+  Future<void> _runAutomaticBleReconnectCycle() async {
+    final targets = _automaticBleReconnectTargets;
+    for (final session in targets) {
+      if (!_bleAutoReconnectCoordinator.isActive ||
+          !_canContinueAutomaticBleReconnect()) {
+        return;
+      }
+      if (!_canAttemptAutomaticBleReconnect(session)) {
+        continue;
+      }
+
+      await _reconnectDisconnectedSessionOnce(session);
+    }
+  }
+
+  Future<void> _reconnectDisconnectedSessionOnce(
+    _ConnectedDeviceSession session,
+  ) async {
+    if (!_canAttemptBleReconnect(session)) {
       return;
     }
 
@@ -1308,6 +1506,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (session.isPolarManaged) {
       try {
         await _reconnectPolarH10(session);
+        if (!_canContinueAutomaticBleReconnect() ||
+            !_sessions.contains(session)) {
+          return;
+        }
         session
           ..isConnected = true
           ..disconnectedDuringAcquisition = false
@@ -1318,6 +1520,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         }
         notifyListeners();
       } catch (_) {
+        if (!_canContinueAutomaticBleReconnect() ||
+            !_sessions.contains(session)) {
+          return;
+        }
         session
           ..isConnected = false
           ..disconnectedDuringAcquisition = true
@@ -1335,6 +1541,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         deviceId: session.deviceId,
         deviceName: session.deviceName,
       );
+      if (!_canContinueAutomaticBleReconnect() ||
+          !_sessions.contains(session)) {
+        return;
+      }
 
       final deviceReferenceChanged = !identical(reconnectedDevice, session.device);
       if (deviceReferenceChanged) {
@@ -1369,6 +1579,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         case KnownDeviceType.unsupported:
           throw StateError('${session.deviceName} is unsupported.');
       }
+      if (!_canContinueAutomaticBleReconnect() ||
+          !_sessions.contains(session)) {
+        return;
+      }
 
       session
         ..isConnected = true
@@ -1383,6 +1597,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       try {
         await session.bleDevice.disconnect();
       } catch (_) {}
+      if (!_canContinueAutomaticBleReconnect() ||
+          !_sessions.contains(session)) {
+        return;
+      }
       session
         ..isConnected = false
         ..disconnectedDuringAcquisition = true
@@ -1391,6 +1609,51 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
             'Could not reconnect to ${session.deviceName}. Move closer and try again.';
       notifyListeners();
     }
+  }
+
+  bool _hasAutomaticBleReconnectTargets() {
+    return _automaticBleReconnectTargets.isNotEmpty;
+  }
+
+  List<_ConnectedDeviceSession> get _automaticBleReconnectTargets {
+    return disconnectedSessionsDuringAcquisition.where((session) {
+      return !_dismissedBleAutoReconnectAlertKeys.contains(
+        _bleAutoReconnectAlertKey(session),
+      );
+    }).toList(growable: false);
+  }
+
+  bool _canContinueAutomaticBleReconnect() {
+    return _acquisitionStarted && !_isStopping && !_disposed;
+  }
+
+  bool _canAttemptAutomaticBleReconnect(_ConnectedDeviceSession session) {
+    return _canAttemptBleReconnect(session) &&
+        !_dismissedBleAutoReconnectAlertKeys.contains(
+          _bleAutoReconnectAlertKey(session),
+        );
+  }
+
+  bool _canAttemptBleReconnect(_ConnectedDeviceSession session) {
+    if (!_canContinueAutomaticBleReconnect() ||
+        !_sessions.contains(session) ||
+        !session.disconnectedDuringAcquisition ||
+        session.reconnectStatus == _BleReconnectStatus.reconnecting ||
+        session.reconnectStatus == _BleReconnectStatus.reconnected) {
+      return false;
+    }
+
+    final wearableService = session.wearableService;
+    if (wearableService != null &&
+        (wearableService.isStopping || wearableService.isStopped)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  String _bleAutoReconnectAlertKey(_ConnectedDeviceSession session) {
+    return '${session.deviceId}:${session.disconnectionAlertVersion}';
   }
 
   void setVisualizationMode(
@@ -1406,6 +1669,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    _bleAutoReconnectCoordinator.cancel();
     _isStopping = true;
     notifyListeners();
 
@@ -1469,10 +1733,12 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     if (_acquisitionStarted) {
+      _bleAutoReconnectCoordinator.cancel();
       return;
     }
 
     _disposed = true;
+    _bleAutoReconnectCoordinator.cancel();
     for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
       await session.cancelConnectionSubscription();
       await session.cancelLiveSubscriptions();
@@ -1602,6 +1868,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         session.deviceName,
       ),
     );
+    _bleAutoReconnectCoordinator.start();
   }
 
   Future<void> _initializeEnvironmental(_ConnectedDeviceSession session) async {
@@ -2989,6 +3256,7 @@ class _MultiDeviceAcquisitionPageState
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     widget.manager.removeListener(_handleManagerChanged);
+    widget.manager.cancelAutomaticBleReconnect();
     _stopBleAlertAlarm();
     super.dispose();
   }
@@ -3022,7 +3290,7 @@ class _MultiDeviceAcquisitionPageState
     final disconnectedSessions =
         widget.manager.disconnectedSessionsDuringAcquisition;
     if (_bleAlertDialogOpen) {
-      if (disconnectedSessions.isEmpty) {
+      if (disconnectedSessions.isEmpty || _visibleBleAlertSessions.isEmpty) {
         _closeBleAlertDialog(dismissCurrentDevices: false);
       }
       return;
@@ -3032,9 +3300,7 @@ class _MultiDeviceAcquisitionPageState
       return;
     }
 
-    final visibleSessions = disconnectedSessions.where((session) {
-      return !_dismissedBleAlertKeys.contains(_bleAlertKey(session));
-    }).toList(growable: false);
+    final visibleSessions = _visibleBleAlertSessions;
     if (visibleSessions.isEmpty) {
       return;
     }
@@ -3058,7 +3324,7 @@ class _MultiDeviceAcquisitionPageState
           return AnimatedBuilder(
             animation: widget.manager,
             builder: (context, _) {
-              final items = widget.manager.disconnectedSessionsDuringAcquisition
+              final items = _visibleBleAlertSessions
                   .map(_bleAlertItemForSession)
                   .toList(growable: false);
               return _BleDisconnectionAlertDialog(
@@ -3088,6 +3354,9 @@ class _MultiDeviceAcquisitionPageState
       id: session.deviceId,
       deviceName: session.deviceName,
       status: session.reconnectStatus,
+      reconnectEnabled:
+          !widget.manager.isBleReconnectOperationInProgress &&
+              !widget.manager.isStopping,
       failureMessage: session.reconnectFailureMessage,
       onReconnect: () {
         unawaited(widget.manager.reconnectDisconnectedSession(session));
@@ -3097,9 +3366,11 @@ class _MultiDeviceAcquisitionPageState
 
   void _closeBleAlertDialog({required bool dismissCurrentDevices}) {
     if (dismissCurrentDevices) {
-      for (final session in widget.manager.disconnectedSessionsDuringAcquisition) {
+      final visibleSessions = _visibleBleAlertSessions;
+      for (final session in visibleSessions) {
         _dismissedBleAlertKeys.add(_bleAlertKey(session));
       }
+      widget.manager.dismissAutomaticBleReconnectForSessions(visibleSessions);
     }
 
     _stopBleAlertAlarm();
@@ -3135,6 +3406,12 @@ class _MultiDeviceAcquisitionPageState
 
   String _bleAlertKey(_ConnectedDeviceSession session) {
     return '${session.deviceId}:${session.disconnectionAlertVersion}';
+  }
+
+  List<_ConnectedDeviceSession> get _visibleBleAlertSessions {
+    return widget.manager.disconnectedSessionsDuringAcquisition.where((session) {
+      return !_dismissedBleAlertKeys.contains(_bleAlertKey(session));
+    }).toList(growable: false);
   }
 
   Future<void> _stopAcquisition() async {
@@ -4245,12 +4522,19 @@ class _WearableBleCommunicationLogPageState
   int _bleDisconnectionAlertVersion = 0;
   _BleReconnectStatus _bleReconnectStatus = _BleReconnectStatus.disconnected;
   String? _bleReconnectFailureMessage;
+  late final _BleAutoReconnectCoordinator _bleAutoReconnectCoordinator;
   bool _isStoppingAcquisition = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _bleAutoReconnectCoordinator = _BleAutoReconnectCoordinator(
+      runAutomaticCycle: _runWearableAutomaticBleReconnectCycle,
+      hasPendingWork: _hasWearableAutomaticBleReconnectWork,
+      canContinue: _canContinueWearableAutomaticBleReconnect,
+      onStateChanged: _handleWearableAutoReconnectStateChanged,
+    );
     _agmBatchesSubscription = widget.service.agmBatchesStream.listen(
       _handleAgmBatch,
     );
@@ -4267,6 +4551,7 @@ class _WearableBleCommunicationLogPageState
     unawaited(_sdsStatusSubscription?.cancel());
     unawaited(_connectionSubscription?.cancel());
     _uiRefreshTimer?.cancel();
+    _bleAutoReconnectCoordinator.cancel(notify: false);
     _stopWearableBleAlertAlarm();
     _bleAlertRevision.dispose();
     super.dispose();
@@ -4356,6 +4641,7 @@ class _WearableBleCommunicationLogPageState
         widget.deviceName,
       ),
     );
+    _bleAutoReconnectCoordinator.start();
 
     if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
       return;
@@ -4365,10 +4651,25 @@ class _WearableBleCommunicationLogPageState
   }
 
   Future<void> _reconnectWearableAfterDisconnection() async {
-    if (_bleReconnectStatus == _BleReconnectStatus.reconnecting ||
-        _isStoppingAcquisition ||
-        widget.service.isStopping ||
-        widget.service.isStopped) {
+    if (!_canAttemptWearableBleReconnect()) {
+      return;
+    }
+
+    await _bleAutoReconnectCoordinator.requestImmediate(
+      operation: _runWearableBleReconnectAttempt,
+    );
+  }
+
+  Future<void> _runWearableAutomaticBleReconnectCycle() async {
+    if (!_canAttemptWearableBleReconnect()) {
+      return;
+    }
+
+    await _runWearableBleReconnectAttempt();
+  }
+
+  Future<void> _runWearableBleReconnectAttempt() async {
+    if (!_canAttemptWearableBleReconnect()) {
       return;
     }
 
@@ -4385,12 +4686,15 @@ class _WearableBleCommunicationLogPageState
         deviceId: currentDevice.remoteId.toString(),
         deviceName: widget.deviceName,
       );
+      if (!_canContinueWearableAutomaticBleReconnect()) {
+        return;
+      }
       await widget.service.resumeNotificationsAfterReconnect(
         reconnectedDevice: reconnectedDevice,
       );
       _attachWearableConnectionListener();
 
-      if (!mounted) {
+      if (!_canContinueWearableAutomaticBleReconnect()) {
         return;
       }
 
@@ -4407,7 +4711,7 @@ class _WearableBleCommunicationLogPageState
         await widget.service.device.disconnect();
       } catch (_) {}
 
-      if (!mounted) {
+      if (!_canContinueWearableAutomaticBleReconnect()) {
         return;
       }
 
@@ -4418,6 +4722,33 @@ class _WearableBleCommunicationLogPageState
             'Could not reconnect to ${widget.deviceName}. Move closer and try again.';
       });
       _notifyWearableBleAlertChanged();
+    }
+  }
+
+  bool _hasWearableAutomaticBleReconnectWork() {
+    return _bleDisconnectedDuringAcquisition &&
+        !_dismissedBleAlertKeys.contains(_wearableBleAlertKey);
+  }
+
+  bool _canContinueWearableAutomaticBleReconnect() {
+    return mounted &&
+        !_isStoppingAcquisition &&
+        !widget.service.isStopping &&
+        !widget.service.isStopped;
+  }
+
+  bool _canAttemptWearableBleReconnect() {
+    return _canContinueWearableAutomaticBleReconnect() &&
+        _bleDisconnectedDuringAcquisition &&
+        !_dismissedBleAlertKeys.contains(_wearableBleAlertKey) &&
+        _bleReconnectStatus != _BleReconnectStatus.reconnecting &&
+        _bleReconnectStatus != _BleReconnectStatus.reconnected;
+  }
+
+  void _handleWearableAutoReconnectStateChanged() {
+    _notifyWearableBleAlertChanged();
+    if (mounted) {
+      setState(() {});
     }
   }
 
@@ -4483,6 +4814,10 @@ class _WearableBleCommunicationLogPageState
       id: widget.service.device.remoteId.toString(),
       deviceName: widget.deviceName,
       status: _bleReconnectStatus,
+      reconnectEnabled: !_bleAutoReconnectCoordinator.isOperationInProgress &&
+          !_isStoppingAcquisition &&
+          !widget.service.isStopping &&
+          !widget.service.isStopped,
       failureMessage: _bleReconnectFailureMessage,
       onReconnect: () {
         unawaited(_reconnectWearableAfterDisconnection());
@@ -4493,6 +4828,7 @@ class _WearableBleCommunicationLogPageState
   void _closeWearableBleAlertDialog({required bool dismissCurrentDevice}) {
     if (dismissCurrentDevice && _bleDisconnectedDuringAcquisition) {
       _dismissedBleAlertKeys.add(_wearableBleAlertKey);
+      _bleAutoReconnectCoordinator.cancel();
     }
 
     _stopWearableBleAlertAlarm();
@@ -4588,6 +4924,7 @@ class _WearableBleCommunicationLogPageState
       return;
     }
 
+    _bleAutoReconnectCoordinator.cancel();
     setState(() {
       _isStoppingAcquisition = true;
     });
@@ -5765,6 +6102,7 @@ class _AcquisitionInitializationPageState
   String? _bleReconnectFailureMessage;
   final Set<String> _dismissedBleAlertKeys = {};
   final ValueNotifier<int> _bleAlertRevision = ValueNotifier<int>(0);
+  late final _BleAutoReconnectCoordinator _bleAutoReconnectCoordinator;
   Timer? _bleAlertBeepTimer;
   BuildContext? _bleAlertDialogContext;
   bool _bleAlertDialogOpen = false;
@@ -5784,6 +6122,12 @@ class _AcquisitionInitializationPageState
     _mqttService = OpenRemoteMqttService();
     _csvLogger = AcquisitionCsvLogger();
     _gpsLocationService = GpsLocationService();
+    _bleAutoReconnectCoordinator = _BleAutoReconnectCoordinator(
+      runAutomaticCycle: _runSingleAutomaticBleReconnectCycle,
+      hasPendingWork: _hasSingleAutomaticBleReconnectWork,
+      canContinue: _canContinueSingleAutomaticBleReconnect,
+      onStateChanged: _handleSingleAutoReconnectStateChanged,
+    );
     _visibleMeasurements = _measurementDefinitions
         .where(
           (definition) =>
@@ -5913,6 +6257,7 @@ class _AcquisitionInitializationPageState
         _deviceDisplayName,
       ),
     );
+    _bleAutoReconnectCoordinator.start();
 
     if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
       return;
@@ -5924,6 +6269,7 @@ class _AcquisitionInitializationPageState
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _bleAutoReconnectCoordinator.cancel(notify: false);
     _stopSingleBleAlertAlarm();
     _bleAlertRevision.dispose();
     if (_acquisitionStarted && !_acquisitionStopped) {
@@ -6094,8 +6440,25 @@ class _AcquisitionInitializationPageState
   }
 
   Future<void> _reconnectSingleEnvironmentalAfterDisconnection() async {
-    if (_bleReconnectStatus == _BleReconnectStatus.reconnecting ||
-        _acquisitionStopped) {
+    if (!_canAttemptSingleBleReconnect()) {
+      return;
+    }
+
+    await _bleAutoReconnectCoordinator.requestImmediate(
+      operation: _runSingleBleReconnectAttempt,
+    );
+  }
+
+  Future<void> _runSingleAutomaticBleReconnectCycle() async {
+    if (!_canAttemptSingleBleReconnect()) {
+      return;
+    }
+
+    await _runSingleBleReconnectAttempt();
+  }
+
+  Future<void> _runSingleBleReconnectAttempt() async {
+    if (!_canAttemptSingleBleReconnect()) {
       return;
     }
 
@@ -6112,12 +6475,15 @@ class _AcquisitionInitializationPageState
         deviceName: _deviceDisplayName,
       );
       _activeDevice = reconnectedDevice;
+      if (!_canContinueSingleAutomaticBleReconnect()) {
+        return;
+      }
       await _service.resumeNotificationsAfterReconnect(
         reconnectedDevice: reconnectedDevice,
       );
       _attachConnectionListener();
 
-      if (!mounted) {
+      if (!_canContinueSingleAutomaticBleReconnect()) {
         return;
       }
 
@@ -6134,7 +6500,7 @@ class _AcquisitionInitializationPageState
         await _activeDevice.disconnect();
       } catch (_) {}
 
-      if (!mounted) {
+      if (!_canContinueSingleAutomaticBleReconnect()) {
         return;
       }
 
@@ -6145,6 +6511,31 @@ class _AcquisitionInitializationPageState
             'Could not reconnect to $_deviceDisplayName. Move closer and try again.';
       });
       _notifySingleBleAlertChanged();
+    }
+  }
+
+  bool _hasSingleAutomaticBleReconnectWork() {
+    return _bleDisconnectedDuringActiveAcquisition &&
+        !_dismissedBleAlertKeys.contains(_singleBleAlertKey);
+  }
+
+  bool _canContinueSingleAutomaticBleReconnect() {
+    return mounted && !_isStoppingAcquisition && !_acquisitionStopped;
+  }
+
+  bool _canAttemptSingleBleReconnect() {
+    return _canContinueSingleAutomaticBleReconnect() &&
+        _acquisitionStarted &&
+        _bleDisconnectedDuringActiveAcquisition &&
+        !_dismissedBleAlertKeys.contains(_singleBleAlertKey) &&
+        _bleReconnectStatus != _BleReconnectStatus.reconnecting &&
+        _bleReconnectStatus != _BleReconnectStatus.reconnected;
+  }
+
+  void _handleSingleAutoReconnectStateChanged() {
+    _notifySingleBleAlertChanged();
+    if (mounted) {
+      setState(() {});
     }
   }
 
@@ -6210,6 +6601,9 @@ class _AcquisitionInitializationPageState
       id: _activeDevice.remoteId.toString(),
       deviceName: _deviceDisplayName,
       status: _bleReconnectStatus,
+      reconnectEnabled: !_bleAutoReconnectCoordinator.isOperationInProgress &&
+          !_isStoppingAcquisition &&
+          !_acquisitionStopped,
       failureMessage: _bleReconnectFailureMessage,
       onReconnect: () {
         unawaited(_reconnectSingleEnvironmentalAfterDisconnection());
@@ -6220,6 +6614,7 @@ class _AcquisitionInitializationPageState
   void _closeSingleBleAlertDialog({required bool dismissCurrentDevice}) {
     if (dismissCurrentDevice && _bleDisconnectedDuringActiveAcquisition) {
       _dismissedBleAlertKeys.add(_singleBleAlertKey);
+      _bleAutoReconnectCoordinator.cancel();
     }
 
     _stopSingleBleAlertAlarm();
@@ -6369,6 +6764,7 @@ class _AcquisitionInitializationPageState
       return;
     }
 
+    _bleAutoReconnectCoordinator.cancel();
     setState(() {
       _isStoppingAcquisition = true;
       _acquisitionStopped = true;
