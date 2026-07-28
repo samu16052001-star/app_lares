@@ -40,6 +40,8 @@ class WearableConfigurationBleService {
   static const Duration _configDoneTimeout = Duration(seconds: 10);
   static const Duration _calibrationDoneTimeout = Duration(seconds: 22);
   static const Duration _periodicTimestampInterval = Duration(seconds: 60);
+  static const int _requestedAttMtu = 247;
+  static const int _minimumBatchedAgmAttMtu = 218;
   static const int _maxLogEntries = 200;
 
   BluetoothDevice device;
@@ -47,8 +49,8 @@ class WearableConfigurationBleService {
 
   final StreamController<List<String>> _logController =
       StreamController<List<String>>.broadcast();
-  final StreamController<WearableAgmReceivedSample> _agmSamplesController =
-      StreamController<WearableAgmReceivedSample>.broadcast();
+  final StreamController<WearableAgmReceivedBatch> _agmBatchesController =
+      StreamController<WearableAgmReceivedBatch>.broadcast();
   final StreamController<WearableSdsReceivedStatus> _sdsStatusController =
       StreamController<WearableSdsReceivedStatus>.broadcast();
   final StreamController<WearableBleSequenceState> _sequenceStateController =
@@ -76,8 +78,8 @@ class WearableConfigurationBleService {
 
   Stream<List<String>> get logsStream => _logController.stream;
 
-  Stream<WearableAgmReceivedSample> get agmSamplesStream =>
-      _agmSamplesController.stream;
+  Stream<WearableAgmReceivedBatch> get agmBatchesStream =>
+      _agmBatchesController.stream;
 
   Stream<WearableSdsReceivedStatus> get sdsStatusStream =>
       _sdsStatusController.stream;
@@ -235,7 +237,7 @@ class WearableConfigurationBleService {
     _setSequenceState(WearableBleSequenceState.stopped);
     _isDisposed = true;
     await _logController.close();
-    await _agmSamplesController.close();
+    await _agmBatchesController.close();
     await _sdsStatusController.close();
     await _sequenceStateController.close();
   }
@@ -275,7 +277,7 @@ class WearableConfigurationBleService {
     _log('Disconnection-related BLE cleanup completed.');
     _log('Wearable BLE service disposed.');
     await _logController.close();
-    await _agmSamplesController.close();
+    await _agmBatchesController.close();
     await _sdsStatusController.close();
     await _sequenceStateController.close();
   }
@@ -335,11 +337,11 @@ class WearableConfigurationBleService {
   }
 
   Future<void> _requestMtu() async {
-    _log('MTU request started: requesting 247 bytes.');
+    _log('MTU request started: requesting $_requestedAttMtu bytes.');
     _mtuRequested = true;
 
     try {
-      final mtu = await device.requestMtu(247);
+      final mtu = await device.requestMtu(_requestedAttMtu);
       _log('MTU request success/result: $mtu bytes.');
       _checkMtu(mtu);
     } catch (error) {
@@ -349,16 +351,18 @@ class WearableConfigurationBleService {
   }
 
   void _checkMtu(int mtu) {
-    if (mtu < 47) {
+    if (mtu < _minimumBatchedAgmAttMtu) {
       _hasBlockingMtuIssue = true;
       _log(
-        'MTU lower than 47 warning/error: negotiated MTU is $mtu bytes. Continue disabled.',
+        'MTU lower than $_minimumBatchedAgmAttMtu warning/error: negotiated MTU is $mtu bytes. Continue disabled.',
       );
       return;
     }
 
     _hasBlockingMtuIssue = false;
-    _log('MTU check passed: negotiated MTU is at least 47 bytes.');
+    _log(
+      'MTU check passed: negotiated MTU is at least $_minimumBatchedAgmAttMtu bytes.',
+    );
   }
 
   Future<void> _discoverWearableService() async {
@@ -450,7 +454,8 @@ class WearableConfigurationBleService {
     }
 
     final receivedAt = DateTime.now();
-    if (WearableAgmPacketParser.startsWithAgmHeader(value)) {
+    if (WearableAgmPacketParser.startsWithAgmHeader(value) ||
+        WearableAgmPacketParser.hasValidLength(value)) {
       _handleAgmPacket(value, receivedAt);
       return;
     }
@@ -471,27 +476,20 @@ class WearableConfigurationBleService {
   }
 
   void _handleAgmPacket(List<int> value, DateTime receivedAt) {
-    if (!WearableAgmPacketParser.hasValidLength(value)) {
-      _log(
-        'Invalid AGM packet length: ${value.length} bytes | ${_hexPayload(value)}',
-      );
-      return;
-    }
-
     try {
-      final sample = WearableAgmPacketParser.parse(value);
+      final samples = WearableAgmPacketParser.parseBatch(value);
       _startPeriodicTimestampTimerIfNeeded(receivedAt);
-      if (!_agmSamplesController.isClosed) {
-        _agmSamplesController.add(
-          WearableAgmReceivedSample(
+      if (!_agmBatchesController.isClosed) {
+        _agmBatchesController.add(
+          WearableAgmReceivedBatch(
             receivedAt: receivedAt,
-            sample: sample,
+            samples: samples,
           ),
         );
       }
-      _log(_formatAgmSample(sample));
-    } catch (error) {
-      _log('Invalid AGM packet: $error | ${_hexPayload(value)}');
+      _log(_formatAgmSample(samples.first));
+    } catch (_) {
+      // Invalid AGM batches are intentionally ignored.
     }
   }
 
@@ -792,14 +790,25 @@ class WearableConfigurationBleService {
   }
 }
 
-class WearableAgmReceivedSample {
-  const WearableAgmReceivedSample({
+class WearableAgmReceivedBatch {
+  WearableAgmReceivedBatch({
     required this.receivedAt,
-    required this.sample,
-  });
+    required List<WearableAgmSample> samples,
+  }) : samples = List.unmodifiable(samples) {
+    if (this.samples.isEmpty ||
+        this.samples.length > WearableAgmPacketParser.maxSamplesPerBatch) {
+      throw ArgumentError.value(
+        samples.length,
+        'samples.length',
+        'AGM batches must contain between 1 and 5 samples.',
+      );
+    }
+  }
 
   final DateTime receivedAt;
-  final WearableAgmSample sample;
+  final List<WearableAgmSample> samples;
+
+  WearableAgmSample get firstSample => samples.first;
 }
 
 class WearableSdsReceivedStatus {

@@ -102,15 +102,15 @@ class UnifiedAcquisitionCsvLogger {
     });
   }
 
-  Future<void> appendWearableAgmSample({
+  Future<void> appendWearableAgmBatch({
     required DateTime receivedAt,
     required String deviceName,
     required String gpsCoordinates,
-    required WearableAgmSample sample,
+    required List<WearableAgmSample> samples,
   }) {
     return _enqueue(() async {
       final sink = _sink;
-      if (!_isStarted || _isStopped || sink == null) {
+      if (!_isStarted || _isStopped || sink == null || samples.isEmpty) {
         return;
       }
 
@@ -118,7 +118,7 @@ class UnifiedAcquisitionCsvLogger {
         [
           _escapeCsvField(_formatWearableTimestamp(receivedAt)),
           _escapeCsvField(deviceName),
-          _escapeCsvField(_formatWearableDataReceived(sample)),
+          _escapeCsvField(_formatWearableDataReceived(samples)),
           _escapeCsvField(gpsCoordinates),
         ].join(';'),
       );
@@ -323,7 +323,11 @@ class UnifiedAcquisitionCsvLogger {
     }).join(',');
   }
 
-  String _formatWearableDataReceived(WearableAgmSample sample) {
+  String _formatWearableDataReceived(List<WearableAgmSample> samples) {
+    return samples.map(_formatWearableSample).join(' - ');
+  }
+
+  String _formatWearableSample(WearableAgmSample sample) {
     return 'acc=(${sample.accX.toStringAsFixed(3)}, '
         '${sample.accY.toStringAsFixed(3)}, '
         '${sample.accZ.toStringAsFixed(3)}) g, '

@@ -934,7 +934,7 @@ class _ConnectedDeviceSession {
   WearableConfigurationBleService? wearableService;
   StreamSubscription<BluetoothConnectionState>? connectionSubscription;
   StreamSubscription<BleNotificationMessage>? environmentalMessagesSubscription;
-  StreamSubscription<WearableAgmReceivedSample>? agmSamplesSubscription;
+  StreamSubscription<WearableAgmReceivedBatch>? agmBatchesSubscription;
   StreamSubscription<WearableSdsReceivedStatus>? sdsStatusSubscription;
   StreamSubscription<PolarH10Event>? polarEventsSubscription;
 
@@ -1021,8 +1021,8 @@ class _ConnectedDeviceSession {
   Future<void> cancelLiveSubscriptions() async {
     await environmentalMessagesSubscription?.cancel();
     environmentalMessagesSubscription = null;
-    await agmSamplesSubscription?.cancel();
-    agmSamplesSubscription = null;
+    await agmBatchesSubscription?.cancel();
+    agmBatchesSubscription = null;
     await sdsStatusSubscription?.cancel();
     sdsStatusSubscription = null;
     await polarEventsSubscription?.cancel();
@@ -1624,9 +1624,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       onStateChanged: notifyListeners,
     );
     session.wearableService = service;
-    session.agmSamplesSubscription = service.agmSamplesStream.listen(
+    session.agmBatchesSubscription = service.agmBatchesStream.listen(
       (event) {
-        _handleWearableAgmSample(session, event);
+        _handleWearableAgmBatch(session, event);
       },
     );
     session.sdsStatusSubscription = service.sdsStatusStream.listen(
@@ -2023,10 +2023,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     return value.toString();
   }
 
-  void _handleWearableAgmSample(
+  void _handleWearableAgmBatch(
     _ConnectedDeviceSession session,
-    WearableAgmReceivedSample event,
+    WearableAgmReceivedBatch event,
   ) {
+    final sample = event.firstSample;
     session.latestWearableSampleReceivedAt = event.receivedAt;
     final cutoff = event.receivedAt.subtract(
       _ConnectedDeviceSession.wearableVisibleChartWindow,
@@ -2040,17 +2041,18 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       series
         ..addSample(
           receivedAt: event.receivedAt,
-          value: _valueForWearableMetric(definition.metric, event.sample),
+          value: _valueForWearableMetric(definition.metric, sample),
         )
         ..pruneBefore(cutoff);
     }
 
+    final gpsCoordinates = gpsLocationService.currentCoordinates;
     unawaited(
-      csvLogger.appendWearableAgmSample(
+      csvLogger.appendWearableAgmBatch(
         receivedAt: event.receivedAt,
         deviceName: session.deviceName,
-        gpsCoordinates: gpsLocationService.currentCoordinates,
-        sample: event.sample,
+        gpsCoordinates: gpsCoordinates,
+        samples: event.samples,
       ),
     );
     notifyListeners();
@@ -3820,7 +3822,7 @@ class _WearableDeviceConfigurationPageState
   bool _isDisposing = false;
   bool _disconnectionNotified = false;
   String? _backgroundStatusMessage;
-  StreamSubscription<WearableAgmReceivedSample>? _agmSamplesSubscription;
+  StreamSubscription<WearableAgmReceivedBatch>? _agmBatchesSubscription;
 
   bool get _isConfigurationOnly {
     return widget.onConfigurationConfirmed != null;
@@ -4049,22 +4051,23 @@ class _WearableDeviceConfigurationPageState
         gpsStatusMessage,
       );
     }
-    await _agmSamplesSubscription?.cancel();
-    _agmSamplesSubscription = service.agmSamplesStream.listen((event) {
+    await _agmBatchesSubscription?.cancel();
+    _agmBatchesSubscription = service.agmBatchesStream.listen((event) {
+      final gpsCoordinates = gpsLocationService.currentCoordinates;
       unawaited(
-        csvLogger.appendAgmSample(
+        csvLogger.appendAgmBatch(
           receivedAt: event.receivedAt,
           deviceName: widget.deviceName,
-          gpsCoordinates: gpsLocationService.currentCoordinates,
-          sample: event.sample,
+          gpsCoordinates: gpsCoordinates,
+          samples: event.samples,
         ),
       );
     });
   }
 
   Future<void> _stopWearableCsvLogging() async {
-    await _agmSamplesSubscription?.cancel();
-    _agmSamplesSubscription = null;
+    await _agmBatchesSubscription?.cancel();
+    _agmBatchesSubscription = null;
     await _gpsLocationService?.stop();
     await _csvLogger?.stop();
   }
@@ -4225,7 +4228,7 @@ class _WearableBleCommunicationLogPageState
       definition.metric: _WearableMetricSeries(),
   };
 
-  StreamSubscription<WearableAgmReceivedSample>? _agmSamplesSubscription;
+  StreamSubscription<WearableAgmReceivedBatch>? _agmBatchesSubscription;
   StreamSubscription<WearableSdsReceivedStatus>? _sdsStatusSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   final Set<String> _dismissedBleAlertKeys = {};
@@ -4248,8 +4251,8 @@ class _WearableBleCommunicationLogPageState
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _agmSamplesSubscription = widget.service.agmSamplesStream.listen(
-      _handleAgmSample,
+    _agmBatchesSubscription = widget.service.agmBatchesStream.listen(
+      _handleAgmBatch,
     );
     _sdsStatusSubscription = widget.service.sdsStatusStream.listen(
       _handleSdsStatus,
@@ -4260,7 +4263,7 @@ class _WearableBleCommunicationLogPageState
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    unawaited(_agmSamplesSubscription?.cancel());
+    unawaited(_agmBatchesSubscription?.cancel());
     unawaited(_sdsStatusSubscription?.cancel());
     unawaited(_connectionSubscription?.cancel());
     _uiRefreshTimer?.cancel();
@@ -4295,7 +4298,8 @@ class _WearableBleCommunicationLogPageState
     });
   }
 
-  void _handleAgmSample(WearableAgmReceivedSample event) {
+  void _handleAgmBatch(WearableAgmReceivedBatch event) {
+    final sample = event.firstSample;
     _latestSampleReceivedAt = event.receivedAt;
 
     final cutoff = event.receivedAt.subtract(_visibleChartWindow);
@@ -4308,7 +4312,7 @@ class _WearableBleCommunicationLogPageState
       series
         ..addSample(
           receivedAt: event.receivedAt,
-          value: _valueForMetric(definition.metric, event),
+          value: _valueForMetric(definition.metric, sample),
         )
         ..pruneBefore(cutoff);
     }
@@ -4532,9 +4536,8 @@ class _WearableBleCommunicationLogPageState
 
   double _valueForMetric(
     _WearableMetric metric,
-    WearableAgmReceivedSample event,
+    WearableAgmSample sample,
   ) {
-    final sample = event.sample;
     return switch (metric) {
       _WearableMetric.accelerometerX => sample.accX,
       _WearableMetric.accelerometerY => sample.accY,
