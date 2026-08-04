@@ -32,6 +32,16 @@ class PolarH10EcgSamplesEvent extends PolarH10Event {
   final List<PolarH10EcgSample> samples;
 }
 
+class PolarH10AccelerometerSamplesEvent extends PolarH10Event {
+  const PolarH10AccelerometerSamplesEvent({
+    required this.samples,
+    required this.samplingRateHz,
+  });
+
+  final List<PolarH10AccelerometerSample> samples;
+  final int samplingRateHz;
+}
+
 class PolarH10BatteryLevelEvent extends PolarH10Event {
   const PolarH10BatteryLevelEvent(this.level);
 

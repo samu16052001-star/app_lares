@@ -581,6 +581,7 @@ String _summarizePolarH10Configuration(
   final streams = [
     if (configuration.hrEnabled) 'HR',
     if (configuration.rawEcgEnabled) 'Raw ECG',
+    if (configuration.accelerometerEnabled) 'Accelerometer',
   ].join(', ');
   return 'streams=$streams';
 }
@@ -1065,6 +1066,7 @@ class _ConnectedDeviceSession {
   static const Duration wearableVisibleChartWindow = Duration(seconds: 2);
   static const Duration polarVisibleEcgWindow = Duration(seconds: 5);
   static const int polarVisibleEcgSampleCount = 650;
+  static const Duration polarVisibleAccelerometerWindow = Duration(seconds: 5);
   static const Duration polarUiRefreshInterval = Duration(milliseconds: 250);
 
   BluetoothDevice? device;
@@ -1111,6 +1113,8 @@ class _ConnectedDeviceSession {
   PolarH10HrSample? latestPolarHrSample;
   int? latestPolarBatteryPercent;
   final List<PolarH10EcgSample> polarEcgSamples = [];
+  final List<PolarH10AccelerometerSample> polarAccelerometerSamples = [];
+  int? latestPolarAccelerometerSamplingRateHz;
   Timer? polarUiRefreshTimer;
   DateTime? lastPolarUiRefreshAt;
   bool polarStreamsStarted = false;
@@ -1177,6 +1181,8 @@ class _ConnectedDeviceSession {
     polarEventsSubscription = null;
     polarUiRefreshTimer?.cancel();
     polarUiRefreshTimer = null;
+    latestPolarAccelerometerSamplingRateHz = null;
+    polarAccelerometerSamples.clear();
   }
 
   Future<void> cancelConnectionSubscription() async {
@@ -2014,13 +2020,21 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   PolarH10Status _polarStreamingStatus(PolarH10Configuration configuration) {
-    if (configuration.hrEnabled && configuration.rawEcgEnabled) {
+    final enabledCount = [
+      configuration.hrEnabled,
+      configuration.rawEcgEnabled,
+      configuration.accelerometerEnabled,
+    ].where((enabled) => enabled).length;
+    if (enabledCount > 1) {
       return PolarH10Status.streaming;
     }
     if (configuration.hrEnabled) {
       return PolarH10Status.streamingHr;
     }
-    return PolarH10Status.streamingEcg;
+    if (configuration.rawEcgEnabled) {
+      return PolarH10Status.streamingEcg;
+    }
+    return PolarH10Status.streamingAccelerometer;
   }
 
   void _handlePolarH10Event(
@@ -2036,6 +2050,13 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         break;
       case final PolarH10EcgSamplesEvent ecgEvent:
         _handlePolarH10EcgSamples(session, ecgEvent.samples);
+        break;
+      case final PolarH10AccelerometerSamplesEvent accelerometerEvent:
+        _handlePolarH10AccelerometerSamples(
+          session,
+          accelerometerEvent.samples,
+          samplingRateHz: accelerometerEvent.samplingRateHz,
+        );
         break;
       case final PolarH10BatteryLevelEvent batteryEvent:
         session.latestPolarBatteryPercent = batteryEvent.level;
@@ -2064,6 +2085,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       case PolarH10Status.preparing:
       case PolarH10Status.streamingHr:
       case PolarH10Status.streamingEcg:
+      case PolarH10Status.streamingAccelerometer:
       case PolarH10Status.streaming:
       case PolarH10Status.reconnecting:
         session.isConnected = true;
@@ -2072,7 +2094,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         final wasConnected = session.isConnected;
         session
           ..isConnected = false
-          ..polarStreamsStarted = false;
+          ..polarStreamsStarted = false
+          ..latestPolarAccelerometerSamplingRateHz = null;
+        session.polarAccelerometerSamples.clear();
         if (_acquisitionStarted && wasConnected && !_isStopping) {
           _markSessionDisconnectedDuringAcquisition(session);
         }
@@ -2151,6 +2175,58 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
   }
 
+  void _handlePolarH10AccelerometerSamples(
+    _ConnectedDeviceSession session,
+    List<PolarH10AccelerometerSample> samples, {
+    required int samplingRateHz,
+  }) {
+    if (samples.isEmpty) {
+      return;
+    }
+
+    session
+      ..isConnected = true
+      ..latestPolarAccelerometerSamplingRateHz = samplingRateHz
+      ..polarAccelerometerSamples.addAll(samples);
+    _prunePolarAccelerometerSamples(session);
+
+    unawaited(
+      csvLogger.appendPolarAccelerometerSamples(
+        deviceName: session.deviceName,
+        gpsCoordinatesBySample: [
+          for (var index = 0; index < samples.length; index += 1)
+            gpsLocationService.currentCoordinates,
+        ],
+        samples: samples,
+      ),
+    );
+    _schedulePolarUiRefresh(session);
+  }
+
+  void _prunePolarAccelerometerSamples(_ConnectedDeviceSession session) {
+    final samples = session.polarAccelerometerSamples;
+    if (samples.isEmpty) {
+      return;
+    }
+
+    final latestDisplayTimestamp = samples
+        .map((sample) => sample.displayTimestamp)
+        .reduce((a, b) => a.isAfter(b) ? a : b);
+    final cutoff = latestDisplayTimestamp.subtract(
+      _ConnectedDeviceSession.polarVisibleAccelerometerWindow,
+    );
+    samples.removeWhere((sample) => sample.displayTimestamp.isBefore(cutoff));
+
+    final samplingRateHz = session.latestPolarAccelerometerSamplingRateHz ?? 25;
+    final maxSamples = math.max(
+      samplingRateHz * _ConnectedDeviceSession.polarVisibleAccelerometerWindow.inSeconds * 2,
+      samplingRateHz + 1,
+    ).toInt();
+    if (samples.length > maxSamples) {
+      samples.removeRange(0, samples.length - maxSamples);
+    }
+  }
+
   void _handlePolarH10Error(
     _ConnectedDeviceSession session,
     PolarH10ErrorEvent event,
@@ -2159,7 +2235,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       ..polarStatus = PolarH10Status.error
       ..errorMessage = event.message
       ..polarStreamsStarted = false
+      ..latestPolarAccelerometerSamplingRateHz = null
       ..isConnected = false;
+    session.polarAccelerometerSamples.clear();
     if (_acquisitionStarted && !_isStopping && !session.disconnectedDuringAcquisition) {
       _markSessionDisconnectedDuringAcquisition(session);
       session.reconnectFailureMessage = event.message;
@@ -3772,6 +3850,9 @@ class _MultiDeviceAcquisitionPageState
       status: session.polarStatus,
       latestHrSample: session.latestPolarHrSample,
       ecgSamples: session.polarEcgSamples,
+      accelerometerSamples: session.polarAccelerometerSamples,
+      accelerometerSamplingRateHz:
+          session.latestPolarAccelerometerSamplingRateHz,
       batteryPercent: session.latestPolarBatteryPercent,
     );
   }

@@ -41,6 +41,12 @@ class _PolarH10ConfigurationPageState extends State<PolarH10ConfigurationPage> {
     });
   }
 
+  void _setAccelerometerEnabled(bool value) {
+    setState(() {
+      _configuration = _configuration.copyWith(accelerometerEnabled: value);
+    });
+  }
+
   void _confirm() {
     if (!_configuration.isValid) {
       return;
@@ -86,6 +92,12 @@ class _PolarH10ConfigurationPageState extends State<PolarH10ConfigurationPage> {
                           title: const Text('Raw ECG'),
                           value: _configuration.rawEcgEnabled,
                           onChanged: _setRawEcgEnabled,
+                        ),
+                        const Divider(height: 1),
+                        SwitchListTile(
+                          title: const Text('Accelerometer'),
+                          value: _configuration.accelerometerEnabled,
+                          onChanged: _setAccelerometerEnabled,
                         ),
                       ],
                     ),

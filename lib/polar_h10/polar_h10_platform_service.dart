@@ -14,7 +14,7 @@ class PolarH10PlatformService {
   static final DateTime _polarTimestampEpochUtc = DateTime.utc(2000);
   static final DateTime _minimumReasonablePolarTimestampUtc =
       DateTime.utc(2020);
-  static const Duration _maximumEcgTimestampReceptionSkew = Duration(hours: 12);
+  static const Duration _maximumPolarTimestampReceptionSkew = Duration(hours: 12);
 
   static const MethodChannel _controlChannel =
       MethodChannel('app_lares/polar_h10_control');
@@ -83,7 +83,9 @@ class PolarH10PlatformService {
       throw UnsupportedError('Polar H10 acquisition is implemented on Android only.');
     }
     if (!configuration.isValid) {
-      throw ArgumentError('Select HR, Raw ECG, or both before continuing.');
+      throw ArgumentError(
+        'Select HR, Raw ECG, or Accelerometer before continuing.',
+      );
     }
 
     await _controlChannel.invokeMethod<void>(method, {
@@ -91,6 +93,7 @@ class PolarH10PlatformService {
       'configuration': {
         'hrEnabled': configuration.hrEnabled,
         'rawEcgEnabled': configuration.rawEcgEnabled,
+        'accelerometerEnabled': configuration.accelerometerEnabled,
       },
     });
   }
@@ -113,6 +116,11 @@ class PolarH10PlatformService {
           ),
         ),
       'ecg' => PolarH10EcgSamplesEvent(_parseEcgSamples(raw)),
+      'accelerometer' => PolarH10AccelerometerSamplesEvent(
+          samples: _parseAccelerometerSamples(raw),
+          samplingRateHz:
+              (_asInt(raw['samplingRateHz']) ?? 1).clamp(1, 1000).toInt(),
+        ),
       'battery' => PolarH10BatteryLevelEvent(_asInt(raw['level']) ?? 0),
       'error' => PolarH10ErrorEvent(
           code: raw['code']?.toString() ?? 'POLAR_H10_ERROR',
@@ -131,6 +139,7 @@ class PolarH10PlatformService {
       'connected' => PolarH10Status.connected,
       'streamingHr' => PolarH10Status.streamingHr,
       'streamingEcg' => PolarH10Status.streamingEcg,
+      'streamingAccelerometer' => PolarH10Status.streamingAccelerometer,
       'streaming' => PolarH10Status.streaming,
       'reconnecting' => PolarH10Status.reconnecting,
       'error' => PolarH10Status.error,
@@ -187,6 +196,59 @@ class PolarH10PlatformService {
     );
   }
 
+  List<PolarH10AccelerometerSample> _parseAccelerometerSamples(
+    Map<Object?, Object?> raw,
+  ) {
+    final rawSamples = raw['samples'];
+    if (rawSamples is! List || rawSamples.isEmpty) {
+      return const [];
+    }
+
+    final receivedAt = _dateTimeFromMillis(raw['receivedAtMillis']);
+    final samplingRateHz =
+        (_asNum(raw['samplingRateHz']) ?? 1).clamp(1, 1000).toDouble();
+    final intervalUs = (Duration.microsecondsPerSecond / samplingRateHz).round();
+    final firstDisplaySampleUs =
+        receivedAt.microsecondsSinceEpoch - intervalUs * (rawSamples.length - 1);
+
+    return [
+      for (var index = 0; index < rawSamples.length; index += 1)
+        _parseSingleAccelerometerSample(
+          rawSamples[index],
+          receivedAt: receivedAt,
+          displayTimestamp: DateTime.fromMicrosecondsSinceEpoch(
+            firstDisplaySampleUs + intervalUs * index,
+          ),
+        ),
+    ];
+  }
+
+  PolarH10AccelerometerSample _parseSingleAccelerometerSample(
+    Object? rawSample, {
+    required DateTime receivedAt,
+    required DateTime displayTimestamp,
+  }) {
+    final sample = rawSample is Map
+        ? Map<Object?, Object?>.from(rawSample)
+        : const <Object?, Object?>{};
+    final sdkTimestamp = _asInt(sample['sdkTimestamp']);
+    final sampleTimestamp = _dateTimeFromPolarSdkTimestamp(
+      sdkTimestamp,
+      receivedAt: receivedAt,
+    );
+
+    return PolarH10AccelerometerSample(
+      sampleTimestamp: sampleTimestamp ?? receivedAt,
+      receivedAt: receivedAt,
+      displayTimestamp: displayTimestamp,
+      xMilliG: _asInt(sample['x']) ?? 0,
+      yMilliG: _asInt(sample['y']) ?? 0,
+      zMilliG: _asInt(sample['z']) ?? 0,
+      sdkTimestamp: sdkTimestamp,
+      timestampFallbackUsed: sampleTimestamp == null,
+    );
+  }
+
   DateTime? _dateTimeFromPolarSdkTimestamp(
     int? sdkTimestamp, {
     required DateTime receivedAt,
@@ -195,19 +257,19 @@ class PolarH10PlatformService {
       return null;
     }
 
-    // Polar SDK ECG sample timestamps are nanoseconds since the Polar epoch.
+    // Polar SDK sample timestamps are nanoseconds since the Polar epoch.
     final microsecondsSincePolarEpoch = sdkTimestamp ~/ 1000;
     final candidate = _polarTimestampEpochUtc.add(
       Duration(microseconds: microsecondsSincePolarEpoch),
     );
-    if (!_isReasonableEcgSampleTimestamp(candidate, receivedAt)) {
+    if (!_isReasonablePolarSampleTimestamp(candidate, receivedAt)) {
       return null;
     }
 
     return candidate;
   }
 
-  bool _isReasonableEcgSampleTimestamp(
+  bool _isReasonablePolarSampleTimestamp(
     DateTime candidate,
     DateTime receivedAt,
   ) {
@@ -216,7 +278,7 @@ class PolarH10PlatformService {
     }
 
     final skew = candidate.difference(receivedAt.toUtc()).abs();
-    return skew <= _maximumEcgTimestampReceptionSkew;
+    return skew <= _maximumPolarTimestampReceptionSkew;
   }
 
   DateTime _dateTimeFromMillis(Object? value) {

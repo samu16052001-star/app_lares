@@ -4,6 +4,7 @@ enum PolarH10Status {
   connected,
   streamingHr,
   streamingEcg,
+  streamingAccelerometer,
   streaming,
   reconnecting,
   error,
@@ -17,7 +18,8 @@ extension PolarH10StatusLabel on PolarH10Status {
       PolarH10Status.connected => 'Connected',
       PolarH10Status.streamingHr => 'Streaming HR',
       PolarH10Status.streamingEcg => 'Streaming ECG',
-      PolarH10Status.streaming => 'Streaming HR + ECG',
+      PolarH10Status.streamingAccelerometer => 'Streaming Accelerometer',
+      PolarH10Status.streaming => 'Streaming',
       PolarH10Status.reconnecting => 'Reconnecting',
       PolarH10Status.error => 'Error',
     };
@@ -83,6 +85,38 @@ class PolarH10EcgSample {
   final DateTime displayTimestamp;
 
   final int ecgMicrovolts;
+  final int? sdkTimestamp;
+
+  /// True when sampleTimestamp fell back to receivedAt because the Polar
+  /// SDK/device timestamp was missing or invalid.
+  final bool timestampFallbackUsed;
+}
+
+class PolarH10AccelerometerSample {
+  const PolarH10AccelerometerSample({
+    required this.sampleTimestamp,
+    required this.receivedAt,
+    required this.displayTimestamp,
+    required this.xMilliG,
+    required this.yMilliG,
+    required this.zMilliG,
+    this.sdkTimestamp,
+    this.timestampFallbackUsed = false,
+  });
+
+  /// Polar SDK/device ACC sample timestamp. Used for CSV logging.
+  final DateTime sampleTimestamp;
+
+  /// Phone timestamp when the ACC SDK event/batch was received.
+  final DateTime receivedAt;
+
+  /// Phone-based reconstructed timestamp used only for live ACC charting.
+  /// This timestamp must not be used for CSV logging.
+  final DateTime displayTimestamp;
+
+  final int xMilliG;
+  final int yMilliG;
+  final int zMilliG;
   final int? sdkTimestamp;
 
   /// True when sampleTimestamp fell back to receivedAt because the Polar

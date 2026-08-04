@@ -22,6 +22,7 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -52,6 +53,8 @@ class PolarH10Manager(
     private var activeDeviceInfo: PolarDeviceInfo? = null
     private var activeDisplayName: String? = null
     private var cachedEcgSettings: PolarSensorSetting? = null
+    private var cachedAccelerometerSettings: PolarSensorSetting? = null
+    private var cachedAccelerometerSampleRateHz: Int? = null
     private var connectionWaiter: CompletableDeferred<PolarDeviceInfo>? = null
     private var connectionSelection: PolarDeviceSelection? = null
     private var connectionIdentifier: String? = null
@@ -60,6 +63,7 @@ class PolarH10Manager(
 
     private var hrJob: Job? = null
     private var ecgJob: Job? = null
+    private var accelerometerJob: Job? = null
     private var apiInstance: PolarBleApi? = null
 
     private val api: PolarBleApi
@@ -131,7 +135,11 @@ class PolarH10Manager(
 
             activeDeviceInfo = null
             activeIdentifier = null
+            accelerometerJob?.cancel()
+            accelerometerJob = null
             cachedEcgSettings = null
+            cachedAccelerometerSettings = null
+            cachedAccelerometerSampleRateHz = null
             if (!stopping.get()) {
                 sendConnection("disconnected", polarDeviceInfo)
             }
@@ -267,13 +275,15 @@ class PolarH10Manager(
         if (!configuration.isValid) {
             throw PolarH10BridgeException(
                 "POLAR_H10_INVALID_CONFIGURATION",
-                "Select HR, Raw ECG, or both before continuing."
+                "Select HR, Raw ECG, or Accelerometer before continuing."
             )
         }
 
         ensureBluetoothPermissions()
         selectedDevice = selection
         cachedEcgSettings = null
+        cachedAccelerometerSettings = null
+        cachedAccelerometerSampleRateHz = null
         sendStatus("preparing")
 
         val deviceInfo = connectToSelectedDevice(selection)
@@ -293,9 +303,20 @@ class PolarH10Manager(
         if (configuration.rawEcgEnabled) {
             waitForFeature(
                 identifier,
-                PolarBleApi.PolarBleSdkFeature.FEATURE_POLAR_ONLINE_STREAMING
+                PolarBleApi.PolarBleSdkFeature.FEATURE_POLAR_ONLINE_STREAMING,
+                "Raw ECG"
             )
             cachedEcgSettings = prepareEcgSettings(identifier)
+        }
+        if (configuration.accelerometerEnabled) {
+            waitForFeature(
+                identifier,
+                PolarBleApi.PolarBleSdkFeature.FEATURE_POLAR_ONLINE_STREAMING,
+                "Accelerometer"
+            )
+            val accelerometerSettings = prepareAccelerometerSettings(identifier)
+            cachedAccelerometerSettings = accelerometerSettings.settings
+            cachedAccelerometerSampleRateHz = accelerometerSettings.samplingRateHz
         }
 
         sendBatteryLevelIfAvailable(identifier)
@@ -309,7 +330,7 @@ class PolarH10Manager(
         if (!configuration.isValid) {
             throw PolarH10BridgeException(
                 "POLAR_H10_INVALID_CONFIGURATION",
-                "Select HR, Raw ECG, or both before continuing."
+                "Select HR, Raw ECG, or Accelerometer before continuing."
             )
         }
 
@@ -334,6 +355,9 @@ class PolarH10Manager(
         if (configuration.rawEcgEnabled) {
             startEcgStream(streamIdentifier)
         }
+        if (configuration.accelerometerEnabled) {
+            startAccelerometerStream(streamIdentifier)
+        }
 
         sendStatus(streamingStatus(configuration))
     }
@@ -352,14 +376,17 @@ class PolarH10Manager(
         activeIdentifier = null
         activeDeviceInfo = null
         cachedEcgSettings = null
+        cachedAccelerometerSettings = null
+        cachedAccelerometerSampleRateHz = null
         sendStatus("disconnected")
         stopping.set(false)
     }
 
     private suspend fun stopStreamsOnly() {
-        val jobs = listOfNotNull(hrJob, ecgJob)
+        val jobs = listOfNotNull(hrJob, ecgJob, accelerometerJob)
         hrJob = null
         ecgJob = null
+        accelerometerJob = null
         for (job in jobs) {
             job.cancelAndJoin()
         }
@@ -371,6 +398,10 @@ class PolarH10Manager(
             }
             try {
                 api.stopStreaming(identifier, PmdMeasurementType.ECG)
+            } catch (_: Exception) {
+            }
+            try {
+                api.stopStreaming(identifier, PmdMeasurementType.ACC)
             } catch (_: Exception) {
             }
         }
@@ -491,7 +522,8 @@ class PolarH10Manager(
 
     private suspend fun waitForFeature(
         identifier: String,
-        feature: PolarBleApi.PolarBleSdkFeature
+        feature: PolarBleApi.PolarBleSdkFeature,
+        streamNameOverride: String? = null
     ) {
         if (api.isFeatureReady(identifier, feature)) {
             return
@@ -505,10 +537,12 @@ class PolarH10Manager(
             }
         } catch (error: TimeoutCancellationException) {
             featureWaiters.remove(feature)
-            val streamName = if (feature == PolarBleApi.PolarBleSdkFeature.FEATURE_HR) {
+            val streamName = streamNameOverride ?: if (
+                feature == PolarBleApi.PolarBleSdkFeature.FEATURE_HR
+            ) {
                 "HR"
             } else {
-                "Raw ECG"
+                "Polar online streaming"
             }
             throw PolarH10BridgeException(
                 "POLAR_H10_STREAM_UNAVAILABLE",
@@ -558,6 +592,61 @@ class PolarH10Manager(
         }
     }
 
+    private suspend fun prepareAccelerometerSettings(
+        identifier: String
+    ): AccelerometerStreamSettings {
+        try {
+            val dataTypes = api.getAvailableOnlineStreamDataTypes(identifier)
+            if (!dataTypes.contains(PolarBleApi.PolarDeviceDataType.ACC)) {
+                throw PolarH10BridgeException(
+                    "POLAR_H10_ACC_UNAVAILABLE",
+                    "Accelerometer stream is not supported or unavailable on this Polar H10."
+                )
+            }
+
+            val availableSettings = api.requestStreamSettings(
+                identifier,
+                PolarBleApi.PolarDeviceDataType.ACC
+            )
+            val sampleRates =
+                availableSettings.settings[PolarSensorSetting.SettingType.SAMPLE_RATE]
+                    ?: emptySet()
+            val minimumSampleRate = sampleRates.minOrNull()
+                ?: throw PolarH10BridgeException(
+                    "POLAR_H10_ACC_STREAM_FAILED",
+                    "Accelerometer stream has no valid sample-rate setting on this Polar H10."
+                )
+            val selectedValues =
+                mutableMapOf<PolarSensorSetting.SettingType, Int>()
+            for ((settingType, settingValues) in availableSettings.maxSettings().settings) {
+                val selectedValue =
+                    if (settingType == PolarSensorSetting.SettingType.SAMPLE_RATE) {
+                        minimumSampleRate
+                    } else {
+                        settingValues.maxOrNull()
+                            ?: throw PolarH10BridgeException(
+                                "POLAR_H10_ACC_STREAM_FAILED",
+                                "Accelerometer stream has incomplete settings on this Polar H10."
+                            )
+                    }
+                selectedValues[settingType] = selectedValue
+            }
+            selectedValues[PolarSensorSetting.SettingType.SAMPLE_RATE] = minimumSampleRate
+
+            return AccelerometerStreamSettings(
+                settings = PolarSensorSetting(selectedValues),
+                samplingRateHz = minimumSampleRate
+            )
+        } catch (error: PolarH10BridgeException) {
+            throw error
+        } catch (error: Exception) {
+            throw PolarH10BridgeException(
+                "POLAR_H10_ACC_STREAM_FAILED",
+                "Accelerometer stream failed. Make sure another app is not connected to the Polar H10."
+            )
+        }
+    }
+
     private fun sendBatteryLevelIfAvailable(identifier: String) {
         try {
             val level = api.getBatteryLevel(identifier)
@@ -591,6 +680,8 @@ class PolarH10Manager(
                         )
                     }
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
                 failActiveStreams(
                     "POLAR_H10_HR_STREAM_FAILED",
@@ -633,10 +724,60 @@ class PolarH10Manager(
                         )
                     }
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Exception) {
                 failActiveStreams(
                     "POLAR_H10_ECG_STREAM_FAILED",
                     "Raw ECG stream failed. Make sure another app is not connected to the Polar H10."
+                )
+            }
+        }
+    }
+
+    private suspend fun startAccelerometerStream(identifier: String) {
+        val preparedSettings = cachedAccelerometerSettings?.let { settings ->
+            AccelerometerStreamSettings(
+                settings = settings,
+                samplingRateHz = cachedAccelerometerSampleRateHz
+                    ?: settings.settings[PolarSensorSetting.SettingType.SAMPLE_RATE]
+                        ?.minOrNull()
+                    ?: 1
+            )
+        } ?: prepareAccelerometerSettings(identifier).also { prepared ->
+            cachedAccelerometerSettings = prepared.settings
+            cachedAccelerometerSampleRateHz = prepared.samplingRateHz
+        }
+        accelerometerJob = scope.launch(Dispatchers.Default) {
+            try {
+                api.startAccStreaming(identifier, preparedSettings.settings).collect { data ->
+                    val samples = data.samples.map { sample ->
+                        mapOf(
+                            "x" to sample.x,
+                            "y" to sample.y,
+                            "z" to sample.z,
+                            "sdkTimestamp" to sample.timeStamp
+                        )
+                    }
+                    if (samples.isNotEmpty()) {
+                        sendEvent(
+                            mapOf(
+                                "type" to "accelerometer",
+                                "deviceId" to activeIdentifier,
+                                "deviceName" to activeDisplayName,
+                                "receivedAtMillis" to System.currentTimeMillis(),
+                                "samplingRateHz" to preparedSettings.samplingRateHz,
+                                "samples" to samples
+                            )
+                        )
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                failActiveStreams(
+                    "POLAR_H10_ACC_STREAM_FAILED",
+                    "Accelerometer stream failed. Make sure another app is not connected to the Polar H10."
                 )
             }
         }
@@ -649,17 +790,28 @@ class PolarH10Manager(
 
         hrJob?.cancel()
         ecgJob?.cancel()
+        accelerometerJob?.cancel()
         hrJob = null
         ecgJob = null
+        accelerometerJob = null
+        cachedEcgSettings = null
+        cachedAccelerometerSettings = null
+        cachedAccelerometerSampleRateHz = null
         sendStatus("error", message)
         sendError(code, message)
     }
 
     private fun streamingStatus(configuration: PolarConfiguration): String {
+        val streamCount = listOf(
+            configuration.hrEnabled,
+            configuration.rawEcgEnabled,
+            configuration.accelerometerEnabled
+        ).count { it }
         return when {
-            configuration.hrEnabled && configuration.rawEcgEnabled -> "streaming"
+            streamCount > 1 -> "streaming"
             configuration.hrEnabled -> "streamingHr"
             configuration.rawEcgEnabled -> "streamingEcg"
+            configuration.accelerometerEnabled -> "streamingAccelerometer"
             else -> "connected"
         }
     }
@@ -802,17 +954,25 @@ class PolarH10Manager(
             )
         return PolarConfiguration(
             hrEnabled = rawConfiguration["hrEnabled"] as? Boolean ?: true,
-            rawEcgEnabled = rawConfiguration["rawEcgEnabled"] as? Boolean ?: true
+            rawEcgEnabled = rawConfiguration["rawEcgEnabled"] as? Boolean ?: true,
+            accelerometerEnabled =
+                rawConfiguration["accelerometerEnabled"] as? Boolean ?: false
         )
     }
 
     private data class PolarConfiguration(
         val hrEnabled: Boolean = false,
-        val rawEcgEnabled: Boolean = false
+        val rawEcgEnabled: Boolean = false,
+        val accelerometerEnabled: Boolean = false
     ) {
         val isValid: Boolean
-            get() = hrEnabled || rawEcgEnabled
+            get() = hrEnabled || rawEcgEnabled || accelerometerEnabled
     }
+
+    private data class AccelerometerStreamSettings(
+        val settings: PolarSensorSetting,
+        val samplingRateHz: Int
+    )
 
     private data class PolarDeviceSelection(
         val deviceId: String,

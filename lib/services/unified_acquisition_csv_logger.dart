@@ -179,6 +179,39 @@ class UnifiedAcquisitionCsvLogger {
     });
   }
 
+  Future<void> appendPolarAccelerometerSamples({
+    required String deviceName,
+    required List<String> gpsCoordinatesBySample,
+    required List<PolarH10AccelerometerSample> samples,
+  }) {
+    return _enqueue(() async {
+      final sink = _sink;
+      if (!_isStarted || _isStopped || sink == null || samples.isEmpty) {
+        return;
+      }
+
+      for (var index = 0; index < samples.length; index += 1) {
+        final sample = samples[index];
+        final gpsCoordinates = index < gpsCoordinatesBySample.length
+            ? gpsCoordinatesBySample[index]
+            : 'NA';
+        sink.writeln(
+          [
+            _escapeCsvField(_formatWearableTimestamp(sample.sampleTimestamp)),
+            _escapeCsvField(_polarDeviceName(deviceName)),
+            _escapeCsvField(
+              'ACC_x=${sample.xMilliG},'
+              'ACC_y=${sample.yMilliG},'
+              'ACC_z=${sample.zMilliG}',
+            ),
+            _escapeCsvField(gpsCoordinates),
+          ].join(';'),
+        );
+      }
+      await sink.flush();
+    });
+  }
+
   Future<void> stop() async {
     if (_isStopped) {
       return;
