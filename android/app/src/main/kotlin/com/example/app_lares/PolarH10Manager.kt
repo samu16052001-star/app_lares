@@ -55,6 +55,7 @@ class PolarH10Manager(
     private var cachedEcgSettings: PolarSensorSetting? = null
     private var cachedAccelerometerSettings: PolarSensorSetting? = null
     private var cachedAccelerometerSampleRateHz: Int? = null
+    private var sdkModeEnabledForActiveSession = false
     private var connectionWaiter: CompletableDeferred<PolarDeviceInfo>? = null
     private var connectionSelection: PolarDeviceSelection? = null
     private var connectionIdentifier: String? = null
@@ -140,6 +141,7 @@ class PolarH10Manager(
             cachedEcgSettings = null
             cachedAccelerometerSettings = null
             cachedAccelerometerSampleRateHz = null
+            sdkModeEnabledForActiveSession = false
             if (!stopping.get()) {
                 sendConnection("disconnected", polarDeviceInfo)
             }
@@ -300,6 +302,11 @@ class PolarH10Manager(
             waitForFeature(identifier, PolarBleApi.PolarBleSdkFeature.FEATURE_HR)
             ensureHrAvailable(identifier)
         }
+        if (configuration.requiresSdkModeForPmdCombination) {
+            enableSdkModeIfNeeded(identifier)
+        } else {
+            disableSdkModeIfEnabled(identifier)
+        }
         if (configuration.rawEcgEnabled) {
             waitForFeature(
                 identifier,
@@ -366,6 +373,7 @@ class PolarH10Manager(
         stopping.set(true)
         stopStreamsOnly()
         val identifier = activeIdentifier
+        disableSdkModeIfEnabled(identifier)
         if (disconnect && identifier != null) {
             try {
                 api.disconnectFromDevice(identifier)
@@ -378,6 +386,7 @@ class PolarH10Manager(
         cachedEcgSettings = null
         cachedAccelerometerSettings = null
         cachedAccelerometerSampleRateHz = null
+        sdkModeEnabledForActiveSession = false
         sendStatus("disconnected")
         stopping.set(false)
     }
@@ -589,6 +598,41 @@ class PolarH10Manager(
                 "POLAR_H10_ECG_STREAM_FAILED",
                 "Raw ECG stream failed. Make sure another app is not connected to the Polar H10."
             )
+        }
+    }
+
+    private suspend fun enableSdkModeIfNeeded(identifier: String) {
+        waitForFeature(
+            identifier,
+            PolarBleApi.PolarBleSdkFeature.FEATURE_POLAR_SDK_MODE,
+            "Polar SDK mode"
+        )
+        try {
+            val wasAlreadyEnabled = api.isSDKModeEnabled(identifier)
+            if (!wasAlreadyEnabled) {
+                api.enableSDKMode(identifier)
+                sdkModeEnabledForActiveSession = true
+            }
+        } catch (error: Exception) {
+            throw PolarH10BridgeException(
+                "POLAR_H10_SDK_MODE_FAILED",
+                "Polar H10 SDK mode could not be enabled for simultaneous ECG and accelerometer streaming."
+            )
+        }
+    }
+
+    private suspend fun disableSdkModeIfEnabled(identifier: String?) {
+        if (!sdkModeEnabledForActiveSession || identifier == null) {
+            return
+        }
+
+        try {
+            if (api.isSDKModeEnabled(identifier)) {
+                api.disableSDKMode(identifier)
+            }
+        } catch (_: Exception) {
+        } finally {
+            sdkModeEnabledForActiveSession = false
         }
     }
 
@@ -967,6 +1011,9 @@ class PolarH10Manager(
     ) {
         val isValid: Boolean
             get() = hrEnabled || rawEcgEnabled || accelerometerEnabled
+
+        val requiresSdkModeForPmdCombination: Boolean
+            get() = rawEcgEnabled && accelerometerEnabled
     }
 
     private data class AccelerometerStreamSettings(
