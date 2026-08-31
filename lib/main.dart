@@ -1201,6 +1201,25 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     );
   }
 
+  static const _openRemoteAttributeByEnvironmentalPrefix = <String, String>{
+    'PM10': 'PM10',
+    'CO2': 'CO2',
+    'CO': 'CO',
+    'PM2.5': 'PM25',
+    'TEM1': 'InternalTemperature',
+    'HUM1': 'InternalHumidity',
+    'VOC': 'VOC',
+    'NOX': 'NOX',
+    'VOCi': 'VOCindex',
+    'NOXi': 'NOXindex',
+    'NH3': 'NH3',
+    'NO2': 'NO2',
+    'PM1.0': 'PM1',
+    'TEM2': 'ExternalTemperature',
+    'HUM2': 'ExternalHumidity',
+    'PRE': 'Pressure',
+  };
+
   final List<_ConnectedDeviceSession> _sessions = [];
   final UnifiedAcquisitionCsvLogger csvLogger = UnifiedAcquisitionCsvLogger();
   final GpsLocationService gpsLocationService = GpsLocationService();
@@ -2281,7 +2300,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       ),
     );
     if (canUseOpenRemote) {
-      unawaited(_publishPm10IfConnected(session, message.value));
+      unawaited(
+        _publishOpenRemoteMeasurementIfConnected(session, message.value),
+      );
     }
     notifyListeners();
   }
@@ -2329,7 +2350,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
   }
 
-  Future<void> _publishPm10IfConnected(
+  Future<void> _publishOpenRemoteMeasurementIfConnected(
     _ConnectedDeviceSession session,
     String bleValue,
   ) async {
@@ -2337,14 +2358,32 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
-    final pm10 = parsePm10Value(bleValue);
-    if (pm10 == null) {
+    final separatorIndex = bleValue.indexOf(':');
+    if (separatorIndex <= 0) {
       return;
     }
 
-    final sent = await mqttService.publishPm10(pm10);
+    final prefix = bleValue.substring(0, separatorIndex).trim();
+    final attribute = _openRemoteAttributeByEnvironmentalPrefix[prefix];
+    if (attribute == null) {
+      return;
+    }
+
+    final rawValue = bleValue.substring(separatorIndex + 1).trim();
+    final value = double.tryParse(rawValue);
+    if (value == null || !value.isFinite) {
+      return;
+    }
+
+    final sent = await mqttService.publishAttributeValue(
+      attribute: attribute,
+      value: value,
+    );
     if (sent) {
-      _appendEnvironmentalLog(session, 'MQTT sent - PM10: ${_formatPm10(pm10)}');
+      _appendEnvironmentalLog(
+        session,
+        'MQTT sent - $prefix: ${_formatMqttNumber(value)}',
+      );
     }
   }
 
@@ -2360,7 +2399,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     );
   }
 
-  String _formatPm10(double value) {
+  String _formatMqttNumber(double value) {
     if (value == value.truncateToDouble()) {
       return value.toInt().toString();
     }

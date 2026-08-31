@@ -69,7 +69,14 @@ class OpenRemoteMqttService {
     await _connectOnce(manualAttempt: true);
   }
 
-  Future<bool> publishPm10(double value) async {
+  Future<bool> publishPm10(double value) {
+    return publishAttributeValue(attribute: 'PM10', value: value);
+  }
+
+  Future<bool> publishAttributeValue({
+    required String attribute,
+    required double value,
+  }) async {
     final client = _client;
     final config = _config;
 
@@ -82,7 +89,7 @@ class OpenRemoteMqttService {
 
     try {
       client.publishMessage(
-        config.topic,
+        config.topicForAttribute(attribute),
         MqttQos.atMostOnce,
         payload.payload!,
         retain: false,
@@ -434,6 +441,9 @@ class _OpenRemoteMqttConfig {
   final String attribute;
 
   String get topic =>
+      topicForAttribute(attribute);
+
+  String topicForAttribute(String attribute) =>
       '$realm/$clientId/writeattributevalue/$attribute/$assetId';
 
   static Future<_OpenRemoteMqttConfig> load() async {
