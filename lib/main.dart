@@ -23,6 +23,7 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart' show Position;
 import 'package:permission_handler/permission_handler.dart';
 
 Future<void> main() async {
@@ -1228,6 +1229,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   final Set<String> _dismissedBleAutoReconnectAlertKeys = {};
 
   StreamSubscription<OpenRemoteMqttState>? _mqttStateSubscription;
+  StreamSubscription<Position>? _openRemoteLocationSubscription;
   OpenRemoteMqttState mqttState = const OpenRemoteMqttState(
     status: OpenRemoteMqttStatus.disconnected,
   );
@@ -1235,6 +1237,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   bool _acquisitionStarted = false;
   bool _isStopping = false;
   bool _disposed = false;
+  bool _openRemoteLocationConnectionPending = false;
+  bool _openRemoteLocationAuthorized = false;
   bool _foregroundServiceStarted = false;
   DateTime? _startedAt;
   String? backgroundStatusMessage;
@@ -1308,6 +1312,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     _sessions.add(session);
+    if (!canUseOpenRemote) {
+      _invalidateOpenRemoteLocationAuthorization();
+    }
     if (!session.isPolarManaged) {
       _attachConnectionListener(session);
     }
@@ -1315,6 +1322,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   Future<void> disconnectAndRemove(_ConnectedDeviceSession session) async {
+    _invalidateOpenRemoteLocationAuthorization();
     await session.cancelConnectionSubscription();
     await session.cancelLiveSubscriptions();
     try {
@@ -1366,8 +1374,12 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     _initializationStarted = true;
+    _invalidateOpenRemoteLocationAuthorization();
     await csvLogger.start();
     await gpsLocationService.start();
+    _openRemoteLocationSubscription ??= gpsLocationService.livePositions.listen(
+      _handleOpenRemoteLivePosition,
+    );
     final gpsStatusMessage = gpsLocationService.statusMessage;
     if (gpsStatusMessage != null) {
       backgroundStatusMessage = _mergeStatusMessage(
@@ -1379,6 +1391,12 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (canUseOpenRemote) {
       _mqttStateSubscription = mqttService.states.listen((state) {
         mqttState = state;
+        if (state.status == OpenRemoteMqttStatus.connected) {
+          _completePendingOpenRemoteLocationAuthorization();
+        } else if (state.status == OpenRemoteMqttStatus.failed ||
+            state.status == OpenRemoteMqttStatus.disconnected) {
+          _openRemoteLocationConnectionPending = false;
+        }
         if (state.status == OpenRemoteMqttStatus.failed &&
             state.message != null &&
             _sessions.isNotEmpty) {
@@ -1440,7 +1458,36 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    _openRemoteLocationConnectionPending =
+        !_disposed && _acquisitionStarted && !_isStopping;
     await mqttService.connect();
+    if (mqttService.isConnected) {
+      _completePendingOpenRemoteLocationAuthorization();
+    } else {
+      _openRemoteLocationConnectionPending = false;
+    }
+  }
+
+  void _completePendingOpenRemoteLocationAuthorization() {
+    if (!_openRemoteLocationConnectionPending) {
+      return;
+    }
+
+    _openRemoteLocationConnectionPending = false;
+    if (_disposed ||
+        !_acquisitionStarted ||
+        _isStopping ||
+        !canUseOpenRemote ||
+        !mqttService.isConnected) {
+      return;
+    }
+
+    _openRemoteLocationAuthorized = true;
+  }
+
+  void _invalidateOpenRemoteLocationAuthorization() {
+    _openRemoteLocationConnectionPending = false;
+    _openRemoteLocationAuthorized = false;
   }
 
   Future<void> refreshAfterResume() async {
@@ -1696,7 +1743,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     _bleAutoReconnectCoordinator.cancel();
     _isStopping = true;
+    _invalidateOpenRemoteLocationAuthorization();
     notifyListeners();
+
+    await _openRemoteLocationSubscription?.cancel();
+    _openRemoteLocationSubscription = null;
 
     for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
       await session.cancelLiveSubscriptions();
@@ -1763,7 +1814,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     _disposed = true;
+    _invalidateOpenRemoteLocationAuthorization();
     _bleAutoReconnectCoordinator.cancel();
+    await _openRemoteLocationSubscription?.cancel();
+    _openRemoteLocationSubscription = null;
     for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
       await session.cancelConnectionSubscription();
       await session.cancelLiveSubscriptions();
@@ -1868,6 +1922,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
             _sessions.removeWhere(
               (candidate) => candidate.deviceId == session.deviceId,
             );
+            _invalidateOpenRemoteLocationAuthorization();
           }
         }
         notifyListeners();
@@ -2281,6 +2336,49 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         session.polarUiRefreshTimer = null;
         session.lastPolarUiRefreshAt = DateTime.now();
         notifyListeners();
+      },
+    );
+  }
+
+  void _handleOpenRemoteLivePosition(Position position) {
+    if (_disposed ||
+        !_acquisitionStarted ||
+        _isStopping ||
+        !_openRemoteLocationAuthorized ||
+        !canUseOpenRemote ||
+        !_sessions.first.isConnected ||
+        !mqttService.isConnected) {
+      return;
+    }
+
+    final longitude = position.longitude;
+    final latitude = position.latitude;
+    if (!longitude.isFinite ||
+        !latitude.isFinite ||
+        longitude < -180 ||
+        longitude > 180 ||
+        latitude < -90 ||
+        latitude > 90) {
+      return;
+    }
+
+    unawaited(
+      _publishOpenRemoteLocation(
+        longitude: longitude,
+        latitude: latitude,
+      ),
+    );
+  }
+
+  Future<void> _publishOpenRemoteLocation({
+    required double longitude,
+    required double latitude,
+  }) async {
+    await mqttService.publishJsonAttributeValue(
+      attribute: 'location',
+      value: <String, Object>{
+        'type': 'Point',
+        'coordinates': <double>[longitude, latitude],
       },
     );
   }

@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:geolocator/geolocator.dart';
 
 class GpsLocationService {
+  final StreamController<Position> _livePositionController =
+      StreamController<Position>.broadcast(sync: true);
   StreamSubscription<Position>? _positionSubscription;
   StreamSubscription<ServiceStatus>? _serviceStatusSubscription;
   Position? _latestPosition;
@@ -12,6 +14,8 @@ class GpsLocationService {
   String? _statusMessage;
 
   String? get statusMessage => _statusMessage;
+
+  Stream<Position> get livePositions => _livePositionController.stream;
 
   String get currentCoordinates {
     final position = _latestPosition;
@@ -67,6 +71,7 @@ class GpsLocationService {
 
   Future<void> dispose() async {
     await stop();
+    await _livePositionController.close();
   }
 
   Future<bool> _ensurePermission() async {
@@ -118,6 +123,7 @@ class GpsLocationService {
     ).listen(
       (position) {
         _latestPosition = position;
+        _livePositionController.add(position);
       },
       onError: (_) {
         _latestPosition = null;

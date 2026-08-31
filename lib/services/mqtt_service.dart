@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_dotenv/flutter_dotenv.dart';
@@ -76,6 +77,26 @@ class OpenRemoteMqttService {
   Future<bool> publishAttributeValue({
     required String attribute,
     required double value,
+  }) {
+    return _publishAttributePayload(
+      attribute: attribute,
+      encodePayload: () => _formatJsonNumber(value),
+    );
+  }
+
+  Future<bool> publishJsonAttributeValue({
+    required String attribute,
+    required Object value,
+  }) {
+    return _publishAttributePayload(
+      attribute: attribute,
+      encodePayload: () => jsonEncode(value),
+    );
+  }
+
+  Future<bool> _publishAttributePayload({
+    required String attribute,
+    required String Function() encodePayload,
   }) async {
     final client = _client;
     final config = _config;
@@ -84,10 +105,8 @@ class OpenRemoteMqttService {
       return false;
     }
 
-    final payload = MqttClientPayloadBuilder()
-      ..addString(_formatJsonNumber(value));
-
     try {
+      final payload = MqttClientPayloadBuilder()..addString(encodePayload());
       client.publishMessage(
         config.topicForAttribute(attribute),
         MqttQos.atMostOnce,
