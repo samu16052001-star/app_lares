@@ -3,6 +3,10 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:app_lares/ble_configuration_service.dart';
+import 'package:app_lares/environmental_v2_ble_service.dart';
+import 'package:app_lares/environmental_v2_configuration.dart';
+import 'package:app_lares/environmental_v2_configuration_page.dart';
+import 'package:app_lares/environmental_v2_message_parser.dart';
 import 'package:app_lares/polar_h10/polar_h10_configuration.dart';
 import 'package:app_lares/polar_h10/polar_h10_configuration_page.dart';
 import 'package:app_lares/polar_h10/polar_h10_event.dart';
@@ -473,6 +477,7 @@ class AutomaticConfigurationPage extends StatelessWidget {
 
 enum KnownDeviceType {
   environmentalMonitor,
+  environmentalMonitorV2,
   respiratoryMonitor,
   polarH10,
   unsupported,
@@ -482,6 +487,7 @@ extension KnownDeviceTypeLabel on KnownDeviceType {
   String get label {
     return switch (this) {
       KnownDeviceType.environmentalMonitor => 'Environmental Monitor',
+      KnownDeviceType.environmentalMonitorV2 => 'Environmental Monitor V2',
       KnownDeviceType.respiratoryMonitor => 'Respiratory Monitor / IMU',
       KnownDeviceType.polarH10 => 'Polar H10',
       KnownDeviceType.unsupported => 'Unsupported device',
@@ -492,8 +498,15 @@ extension KnownDeviceTypeLabel on KnownDeviceType {
 class KnownDeviceClassifier {
   const KnownDeviceClassifier._();
 
+  static const String environmentalV2NamePrefix = 'LARES_ENV_V2';
+
   static KnownDeviceType fromNames(Iterable<String> names) {
-    final normalizedNames = names.map(_normalizeDeviceName);
+    final originalNames = names.toList(growable: false);
+    if (environmentalV2NameFrom(originalNames) != null) {
+      return KnownDeviceType.environmentalMonitorV2;
+    }
+
+    final normalizedNames = originalNames.map(_normalizeDeviceName);
 
     if (normalizedNames.any((name) => name.contains('env'))) {
       return KnownDeviceType.environmentalMonitor;
@@ -513,6 +526,18 @@ class KnownDeviceClassifier {
     }
 
     return KnownDeviceType.unsupported;
+  }
+
+  static String? environmentalV2NameFrom(Iterable<String> names) {
+    for (final name in names) {
+      final candidate = name.trim();
+      if (candidate.isNotEmpty &&
+          candidate.startsWith(environmentalV2NamePrefix)) {
+        return candidate;
+      }
+    }
+
+    return null;
   }
 
   static bool matchesSupportedFilter(Iterable<String> names) {
@@ -564,6 +589,12 @@ String _summarizeEnvironmentalConfiguration(BleConfiguration configuration) {
 
   return 'samplingFrequencySeconds=${configuration.samplingFrequencySeconds}; '
       'enabled=$enabledText';
+}
+
+String _summarizeEnvironmentalV2Configuration(
+  EnvironmentalV2Configuration configuration,
+) {
+  return configuration.summary;
 }
 
 String _summarizeWearableConfiguration(
@@ -769,6 +800,7 @@ class _BleReconnectHelper {
     required BluetoothDevice currentDevice,
     required String deviceId,
     required String deviceName,
+    bool requireUnambiguousEnvironmentalV2NameFallback = false,
   }) async {
     late final Object savedDeviceError;
 
@@ -781,6 +813,8 @@ class _BleReconnectHelper {
     final scannedDevice = await _scanForMatchingDevice(
       deviceId: deviceId,
       deviceName: deviceName,
+      requireUnambiguousEnvironmentalV2NameFallback:
+          requireUnambiguousEnvironmentalV2NameFallback,
     );
     if (scannedDevice == null) {
       throw savedDeviceError;
@@ -810,6 +844,7 @@ class _BleReconnectHelper {
   static Future<BluetoothDevice?> _scanForMatchingDevice({
     required String deviceId,
     required String deviceName,
+    required bool requireUnambiguousEnvironmentalV2NameFallback,
   }) async {
     final hasPermissions = await _requestBluetoothReconnectPermissions();
     if (!hasPermissions) {
@@ -821,6 +856,7 @@ class _BleReconnectHelper {
     } catch (_) {}
 
     BluetoothDevice? nameFallbackDevice;
+    final environmentalV2NameFallbackDevices = <String, BluetoothDevice>{};
     final idMatchCompleter = Completer<BluetoothDevice>();
     late final StreamSubscription<List<ScanResult>> scanSubscription;
 
@@ -834,7 +870,12 @@ class _BleReconnectHelper {
           return;
         }
 
-        if (nameFallbackDevice == null &&
+        if (requireUnambiguousEnvironmentalV2NameFallback) {
+          if (_scanResultMatchesEnvironmentalV2Name(result, deviceName)) {
+            environmentalV2NameFallbackDevices[_deviceId(resultDevice)] =
+                resultDevice;
+          }
+        } else if (nameFallbackDevice == null &&
             _scanResultMatchesName(result, deviceName)) {
           nameFallbackDevice = resultDevice;
         }
@@ -846,6 +887,11 @@ class _BleReconnectHelper {
       try {
         return await idMatchCompleter.future.timeout(_scanTimeout);
       } on TimeoutException {
+        if (requireUnambiguousEnvironmentalV2NameFallback) {
+          return environmentalV2NameFallbackDevices.length == 1
+              ? environmentalV2NameFallbackDevices.values.single
+              : null;
+        }
         return nameFallbackDevice;
       }
     } finally {
@@ -882,6 +928,18 @@ class _BleReconnectHelper {
 
     return _scanResultNameCandidates(result).any((name) {
       return _normalizeDeviceNameForReconnect(name) == expected;
+    });
+  }
+
+  static bool _scanResultMatchesEnvironmentalV2Name(
+    ScanResult result,
+    String deviceName,
+  ) {
+    return _scanResultNameCandidates(result).any((candidate) {
+      return candidate == deviceName &&
+          candidate.startsWith(
+            KnownDeviceClassifier.environmentalV2NamePrefix,
+          );
     });
   }
 
@@ -1079,12 +1137,16 @@ class _ConnectedDeviceSession {
   int? polarRssi;
 
   BleConfiguration? environmentalConfiguration;
+  EnvironmentalV2Configuration? environmentalV2Configuration;
   WearableDeviceConfiguration? wearableConfiguration;
   PolarH10Configuration? polarConfiguration;
   BleConfigurationService? environmentalService;
+  EnvironmentalV2BleService? environmentalV2Service;
   WearableConfigurationBleService? wearableService;
   StreamSubscription<BluetoothConnectionState>? connectionSubscription;
   StreamSubscription<BleNotificationMessage>? environmentalMessagesSubscription;
+  StreamSubscription<EnvironmentalV2NotificationMessage>?
+      environmentalV2MessagesSubscription;
   StreamSubscription<WearableAgmReceivedBatch>? agmBatchesSubscription;
   StreamSubscription<WearableSdsReceivedStatus>? sdsStatusSubscription;
   StreamSubscription<PolarH10Event>? polarEventsSubscription;
@@ -1092,6 +1154,9 @@ class _ConnectedDeviceSession {
   bool isConnected = true;
   bool isInitializing = false;
   bool isInitialized = false;
+  bool environmentalV2ConfigurationApplied = false;
+  bool environmentalV2NotificationsRequested = false;
+  bool environmentalV2NotificationsStarted = false;
   bool disconnectedDuringAcquisition = false;
   int disconnectionAlertVersion = 0;
   _BleReconnectStatus reconnectStatus = _BleReconnectStatus.disconnected;
@@ -1144,6 +1209,8 @@ class _ConnectedDeviceSession {
   bool get isConfigured {
     return switch (type) {
       KnownDeviceType.environmentalMonitor => environmentalConfiguration != null,
+      KnownDeviceType.environmentalMonitorV2 =>
+        environmentalV2Configuration != null,
       KnownDeviceType.respiratoryMonitor => wearableConfiguration != null,
       KnownDeviceType.polarH10 => polarConfiguration?.isValid ?? false,
       KnownDeviceType.unsupported => false,
@@ -1151,17 +1218,34 @@ class _ConnectedDeviceSession {
   }
 
   List<_MeasurementDefinition> get visibleMeasurements {
-    final configuration = environmentalConfiguration;
-    if (configuration == null) {
-      return const [];
+    switch (type) {
+      case KnownDeviceType.environmentalMonitor:
+        final v1Configuration = environmentalConfiguration;
+        if (v1Configuration == null) {
+          return const [];
+        }
+        return _measurementDefinitions
+            .where(
+              (definition) =>
+                  v1Configuration.enabledOptions[definition.label] ?? false,
+            )
+            .toList(growable: false);
+      case KnownDeviceType.environmentalMonitorV2:
+        final v2Configuration = environmentalV2Configuration;
+        if (v2Configuration == null) {
+          return const [];
+        }
+        return _environmentalV2MeasurementDefinitions
+            .where(
+              (definition) =>
+                  v2Configuration.isMessageTypeEnabled(definition.prefix),
+            )
+            .toList(growable: false);
+      case KnownDeviceType.respiratoryMonitor:
+      case KnownDeviceType.polarH10:
+      case KnownDeviceType.unsupported:
+        return const [];
     }
-
-    return _measurementDefinitions
-        .where(
-          (definition) =>
-              configuration.enabledOptions[definition.label] ?? false,
-        )
-        .toList(growable: false);
   }
 
   Map<String, _MeasurementDefinition> get visibleMeasurementsByPrefix {
@@ -1174,6 +1258,8 @@ class _ConnectedDeviceSession {
   Future<void> cancelLiveSubscriptions() async {
     await environmentalMessagesSubscription?.cancel();
     environmentalMessagesSubscription = null;
+    await environmentalV2MessagesSubscription?.cancel();
+    environmentalV2MessagesSubscription = null;
     await agmBatchesSubscription?.cancel();
     agmBatchesSubscription = null;
     await sdsStatusSubscription?.cancel();
@@ -1289,6 +1375,12 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
                 : _summarizeEnvironmentalConfiguration(
                     session.environmentalConfiguration!,
                   ),
+          KnownDeviceType.environmentalMonitorV2 =>
+            session.environmentalV2Configuration == null
+                ? 'not configured'
+                : _summarizeEnvironmentalV2Configuration(
+                    session.environmentalV2Configuration!,
+                  ),
           KnownDeviceType.respiratoryMonitor =>
             session.wearableConfiguration == null
                 ? 'not configured'
@@ -1329,6 +1421,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       await session.environmentalService?.dispose();
     } catch (_) {}
     try {
+      await session.environmentalV2Service?.dispose();
+    } catch (_) {}
+    try {
       await session.wearableService?.dispose();
     } catch (_) {}
     if (session.isPolarManaged) {
@@ -1349,6 +1444,14 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     BleConfiguration configuration,
   ) {
     session.environmentalConfiguration = configuration;
+    notifyListeners();
+  }
+
+  void configureEnvironmentalV2(
+    _ConnectedDeviceSession session,
+    EnvironmentalV2Configuration configuration,
+  ) {
+    session.environmentalV2Configuration = configuration;
     notifyListeners();
   }
 
@@ -1423,6 +1526,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         switch (session.type) {
           case KnownDeviceType.environmentalMonitor:
             await _initializeEnvironmental(session);
+            break;
+          case KnownDeviceType.environmentalMonitorV2:
+            await _initializeEnvironmentalV2(session);
             break;
           case KnownDeviceType.respiratoryMonitor:
             await _initializeWearable(session);
@@ -1612,6 +1718,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         currentDevice: session.bleDevice,
         deviceId: session.deviceId,
         deviceName: session.deviceName,
+        requireUnambiguousEnvironmentalV2NameFallback:
+            session.type == KnownDeviceType.environmentalMonitorV2,
       );
       if (!_canContinueAutomaticBleReconnect() ||
           !_sessions.contains(session)) {
@@ -1636,6 +1744,20 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           await service.resumeNotificationsAfterReconnect(
             reconnectedDevice: reconnectedDevice,
           );
+          break;
+        case KnownDeviceType.environmentalMonitorV2:
+          final service = session.environmentalV2Service;
+          if (service == null) {
+            throw StateError(
+              'Environmental Monitor V2 BLE service is not available.',
+            );
+          }
+          if (session.environmentalV2NotificationsRequested) {
+            await service.resumeNotificationsAfterReconnect(
+              reconnectedDevice: reconnectedDevice,
+            );
+            session.environmentalV2NotificationsStarted = true;
+          }
           break;
         case KnownDeviceType.respiratoryMonitor:
           final service = session.wearableService;
@@ -1666,6 +1788,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       }
       notifyListeners();
     } catch (_) {
+      if (session.type == KnownDeviceType.environmentalMonitorV2) {
+        session.environmentalV2NotificationsStarted = false;
+      }
       try {
         await session.bleDevice.disconnect();
       } catch (_) {}
@@ -1749,12 +1874,24 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     await _openRemoteLocationSubscription?.cancel();
     _openRemoteLocationSubscription = null;
 
-    for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
+    final sessionsToStop = List<_ConnectedDeviceSession>.from(_sessions);
+    for (final session in sessionsToStop) {
       await session.cancelLiveSubscriptions();
+    }
+
+    for (final session in sessionsToStop) {
       switch (session.type) {
         case KnownDeviceType.environmentalMonitor:
           try {
             await session.environmentalService?.dispose();
+          } catch (_) {}
+          try {
+            await session.bleDevice.disconnect();
+          } catch (_) {}
+          break;
+        case KnownDeviceType.environmentalMonitorV2:
+          try {
+            await session.environmentalV2Service?.dispose();
           } catch (_) {}
           try {
             await session.bleDevice.disconnect();
@@ -1823,6 +1960,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       await session.cancelLiveSubscriptions();
       try {
         await session.environmentalService?.dispose();
+      } catch (_) {}
+      try {
+        await session.environmentalV2Service?.dispose();
       } catch (_) {}
       try {
         await session.wearableService?.dispose();
@@ -1910,6 +2050,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
         session.isConnected = isConnected;
         if (!isConnected) {
+          if (session.type == KnownDeviceType.environmentalMonitorV2) {
+            session.environmentalV2NotificationsStarted = false;
+          }
           if (_isStopping) {
             notifyListeners();
             return;
@@ -1917,6 +2060,13 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
           if (_acquisitionStarted) {
             _markSessionDisconnectedDuringAcquisition(session);
+          } else if (session.type ==
+                  KnownDeviceType.environmentalMonitorV2 &&
+              session.environmentalV2ConfigurationApplied &&
+              _initializationStarted) {
+            // Keep a configured V2 session until the live page can use the
+            // normal acquisition reconnect flow. Notifications are not
+            // started here.
           } else {
             unawaited(session.cancelConnectionSubscription());
             _sessions.removeWhere(
@@ -1942,6 +2092,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       ..disconnectionAlertVersion += 1
       ..reconnectStatus = _BleReconnectStatus.disconnected
       ..reconnectFailureMessage = null;
+    if (session.type == KnownDeviceType.environmentalMonitorV2) {
+      session.environmentalV2NotificationsStarted = false;
+    }
 
     unawaited(
       AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
@@ -1962,6 +2115,26 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     );
 
     await service.initialize(configuration);
+  }
+
+  Future<void> _initializeEnvironmentalV2(
+    _ConnectedDeviceSession session,
+  ) async {
+    final configuration = session.environmentalV2Configuration!;
+    final service = EnvironmentalV2BleService(session.bleDevice);
+    session
+      ..environmentalV2Service = service
+      ..environmentalV2ConfigurationApplied = false
+      ..environmentalV2NotificationsRequested = false
+      ..environmentalV2NotificationsStarted = false;
+    session.environmentalV2MessagesSubscription = service.messages.listen(
+      (message) {
+        _handleEnvironmentalV2Message(session, message);
+      },
+    );
+
+    await service.initialize(configuration);
+    session.environmentalV2ConfigurationApplied = true;
   }
 
   Future<void> _initializeWearable(_ConnectedDeviceSession session) async {
@@ -2069,6 +2242,77 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       }
       notifyListeners();
     }
+  }
+
+  Future<void> startEnvironmentalV2NotificationsForAcquisition() async {
+    if (!_acquisitionStarted || _isStopping) {
+      return;
+    }
+
+    final sessions = _sessions.where(
+      (session) =>
+          session.type == KnownDeviceType.environmentalMonitorV2 &&
+          session.isInitialized,
+    );
+    await Future.wait<void>([
+      for (final session in sessions)
+        _startEnvironmentalV2NotificationsForSession(session),
+    ]);
+  }
+
+  Future<void> _startEnvironmentalV2NotificationsForSession(
+    _ConnectedDeviceSession session,
+  ) async {
+    session.environmentalV2NotificationsRequested = true;
+    if (session.environmentalV2NotificationsStarted || _isStopping) {
+      return;
+    }
+
+    if (!session.isConnected) {
+      if (!session.disconnectedDuringAcquisition) {
+        _markSessionDisconnectedDuringAcquisition(session);
+      }
+      notifyListeners();
+      return;
+    }
+
+    final service = session.environmentalV2Service;
+    if (service == null) {
+      return;
+    }
+
+    try {
+      await service.startNotificationsForAcquisition(
+        reconnectedDevice: session.bleDevice,
+      );
+      session
+        ..environmentalV2NotificationsStarted = true
+        ..isConnected = true
+        ..errorMessage = null;
+    } catch (error) {
+      if (_isStopping || _disposed) {
+        return;
+      }
+      try {
+        await service.stopNotifications();
+      } catch (_) {}
+      if (_isStopping || _disposed) {
+        return;
+      }
+      session
+        ..environmentalV2NotificationsStarted = false
+        ..isConnected = false
+        ..errorMessage = error.toString()
+        ..reconnectFailureMessage = error.toString();
+      try {
+        await session.bleDevice.disconnect();
+      } catch (_) {}
+      if (!session.disconnectedDuringAcquisition) {
+        _markSessionDisconnectedDuringAcquisition(session);
+        session.reconnectFailureMessage = error.toString();
+      }
+    }
+    notifyListeners();
   }
 
   Future<void> _reconnectPolarH10(_ConnectedDeviceSession session) async {
@@ -2402,6 +2646,58 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         _publishOpenRemoteMeasurementIfConnected(session, message.value),
       );
     }
+    notifyListeners();
+  }
+
+  void _handleEnvironmentalV2Message(
+    _ConnectedDeviceSession session,
+    EnvironmentalV2NotificationMessage message,
+  ) {
+    final configuration = session.environmentalV2Configuration;
+    if (configuration == null ||
+        !configuration.isMessageTypeEnabled(message.type)) {
+      return;
+    }
+
+    final definition = session.visibleMeasurementsByPrefix[message.type];
+    if (definition == null) {
+      return;
+    }
+
+    final previous = session.liveMeasurementValues[definition.prefix];
+    session.liveMeasurementValues[definition.prefix] = _LiveMeasurementValue(
+      formattedValue: message.value,
+      updatedAt: message.receivedAt,
+      updateCount: (previous?.updateCount ?? 0) + 1,
+    );
+
+    final numericValue = message.numericValue;
+    if (definition.chartEnabled && numericValue != null) {
+      final samples = session.chartSamplesByPrefix.putIfAbsent(
+        definition.prefix,
+        () => <_MeasurementChartSample>[],
+      );
+      samples.add(
+        _MeasurementChartSample(
+          receivedAt: message.receivedAt,
+          value: numericValue,
+        ),
+      );
+      if (samples.length > 100) {
+        samples.removeRange(0, samples.length - 100);
+      }
+    }
+
+    unawaited(
+      csvLogger.appendEnvironmentalV2Message(
+        receivedAt: message.receivedAt,
+        deviceId: session.deviceId,
+        deviceName: session.deviceName,
+        gpsCoordinates: gpsLocationService.currentCoordinates,
+        messageType: message.type,
+        value: message.value,
+      ),
+    );
     notifyListeners();
   }
 
@@ -2846,6 +3142,11 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
   String _displayDeviceName(ScanResult result) {
     final names = _deviceNameCandidates(result);
+    final environmentalV2Name =
+        KnownDeviceClassifier.environmentalV2NameFrom(names);
+    if (environmentalV2Name != null) {
+      return environmentalV2Name;
+    }
     return names.isEmpty ? 'Unknown device' : names.first;
   }
 
@@ -3238,6 +3539,21 @@ class _MultiDeviceConfigurationPageState
           ),
         );
         return;
+      case KnownDeviceType.environmentalMonitorV2:
+        await Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => EnvironmentalV2ConfigurationPage(
+              initialConfiguration: session.environmentalV2Configuration,
+              onConfigurationConfirmed: (configuration) {
+                widget.manager.configureEnvironmentalV2(
+                  session,
+                  configuration,
+                );
+              },
+            ),
+          ),
+        );
+        return;
       case KnownDeviceType.respiratoryMonitor:
         await Navigator.of(context).push(
           MaterialPageRoute<void>(
@@ -3464,6 +3780,9 @@ class _MultiDeviceAcquisitionPageState
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _syncBleDisconnectionAlertDialog();
       unawaited(widget.manager.startPolarStreamsForAcquisition());
+      unawaited(
+        widget.manager.startEnvironmentalV2NotificationsForAcquisition(),
+      );
     });
   }
 
@@ -3789,6 +4108,8 @@ class _MultiDeviceAcquisitionPageState
           switch (session.type) {
             KnownDeviceType.environmentalMonitor =>
               _buildEnvironmentalSection(context, session),
+            KnownDeviceType.environmentalMonitorV2 =>
+              _buildEnvironmentalSection(context, session),
             KnownDeviceType.respiratoryMonitor =>
               _buildWearableSection(context, session),
             KnownDeviceType.polarH10 =>
@@ -3887,15 +4208,26 @@ class _MultiDeviceAcquisitionPageState
       );
     }
 
+    return _buildEnvironmentalCardGrid(
+      session,
+      measurements,
+    );
+  }
+
+  Widget _buildEnvironmentalCardGrid(
+    _ConnectedDeviceSession session,
+    List<_MeasurementDefinition> measurements, {
+    double childAspectRatio = 0.9,
+  }) {
     return GridView.builder(
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
       itemCount: measurements.length,
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
         crossAxisSpacing: 12,
         mainAxisSpacing: 12,
-        childAspectRatio: 0.9,
+        childAspectRatio: childAspectRatio,
       ),
       itemBuilder: (context, index) {
         final definition = measurements[index];
@@ -3927,9 +4259,16 @@ class _MultiDeviceAcquisitionPageState
       );
     }
 
+    final chartMeasurements = measurements
+        .where((definition) => definition.chartEnabled)
+        .toList(growable: false);
+    final currentValueMeasurements = measurements
+        .where((definition) => !definition.chartEnabled)
+        .toList(growable: false);
+
     return Column(
       children: [
-        for (final definition in measurements) ...[
+        for (final definition in chartMeasurements) ...[
           _LiveMeasurementChartCard(
             definition: definition,
             samples: session.chartSamplesByPrefix[definition.prefix] ?? const [],
@@ -3938,6 +4277,12 @@ class _MultiDeviceAcquisitionPageState
           ),
           const SizedBox(height: 12),
         ],
+        if (currentValueMeasurements.isNotEmpty)
+          _buildEnvironmentalCardGrid(
+            session,
+            currentValueMeasurements,
+            childAspectRatio: 1.35,
+          ),
       ],
     );
   }
@@ -6233,16 +6578,106 @@ const List<_MeasurementDefinition> _measurementDefinitions = [
   ),
 ];
 
+const List<_MeasurementDefinition> _environmentalV2MeasurementDefinitions = [
+  _MeasurementDefinition(
+    label: 'PM1',
+    prefix: EnvironmentalV2MessageTypes.pm1,
+    unit: '\u00B5g/m\u00B3',
+  ),
+  _MeasurementDefinition(
+    label: 'PM2.5',
+    prefix: EnvironmentalV2MessageTypes.pm25,
+    unit: '\u00B5g/m\u00B3',
+  ),
+  _MeasurementDefinition(
+    label: 'PM10',
+    prefix: EnvironmentalV2MessageTypes.pm10,
+    unit: '\u00B5g/m\u00B3',
+  ),
+  _MeasurementDefinition(
+    label: 'VOC Index',
+    prefix: EnvironmentalV2MessageTypes.vocIndex,
+    unit: 'index',
+  ),
+  _MeasurementDefinition(
+    label: 'NOX Index',
+    prefix: EnvironmentalV2MessageTypes.noxIndex,
+    unit: 'index',
+  ),
+  _MeasurementDefinition(
+    label: 'Temperature',
+    prefix: EnvironmentalV2MessageTypes.temperature,
+    unit: '\u00B0C',
+  ),
+  _MeasurementDefinition(
+    label: 'Humidity',
+    prefix: EnvironmentalV2MessageTypes.humidity,
+    unit: '%',
+  ),
+  _MeasurementDefinition(
+    label: 'CO2',
+    prefix: EnvironmentalV2MessageTypes.co2,
+    unit: 'ppm',
+  ),
+  _MeasurementDefinition(
+    label: 'Date',
+    prefix: EnvironmentalV2MessageTypes.date,
+    unit: '',
+    chartEnabled: false,
+  ),
+  _MeasurementDefinition(
+    label: 'Time',
+    prefix: EnvironmentalV2MessageTypes.time,
+    unit: '',
+    chartEnabled: false,
+  ),
+  _MeasurementDefinition(
+    label: 'Latitude',
+    prefix: EnvironmentalV2MessageTypes.latitude,
+    unit: '\u00B0',
+    chartEnabled: false,
+  ),
+  _MeasurementDefinition(
+    label: 'Longitude',
+    prefix: EnvironmentalV2MessageTypes.longitude,
+    unit: '\u00B0',
+    chartEnabled: false,
+  ),
+  _MeasurementDefinition(
+    label: 'Acc x',
+    prefix: EnvironmentalV2MessageTypes.accelerometerX,
+    unit: 'g',
+  ),
+  _MeasurementDefinition(
+    label: 'Acc y',
+    prefix: EnvironmentalV2MessageTypes.accelerometerY,
+    unit: 'g',
+  ),
+  _MeasurementDefinition(
+    label: 'Acc z',
+    prefix: EnvironmentalV2MessageTypes.accelerometerZ,
+    unit: 'g',
+  ),
+  _MeasurementDefinition(
+    label: 'Activity',
+    prefix: EnvironmentalV2MessageTypes.activity,
+    unit: '',
+    chartEnabled: false,
+  ),
+];
+
 class _MeasurementDefinition {
   const _MeasurementDefinition({
     required this.label,
     required this.prefix,
     required this.unit,
+    this.chartEnabled = true,
   });
 
   final String label;
   final String prefix;
   final String unit;
+  final bool chartEnabled;
 }
 
 class _LiveMeasurementValue {
@@ -7412,7 +7847,9 @@ class _LiveMeasurementCard extends StatelessWidget {
     final updateCount = value?.updateCount ?? 0;
     final valueText = value == null
         ? '—'
-        : '${value!.formattedValue} ${definition.unit}';
+        : definition.unit.isEmpty
+            ? value!.formattedValue
+            : '${value!.formattedValue} ${definition.unit}';
 
     return TweenAnimationBuilder<double>(
       key: ValueKey('${definition.prefix}-$updateCount'),
@@ -7520,7 +7957,9 @@ class _LiveMeasurementChartCard extends StatelessWidget {
     final visibleSamples = _visibleSamples;
     final currentValueText = currentValue == null
         ? '—'
-        : '${currentValue!.formattedValue} ${definition.unit}';
+        : definition.unit.isEmpty
+            ? currentValue!.formattedValue
+            : '${currentValue!.formattedValue} ${definition.unit}';
 
     return DecoratedBox(
       decoration: BoxDecoration(

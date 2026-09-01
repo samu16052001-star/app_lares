@@ -31,13 +31,44 @@ class UnifiedAcquisitionCsvLogger {
     for (final field in _sensorFields) field.prefix: field,
   };
 
+  static const List<_CsvSensorField> _environmentalV2SensorFields = [
+    _CsvSensorField(prefix: 'PM1', label: 'PM1.0', unit: 'ug/m3'),
+    _CsvSensorField(prefix: 'PM2.5', label: 'PM2.5', unit: 'ug/m3'),
+    _CsvSensorField(prefix: 'PM10', label: 'PM10', unit: 'ug/m3'),
+    _CsvSensorField(prefix: 'VOCi', label: 'VOC Index'),
+    _CsvSensorField(prefix: 'NOXi', label: 'NOX Index'),
+    _CsvSensorField(
+      prefix: 'Temp',
+      label: 'Temperature',
+      unit: '\u00B0C',
+    ),
+    _CsvSensorField(prefix: 'Hum', label: 'Humidity', unit: '%'),
+    _CsvSensorField(prefix: 'CO2', label: 'CO2', unit: 'ppm'),
+    _CsvSensorField(prefix: 'Date', label: 'Date'),
+    _CsvSensorField(prefix: 'Time', label: 'Time'),
+    _CsvSensorField(prefix: 'Lat', label: 'Lat', unit: '\u00B0'),
+    _CsvSensorField(prefix: 'Long', label: 'Long', unit: '\u00B0'),
+    _CsvSensorField(prefix: 'Accx', label: 'acc_x', unit: 'g'),
+    _CsvSensorField(prefix: 'Accy', label: 'acc_y', unit: 'g'),
+    _CsvSensorField(prefix: 'Accz', label: 'acc_z', unit: 'g'),
+    _CsvSensorField(prefix: 'Act', label: 'step_activity'),
+  ];
+
+  static final Map<String, _CsvSensorField>
+      _environmentalV2SensorFieldsByType = {
+    for (final field in _environmentalV2SensorFields) field.prefix: field,
+  };
+
   File? _file;
   IOSink? _sink;
   String? _fileName;
   bool _isStarted = false;
   bool _isStopped = false;
   Future<void> _writeQueue = Future<void>.value();
+  Future<void>? _stopFuture;
   final Map<String, _EnvironmentalClusterState> _environmentalClusters = {};
+  final Map<String, _EnvironmentalV2ClusterState> _environmentalV2Clusters =
+      {};
 
   String? get fileName => _fileName;
 
@@ -67,7 +98,9 @@ class UnifiedAcquisitionCsvLogger {
     _sink = sink;
     _isStarted = true;
     _isStopped = false;
+    _stopFuture = null;
     _environmentalClusters.clear();
+    _environmentalV2Clusters.clear();
   }
 
   Future<void> appendEnvironmentalMessage({
@@ -99,6 +132,48 @@ class UnifiedAcquisitionCsvLogger {
       }
 
       _handleDataMessage(deviceName, trimmedValue);
+    });
+  }
+
+  Future<void> appendEnvironmentalV2Message({
+    required DateTime receivedAt,
+    required String deviceId,
+    required String deviceName,
+    required String gpsCoordinates,
+    required String messageType,
+    required String value,
+  }) {
+    return _enqueue(() async {
+      final sink = _sink;
+      if (!_isStarted || _isStopped || sink == null) {
+        return;
+      }
+
+      if (!_environmentalV2SensorFieldsByType.containsKey(messageType)) {
+        return;
+      }
+
+      final cluster = _environmentalV2Clusters.putIfAbsent(
+        deviceId,
+        _EnvironmentalV2ClusterState.new,
+      );
+      final closesCurrentRow = cluster.delimiterType == messageType;
+      if (closesCurrentRow) {
+        _flushEnvironmentalV2ClusterIfNeeded(cluster, sink);
+      }
+
+      if (cluster.delimiterType == null) {
+        cluster
+          ..delimiterType = messageType
+          ..receivedAt = receivedAt
+          ..deviceName = deviceName
+          ..gpsCoordinates = gpsCoordinates;
+      }
+      cluster.values[messageType] = value;
+
+      if (closesCurrentRow) {
+        await sink.flush();
+      }
     });
   }
 
@@ -212,26 +287,37 @@ class UnifiedAcquisitionCsvLogger {
     });
   }
 
-  Future<void> stop() async {
+  Future<void> stop() {
+    final existingStop = _stopFuture;
+    if (existingStop != null) {
+      return existingStop;
+    }
     if (_isStopped) {
-      return;
+      return Future<void>.value();
     }
 
-    _isStopped = true;
-    await _writeQueue.catchError((_) {});
-    final sink = _sink;
-    _sink = null;
+    final stopFuture = _enqueue(() async {
+      final sink = _sink;
+      if (sink != null) {
+        for (final cluster in _environmentalClusters.values) {
+          _flushEnvironmentalClusterIfNeeded(cluster, sink);
+        }
+        for (final cluster in _environmentalV2Clusters.values) {
+          _flushEnvironmentalV2ClusterIfNeeded(cluster, sink);
+        }
+      }
+      _environmentalClusters.clear();
+      _environmentalV2Clusters.clear();
+      _isStopped = true;
+      _sink = null;
 
-    if (sink == null) {
-      return;
-    }
-
-    for (final cluster in _environmentalClusters.values) {
-      _flushEnvironmentalClusterIfNeeded(cluster, sink);
-    }
-    _environmentalClusters.clear();
-    await sink.flush();
-    await sink.close();
+      if (sink != null) {
+        await sink.flush();
+        await sink.close();
+      }
+    });
+    _stopFuture = stopFuture;
+    return stopFuture;
   }
 
   Future<void> exportToDownloadsOrShare() async {
@@ -356,6 +442,37 @@ class UnifiedAcquisitionCsvLogger {
     }).join(',');
   }
 
+  void _flushEnvironmentalV2ClusterIfNeeded(
+    _EnvironmentalV2ClusterState cluster,
+    IOSink sink,
+  ) {
+    if (cluster.delimiterType == null ||
+        cluster.receivedAt == null ||
+        cluster.deviceName == null ||
+        cluster.gpsCoordinates == null) {
+      return;
+    }
+
+    sink.writeln(
+      [
+        _escapeCsvField(_formatEnvironmentalTimestamp(cluster.receivedAt!)),
+        _escapeCsvField(cluster.deviceName!),
+        _escapeCsvField(_buildEnvironmentalV2DataReceivedString(cluster)),
+        _escapeCsvField(cluster.gpsCoordinates!),
+      ].join(';'),
+    );
+    cluster.clear();
+  }
+
+  String _buildEnvironmentalV2DataReceivedString(
+    _EnvironmentalV2ClusterState cluster,
+  ) {
+    return _environmentalV2SensorFields.map((field) {
+      final value = cluster.values[field.prefix] ?? 'NA';
+      return field.formatValue(value);
+    }).join(',');
+  }
+
   String _formatWearableDataReceived(List<WearableAgmSample> samples) {
     return samples.map(_formatWearableSample).join(' - ');
   }
@@ -434,6 +551,22 @@ class _EnvironmentalClusterState {
 
   void clear() {
     counter = null;
+    receivedAt = null;
+    deviceName = null;
+    gpsCoordinates = null;
+    values.clear();
+  }
+}
+
+class _EnvironmentalV2ClusterState {
+  String? delimiterType;
+  DateTime? receivedAt;
+  String? deviceName;
+  String? gpsCoordinates;
+  final Map<String, String> values = {};
+
+  void clear() {
+    delimiterType = null;
     receivedAt = null;
     deviceName = null;
     gpsCoordinates = null;
