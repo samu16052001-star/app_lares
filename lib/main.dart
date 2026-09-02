@@ -4218,6 +4218,7 @@ class _MultiDeviceAcquisitionPageState
     _ConnectedDeviceSession session,
     List<_MeasurementDefinition> measurements, {
     double childAspectRatio = 0.9,
+    double? mainAxisExtent,
   }) {
     return GridView.builder(
       shrinkWrap: true,
@@ -4228,6 +4229,7 @@ class _MultiDeviceAcquisitionPageState
         crossAxisSpacing: 12,
         mainAxisSpacing: 12,
         childAspectRatio: childAspectRatio,
+        mainAxisExtent: mainAxisExtent,
       ),
       itemBuilder: (context, index) {
         final definition = measurements[index];
@@ -4281,10 +4283,22 @@ class _MultiDeviceAcquisitionPageState
           _buildEnvironmentalCardGrid(
             session,
             currentValueMeasurements,
-            childAspectRatio: 1.35,
+            mainAxisExtent: _compactEnvironmentalCardExtent(context),
           ),
       ],
     );
+  }
+
+  double _compactEnvironmentalCardExtent(BuildContext context) {
+    final textScaler = MediaQuery.textScalerOf(context);
+    final titleScale = textScaler.scale(14) / 14;
+    final valueScale = textScaler.scale(24) / 24;
+    final updateScale = textScaler.scale(12) / 12;
+    final effectiveScale = math.max(
+      1.0,
+      math.max(titleScale, math.max(valueScale, updateScale)),
+    );
+    return 144 * effectiveScale;
   }
 
   Widget _buildWearableSection(
