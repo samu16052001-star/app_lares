@@ -234,7 +234,7 @@ const Map<String, _EnvironmentalV2MessageDefinition> _definitionByHeader =
         option: EnvironmentalV2Option.accelerometer,
         valueKind: _EnvironmentalV2ValueKind.finiteNumber,
       ),
-      'Act:': _EnvironmentalV2MessageDefinition(
+      'Act=': _EnvironmentalV2MessageDefinition(
         type: EnvironmentalV2MessageTypes.activity,
         option: EnvironmentalV2Option.accelerometer,
         valueKind: _EnvironmentalV2ValueKind.integer,
