@@ -1108,6 +1108,29 @@ class _BleAutoReconnectCoordinator {
   }
 }
 
+/// Rettangolo di origine per il pannello di condivisione.
+///
+/// Su iOS share_plus lo richiede obbligatoriamente e rifiuta un rettangolo
+/// nullo o di area zero; su iPad determina anche dove viene ancorato il
+/// popover. Su Android il valore viene ignorato. Se il render object non e'
+/// disponibile si ripiega su un punto al centro dello schermo, per non
+/// ritrovarsi di nuovo con un rettangolo non valido.
+Rect _shareOriginFor(BuildContext context) {
+  final renderObject = context.findRenderObject();
+  if (renderObject is RenderBox &&
+      renderObject.hasSize &&
+      !renderObject.size.isEmpty) {
+    return renderObject.localToGlobal(Offset.zero) & renderObject.size;
+  }
+
+  final screenSize = MediaQuery.sizeOf(context);
+  return Rect.fromCenter(
+    center: Offset(screenSize.width / 2, screenSize.height / 2),
+    width: 1,
+    height: 1,
+  );
+}
+
 String _normalizeDeviceNameForReconnect(String value) {
   return value.trim().toLowerCase();
 }
@@ -4563,7 +4586,9 @@ class _MultiDeviceAcquisitionCompletedPage extends StatelessWidget {
 
   Future<void> _downloadData(BuildContext context) async {
     try {
-      await csvLogger.exportToDownloadsOrShare();
+      await csvLogger.exportToDownloadsOrShare(
+        sharePositionOrigin: _shareOriginFor(context),
+      );
       if (!context.mounted) {
         return;
       }
@@ -4571,7 +4596,9 @@ class _MultiDeviceAcquisitionCompletedPage extends StatelessWidget {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('CSV file saved successfully')),
       );
-    } catch (_) {
+    } catch (error, stackTrace) {
+      debugPrint('CSV export failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
       if (!context.mounted) {
         return;
       }
@@ -6252,7 +6279,9 @@ class WearableAcquisitionCompletedPage extends StatelessWidget {
 
   Future<void> _downloadData(BuildContext context) async {
     try {
-      await csvLogger.exportToDownloadsOrShare();
+      await csvLogger.exportToDownloadsOrShare(
+        sharePositionOrigin: _shareOriginFor(context),
+      );
       if (!context.mounted) {
         return;
       }
@@ -6260,7 +6289,9 @@ class WearableAcquisitionCompletedPage extends StatelessWidget {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('CSV file saved successfully')),
       );
-    } catch (_) {
+    } catch (error, stackTrace) {
+      debugPrint('CSV export failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
       if (!context.mounted) {
         return;
       }
@@ -8396,7 +8427,9 @@ class AcquisitionCompletedPage extends StatelessWidget {
 
   Future<void> _downloadData(BuildContext context) async {
     try {
-      await csvLogger.exportToDownloadsOrShare();
+      await csvLogger.exportToDownloadsOrShare(
+        sharePositionOrigin: _shareOriginFor(context),
+      );
       if (!context.mounted) {
         return;
       }
@@ -8404,7 +8437,9 @@ class AcquisitionCompletedPage extends StatelessWidget {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('CSV file saved successfully')),
       );
-    } catch (_) {
+    } catch (error, stackTrace) {
+      debugPrint('CSV export failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
       if (!context.mounted) {
         return;
       }

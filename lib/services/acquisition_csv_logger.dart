@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' show Rect;
 
 import 'package:share_plus/share_plus.dart';
 
@@ -176,7 +177,7 @@ class AcquisitionCsvLogger {
     await sink.close();
   }
 
-  Future<void> exportToDownloadsOrShare() async {
+  Future<void> exportToDownloadsOrShare({Rect? sharePositionOrigin}) async {
     await stop();
 
     final file = _file;
@@ -193,6 +194,7 @@ class AcquisitionCsvLogger {
       ShareParams(
         files: [XFile(file.path, mimeType: 'text/csv', name: fileName)],
         subject: fileName,
+        sharePositionOrigin: sharePositionOrigin,
       ),
     );
   }

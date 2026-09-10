@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:ui' show Rect;
 
 import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:flutter/foundation.dart';
@@ -84,7 +85,7 @@ class WearableAcquisitionCsvLogger {
     await sink.close();
   }
 
-  Future<void> exportToDownloadsOrShare() async {
+  Future<void> exportToDownloadsOrShare({Rect? sharePositionOrigin}) async {
     await stop();
 
     final file = _file;
@@ -103,6 +104,7 @@ class WearableAcquisitionCsvLogger {
       ShareParams(
         files: [XFile(file.path, mimeType: 'text/csv', name: fileName)],
         subject: fileName,
+        sharePositionOrigin: sharePositionOrigin,
       ),
     );
   }

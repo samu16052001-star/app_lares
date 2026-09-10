@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' show Rect;
 
 import 'package:app_lares/polar_h10/polar_h10_models.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
@@ -9,7 +10,7 @@ class UnifiedAcquisitionCsvLogger {
   static final RegExp _counterPattern = RegExp(r'^\d+$');
   static const List<_CsvSensorField> _sensorFields = [
     _CsvSensorField(prefix: 'CO2', label: 'CO2', unit: 'ppm'),
-    _CsvSensorField(prefix: 'TEM1', label: 'Internal Temperature', unit: 'Â°C'),
+    _CsvSensorField(prefix: 'TEM1', label: 'Internal Temperature', unit: '°C'),
     _CsvSensorField(prefix: 'HUM1', label: 'Internal Humidity', unit: '%'),
     _CsvSensorField(prefix: 'VOC', label: 'VOC'),
     _CsvSensorField(prefix: 'NOX', label: 'NOX'),
@@ -22,7 +23,7 @@ class UnifiedAcquisitionCsvLogger {
     _CsvSensorField(prefix: 'PM1.0', label: 'PM1.0', unit: 'ug/m3'),
     _CsvSensorField(prefix: 'PM2.5', label: 'PM2.5', unit: 'ug/m3'),
     _CsvSensorField(prefix: 'PM10', label: 'PM10', unit: 'ug/m3'),
-    _CsvSensorField(prefix: 'TEM2', label: 'External Temperature', unit: 'Â°C'),
+    _CsvSensorField(prefix: 'TEM2', label: 'External Temperature', unit: '°C'),
     _CsvSensorField(prefix: 'HUM2', label: 'External Humidity', unit: '%'),
     _CsvSensorField(prefix: 'PRE', label: 'Atmospheric Pressure', unit: 'Pa'),
   ];
@@ -320,7 +321,7 @@ class UnifiedAcquisitionCsvLogger {
     return stopFuture;
   }
 
-  Future<void> exportToDownloadsOrShare() async {
+  Future<void> exportToDownloadsOrShare({Rect? sharePositionOrigin}) async {
     await stop();
 
     final file = _file;
@@ -339,6 +340,7 @@ class UnifiedAcquisitionCsvLogger {
       ShareParams(
         files: [XFile(file.path, mimeType: 'text/csv', name: fileName)],
         subject: fileName,
+        sharePositionOrigin: sharePositionOrigin,
       ),
     );
   }
