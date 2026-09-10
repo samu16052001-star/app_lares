@@ -26,6 +26,7 @@ import 'package:app_lares/widgets/polar_h10_live_section.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart' show Position;
 import 'package:permission_handler/permission_handler.dart';
@@ -1106,6 +1107,26 @@ class _BleAutoReconnectCoordinator {
   void _notify() {
     onStateChanged?.call();
   }
+}
+
+/// Esegue [action] fuori dalla fase in cui l'albero dei widget e' bloccato.
+///
+/// I manager di acquisizione notificano i propri listener anche da dispose():
+/// lo smontaggio avviene dentro BuildOwner.finalizeTree, che tiene l'albero
+/// bloccato, e una setState() in quel momento solleva "widget tree was
+/// locked". In quel caso rimandiamo l'aggiornamento alla fine del frame
+/// corrente; se invece non siamo dentro un frame eseguiamo subito, perche'
+/// addPostFrameCallback da solo non ne programma uno e l'aggiornamento
+/// resterebbe sospeso.
+void _runOutsideBuildPhase(VoidCallback action) {
+  final phase = SchedulerBinding.instance.schedulerPhase;
+  if (phase == SchedulerPhase.idle ||
+      phase == SchedulerPhase.postFrameCallbacks) {
+    action();
+    return;
+  }
+
+  SchedulerBinding.instance.addPostFrameCallback((_) => action());
 }
 
 /// Rettangolo di origine per il pannello di condivisione.
@@ -2923,7 +2944,11 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       return;
     }
 
-    setState(() {});
+    _runOutsideBuildPhase(() {
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   void _listenToScanState() {
@@ -3542,7 +3567,11 @@ class _MultiDeviceConfigurationPageState
       return;
     }
 
-    setState(() {});
+    _runOutsideBuildPhase(() {
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   Future<void> _openSessionConfiguration(
@@ -3835,8 +3864,13 @@ class _MultiDeviceAcquisitionPageState
       return;
     }
 
-    setState(() {});
-    _syncBleDisconnectionAlertDialog();
+    _runOutsideBuildPhase(() {
+      if (!mounted) {
+        return;
+      }
+      setState(() {});
+      _syncBleDisconnectionAlertDialog();
+    });
   }
 
   void _syncBleDisconnectionAlertDialog() {
@@ -5352,9 +5386,11 @@ class _WearableBleCommunicationLogPageState
 
   void _handleWearableAutoReconnectStateChanged() {
     _notifyWearableBleAlertChanged();
-    if (mounted) {
-      setState(() {});
-    }
+    _runOutsideBuildPhase(() {
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   void _syncWearableBleDisconnectionAlertDialog() {
@@ -7234,9 +7270,11 @@ class _AcquisitionInitializationPageState
 
   void _handleSingleAutoReconnectStateChanged() {
     _notifySingleBleAlertChanged();
-    if (mounted) {
-      setState(() {});
-    }
+    _runOutsideBuildPhase(() {
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   void _syncSingleBleDisconnectionAlertDialog() {
