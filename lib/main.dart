@@ -3817,7 +3817,7 @@ class _MultiDeviceAcquisitionPageState
   }
 
   void _syncBleDisconnectionAlertDialog() {
-    if (!mounted || !Platform.isAndroid) {
+    if (!mounted) {
       return;
     }
 
@@ -3929,11 +3929,12 @@ class _MultiDeviceAcquisitionPageState
   }
 
   void _playBleAlertCue() {
-    if (!Platform.isAndroid) {
-      return;
+    if (Platform.isAndroid) {
+      unawaited(
+        AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
+      );
     }
 
-    unawaited(AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue());
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
@@ -5330,7 +5331,7 @@ class _WearableBleCommunicationLogPageState
   }
 
   void _syncWearableBleDisconnectionAlertDialog() {
-    if (!mounted || !Platform.isAndroid) {
+    if (!mounted) {
       return;
     }
 
@@ -5430,11 +5431,12 @@ class _WearableBleCommunicationLogPageState
   }
 
   void _playWearableBleAlertCue() {
-    if (!Platform.isAndroid) {
-      return;
+    if (Platform.isAndroid) {
+      unawaited(
+        AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
+      );
     }
 
-    unawaited(AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue());
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
@@ -7207,7 +7209,7 @@ class _AcquisitionInitializationPageState
   }
 
   void _syncSingleBleDisconnectionAlertDialog() {
-    if (!mounted || !Platform.isAndroid) {
+    if (!mounted) {
       return;
     }
 
@@ -7306,11 +7308,12 @@ class _AcquisitionInitializationPageState
   }
 
   void _playSingleBleAlertCue() {
-    if (!Platform.isAndroid) {
-      return;
+    if (Platform.isAndroid) {
+      unawaited(
+        AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
+      );
     }
 
-    unawaited(AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue());
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
