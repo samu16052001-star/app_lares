@@ -15,6 +15,7 @@ import 'package:app_lares/polar_h10/polar_h10_platform_service.dart';
 import 'package:app_lares/services/acquisition_recovery_store.dart';
 import 'package:app_lares/services/acquisition_csv_logger.dart';
 import 'package:app_lares/services/android_acquisition_foreground_service.dart';
+import 'package:app_lares/services/device_alias_store.dart';
 import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
@@ -805,6 +806,7 @@ class _BleReconnectHelper {
     required String deviceId,
     required String deviceName,
     bool requireUnambiguousEnvironmentalV2NameFallback = false,
+    bool allowNameFallback = true,
   }) async {
     late final Object savedDeviceError;
 
@@ -819,6 +821,7 @@ class _BleReconnectHelper {
       deviceName: deviceName,
       requireUnambiguousEnvironmentalV2NameFallback:
           requireUnambiguousEnvironmentalV2NameFallback,
+      allowNameFallback: allowNameFallback,
     );
     if (scannedDevice == null) {
       throw savedDeviceError;
@@ -849,6 +852,7 @@ class _BleReconnectHelper {
     required String deviceId,
     required String deviceName,
     required bool requireUnambiguousEnvironmentalV2NameFallback,
+    required bool allowNameFallback,
   }) async {
     final hasPermissions = await _requestBluetoothReconnectPermissions();
     if (!hasPermissions) {
@@ -872,6 +876,10 @@ class _BleReconnectHelper {
             idMatchCompleter.complete(resultDevice);
           }
           return;
+        }
+
+        if (!allowNameFallback) {
+          continue;
         }
 
         if (requireUnambiguousEnvironmentalV2NameFallback) {
@@ -1164,6 +1172,7 @@ class _ConnectedDeviceSession {
     this.device,
     required this.deviceId,
     required this.deviceName,
+    required this.advertisedName,
     required this.type,
     this.polarAddress,
     this.polarRssi,
@@ -1177,7 +1186,12 @@ class _ConnectedDeviceSession {
 
   BluetoothDevice? device;
   final String deviceId;
-  final String deviceName;
+
+  /// Name shown in the UI and written to the CSV: the user alias, if any.
+  String deviceName;
+
+  /// Name advertised by the device, used for reconnection by name.
+  final String advertisedName;
   final KnownDeviceType type;
   String? polarDeviceId;
   String? polarAddress;
@@ -1764,9 +1778,12 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       final reconnectedDevice = await _BleReconnectHelper.reconnect(
         currentDevice: session.bleDevice,
         deviceId: session.deviceId,
-        deviceName: session.deviceName,
+        deviceName: session.advertisedName,
         requireUnambiguousEnvironmentalV2NameFallback:
             session.type == KnownDeviceType.environmentalMonitorV2,
+        // IMU units have a static BLE address: a name match could pick
+        // another unit flashed with the same name and mix the data.
+        allowNameFallback: session.type != KnownDeviceType.respiratoryMonitor,
       );
       if (!_canContinueAutomaticBleReconnect() ||
           !_sessions.contains(session)) {
@@ -2934,6 +2951,13 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     super.initState();
     _sessionManager.addListener(_handleSessionManagerChanged);
     _listenToScanState();
+    unawaited(
+      DeviceAliasStore.load().then((_) {
+        if (mounted) {
+          setState(() {});
+        }
+      }),
+    );
   }
 
   @override
@@ -3119,6 +3143,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
           _ConnectedDeviceSession(
             deviceId: id,
             deviceName: displayName,
+            advertisedName: _advertisedDeviceName(result),
             type: deviceType,
             polarAddress: id,
             polarRssi: result.rssi,
@@ -3147,6 +3172,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
           device: device,
           deviceId: id,
           deviceName: displayName,
+          advertisedName: _advertisedDeviceName(result),
           type: deviceType,
         ),
       );
@@ -3196,6 +3222,11 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   }
 
   String _displayDeviceName(ScanResult result) {
+    return DeviceAliasStore.aliasFor(_deviceId(result.device)) ??
+        _advertisedDeviceName(result);
+  }
+
+  String _advertisedDeviceName(ScanResult result) {
     final names = _deviceNameCandidates(result);
     final environmentalV2Name =
         KnownDeviceClassifier.environmentalV2NameFrom(names);
@@ -3274,6 +3305,50 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         });
       }
     }
+  }
+
+  Future<void> _renameDevice({
+    required String deviceId,
+    required String advertisedName,
+  }) async {
+    await DeviceAliasStore.load();
+    if (!mounted) {
+      return;
+    }
+
+    final result = await showDialog<_DeviceRenameResult>(
+      context: context,
+      builder: (_) => _DeviceRenameDialog(
+        deviceId: deviceId,
+        advertisedName: advertisedName,
+        currentAlias: DeviceAliasStore.aliasFor(deviceId),
+      ),
+    );
+    if (result == null || !mounted) {
+      return;
+    }
+
+    try {
+      await DeviceAliasStore.setAlias(deviceId, result.alias);
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'Could not save the device name: $error';
+        });
+      }
+      return;
+    }
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      final session = _sessionForDeviceId(deviceId);
+      if (session != null) {
+        session.deviceName =
+            DeviceAliasStore.aliasFor(deviceId) ?? session.advertisedName;
+      }
+    });
   }
 
   String _deviceId(BluetoothDevice device) {
@@ -3431,20 +3506,44 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
                               contentPadding: EdgeInsets.zero,
                               leading: const Icon(Icons.bluetooth_connected),
                               title: Text(session.deviceName),
-                              subtitle: Text(session.type.label),
-                              trailing: FilledButton(
-                                onPressed: _connectingDeviceIds.contains(
-                                  session.deviceId,
-                                )
-                                    ? null
-                                    : () => _disconnectFromSession(session),
-                                child: Text(
-                                  _connectingDeviceIds.contains(
-                                    session.deviceId,
-                                  )
-                                      ? 'Wait'
-                                      : 'Disconnect',
-                                ),
+                              subtitle: Text(
+                                '${session.type.label}\n'
+                                '${session.advertisedName} - ${session.deviceId}',
+                              ),
+                              isThreeLine: true,
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    tooltip: 'Rename',
+                                    icon: const Icon(Icons.edit),
+                                    onPressed: _connectingDeviceIds.contains(
+                                      session.deviceId,
+                                    )
+                                        ? null
+                                        : () => unawaited(
+                                              _renameDevice(
+                                                deviceId: session.deviceId,
+                                                advertisedName:
+                                                    session.advertisedName,
+                                              ),
+                                            ),
+                                  ),
+                                  FilledButton(
+                                    onPressed: _connectingDeviceIds.contains(
+                                      session.deviceId,
+                                    )
+                                        ? null
+                                        : () => _disconnectFromSession(session),
+                                    child: Text(
+                                      _connectingDeviceIds.contains(
+                                        session.deviceId,
+                                      )
+                                          ? 'Wait'
+                                          : 'Disconnect',
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           const Divider(height: 24),
@@ -3460,7 +3559,14 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
                           _BluetoothScanResultTile(
                             result: result,
                             displayName: _displayDeviceName(result),
+                            advertisedName: _advertisedDeviceName(result),
                             deviceId: _deviceId(result.device),
+                            onRename: () => unawaited(
+                              _renameDevice(
+                                deviceId: _deviceId(result.device),
+                                advertisedName: _advertisedDeviceName(result),
+                              ),
+                            ),
                             deviceType: _deviceType(result),
                             isConnected:
                                 _sessionForDeviceId(_deviceId(result.device)) !=
@@ -3496,28 +3602,152 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   }
 }
 
+class _DeviceRenameResult {
+  const _DeviceRenameResult(this.alias);
+
+  /// Null restores the advertised name.
+  final String? alias;
+}
+
+class _DeviceRenameDialog extends StatefulWidget {
+  const _DeviceRenameDialog({
+    required this.deviceId,
+    required this.advertisedName,
+    required this.currentAlias,
+  });
+
+  final String deviceId;
+  final String advertisedName;
+  final String? currentAlias;
+
+  @override
+  State<_DeviceRenameDialog> createState() => _DeviceRenameDialogState();
+}
+
+class _DeviceRenameDialogState extends State<_DeviceRenameDialog> {
+  late final TextEditingController _controller;
+  String? _errorText;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(
+      text: widget.currentAlias ?? widget.advertisedName,
+    );
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    final alias = DeviceAliasStore.normalize(_controller.text);
+    if (alias.isEmpty) {
+      setState(() {
+        _errorText = 'Enter a name.';
+      });
+      return;
+    }
+
+    if (alias == widget.advertisedName) {
+      Navigator.of(context).pop(const _DeviceRenameResult(null));
+      return;
+    }
+
+    if (DeviceAliasStore.deviceIdUsingAlias(
+          alias,
+          exceptDeviceId: widget.deviceId,
+        ) !=
+        null) {
+      setState(() {
+        _errorText = 'Another device already uses this name.';
+      });
+      return;
+    }
+
+    Navigator.of(context).pop(_DeviceRenameResult(alias));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Rename device'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Advertised name: ${widget.advertisedName}\nID: ${widget.deviceId}',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _controller,
+            autofocus: true,
+            maxLength: DeviceAliasStore.maxLength,
+            textInputAction: TextInputAction.done,
+            decoration: InputDecoration(
+              labelText: 'Name',
+              errorText: _errorText,
+            ),
+            onSubmitted: (_) => _save(),
+          ),
+          Text(
+            'Saved on this phone. Used in the app and in the CSV file.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
+      ),
+      actions: [
+        if (widget.currentAlias != null)
+          TextButton(
+            onPressed: () =>
+                Navigator.of(context).pop(const _DeviceRenameResult(null)),
+            child: const Text('Reset'),
+          ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _save,
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
 class _BluetoothScanResultTile extends StatelessWidget {
   const _BluetoothScanResultTile({
     required this.result,
     required this.displayName,
+    required this.advertisedName,
     required this.deviceId,
     required this.deviceType,
     required this.isConnected,
     required this.isBusy,
     required this.onPressed,
+    required this.onRename,
   });
 
   final ScanResult result;
   final String displayName;
+  final String advertisedName;
   final String deviceId;
   final KnownDeviceType deviceType;
   final bool isConnected;
   final bool isBusy;
   final VoidCallback onPressed;
+  final VoidCallback onRename;
 
   @override
   Widget build(BuildContext context) {
     final isUnsupported = deviceType == KnownDeviceType.unsupported;
+    final advertisedSuffix =
+        displayName == advertisedName ? '' : ' - $advertisedName';
 
     return ListTile(
       contentPadding: EdgeInsets.zero,
@@ -3525,18 +3755,30 @@ class _BluetoothScanResultTile extends StatelessWidget {
       subtitle: Text(
         isUnsupported
             ? '$displayName\n$deviceId - RSSI ${result.rssi} dBm'
-            : '${deviceType.label}\n$deviceId - RSSI ${result.rssi} dBm',
+            : '${deviceType.label}$advertisedSuffix\n'
+                '$deviceId - RSSI ${result.rssi} dBm',
       ),
       isThreeLine: true,
-      trailing: FilledButton(
-        onPressed: isUnsupported || isBusy ? null : onPressed,
-        child: Text(
-          isBusy
-              ? 'Wait'
-              : isConnected
-                  ? 'Disconnect'
-                  : 'Connect',
-        ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (!isUnsupported)
+            IconButton(
+              tooltip: 'Rename',
+              icon: const Icon(Icons.edit),
+              onPressed: isBusy ? null : onRename,
+            ),
+          FilledButton(
+            onPressed: isUnsupported || isBusy ? null : onPressed,
+            child: Text(
+              isBusy
+                  ? 'Wait'
+                  : isConnected
+                      ? 'Disconnect'
+                      : 'Connect',
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -5330,6 +5572,8 @@ class _WearableBleCommunicationLogPageState
         currentDevice: currentDevice,
         deviceId: currentDevice.remoteId.toString(),
         deviceName: widget.deviceName,
+        // Static BLE address: never fall back to a unit with the same name.
+        allowNameFallback: false,
       );
       if (!_canContinueWearableAutomaticBleReconnect()) {
         return;
