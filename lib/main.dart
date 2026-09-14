@@ -172,6 +172,9 @@ class _ActiveAcquisitionRuntime {
   }
 
   static Future<void> _ensureAndroidForegroundService() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
     try {
       await AndroidAcquisitionForegroundService.start();
     } catch (_) {
@@ -2030,21 +2033,25 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   Future<void> _activateAndroidBackgroundSupport() async {
-    if (!_acquisitionStarted || !Platform.isAndroid) {
+    if (!_acquisitionStarted) {
       return;
     }
 
-    await _requestAndroidNotificationPermission();
-    try {
-      await AndroidAcquisitionForegroundService.start();
-      _foregroundServiceStarted = true;
-    } catch (error) {
-      backgroundStatusMessage = _mergeStatusMessage(
-        backgroundStatusMessage,
-        'Android background acquisition may be unreliable: $error',
-      );
+    if (Platform.isAndroid) {
+      await _requestAndroidNotificationPermission();
+      try {
+        await AndroidAcquisitionForegroundService.start();
+        _foregroundServiceStarted = true;
+      } catch (error) {
+        backgroundStatusMessage = _mergeStatusMessage(
+          backgroundStatusMessage,
+          'Android background acquisition may be unreliable: $error',
+        );
+      }
     }
 
+    // Runtime state and recovery store are platform-independent: on iOS the
+    // app stays alive in background through UIBackgroundModes bluetooth-central.
     await _ActiveAcquisitionRuntime.markActive();
     await AcquisitionRecoveryStore.saveActive(
       acquisitionType: _sessions.length == 1
@@ -4887,27 +4894,26 @@ class _WearableDeviceConfigurationPageState
   }
 
   Future<void> _activateAndroidBackgroundSupport() async {
-    if (!Platform.isAndroid) {
-      return;
+    if (Platform.isAndroid) {
+      final notificationStatus = await Permission.notification.request();
+      if (!notificationStatus.isGranted) {
+        _backgroundStatusMessage = _mergeStatusMessage(
+          _backgroundStatusMessage,
+          'Android background acquisition may be unreliable without the persistent notification.',
+        );
+      }
+
+      try {
+        await AndroidAcquisitionForegroundService.start();
+      } catch (error) {
+        _backgroundStatusMessage = _mergeStatusMessage(
+          _backgroundStatusMessage,
+          'Android background acquisition may be unreliable: $error',
+        );
+      }
     }
 
-    final notificationStatus = await Permission.notification.request();
-    if (!notificationStatus.isGranted) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        'Android background acquisition may be unreliable without the persistent notification.',
-      );
-    }
-
-    try {
-      await AndroidAcquisitionForegroundService.start();
-    } catch (error) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        'Android background acquisition may be unreliable: $error',
-      );
-    }
-
+    // Platform-independent: see UIBackgroundModes bluetooth-central on iOS.
     await _ActiveAcquisitionRuntime.markActive();
     await AcquisitionRecoveryStore.saveActive(
       acquisitionType: KnownDeviceType.respiratoryMonitor.name,
@@ -7089,28 +7095,27 @@ class _AcquisitionInitializationPageState
   }
 
   Future<void> _activateAndroidBackgroundSupport() async {
-    if (!Platform.isAndroid) {
-      return;
+    if (Platform.isAndroid) {
+      final notificationStatus = await Permission.notification.request();
+      if (!notificationStatus.isGranted) {
+        _backgroundStatusMessage = _mergeStatusMessage(
+          _backgroundStatusMessage,
+          'Android background acquisition may be unreliable without the persistent notification.',
+        );
+      }
+
+      try {
+        await AndroidAcquisitionForegroundService.start();
+        _foregroundServiceStarted = true;
+      } catch (error) {
+        _backgroundStatusMessage = _mergeStatusMessage(
+          _backgroundStatusMessage,
+          'Android background acquisition may be unreliable: $error',
+        );
+      }
     }
 
-    final notificationStatus = await Permission.notification.request();
-    if (!notificationStatus.isGranted) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        'Android background acquisition may be unreliable without the persistent notification.',
-      );
-    }
-
-    try {
-      await AndroidAcquisitionForegroundService.start();
-      _foregroundServiceStarted = true;
-    } catch (error) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        'Android background acquisition may be unreliable: $error',
-      );
-    }
-
+    // Platform-independent: see UIBackgroundModes bluetooth-central on iOS.
     await _ActiveAcquisitionRuntime.markActive();
     await AcquisitionRecoveryStore.saveActive(
       acquisitionType: 'environmentalMonitor',

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:geolocator/geolocator.dart';
 
@@ -113,10 +114,20 @@ class GpsLocationService {
   }
 
   void _listenToPositionUpdates() {
-    const locationSettings = LocationSettings(
-      accuracy: LocationAccuracy.high,
-      distanceFilter: 0,
-    );
+    // iOS: keep updates alive in background (matches the Android foreground
+    // service of type location). Requires UIBackgroundModes location.
+    final LocationSettings locationSettings = Platform.isIOS
+        ? AppleSettings(
+            accuracy: LocationAccuracy.high,
+            distanceFilter: 0,
+            allowBackgroundLocationUpdates: true,
+            pauseLocationUpdatesAutomatically: false,
+            showBackgroundLocationIndicator: true,
+          )
+        : const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            distanceFilter: 0,
+          );
 
     _positionSubscription = Geolocator.getPositionStream(
       locationSettings: locationSettings,
