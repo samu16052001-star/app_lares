@@ -480,7 +480,9 @@ class UnifiedAcquisitionCsvLogger {
   }
 
   String _formatWearableSample(WearableAgmSample sample) {
-    return 'acc=(${sample.accX.toStringAsFixed(3)}, '
+    // t = sensor hardware timestamp (ms from sensor power-on), per sample.
+    return 't=${sample.timestampMs} ms, '
+        'acc=(${sample.accX.toStringAsFixed(3)}, '
         '${sample.accY.toStringAsFixed(3)}, '
         '${sample.accZ.toStringAsFixed(3)}) g, '
         'gyr=(${sample.gyrX.toStringAsFixed(3)}, '
