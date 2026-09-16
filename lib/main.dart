@@ -2171,7 +2171,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     unawaited(
-      DisconnectionNotifications.showDisconnected(session.deviceName),
+      DisconnectionNotifications.showDisconnected(
+        session.deviceName,
+        appInForeground: _ActiveAcquisitionRuntime.isForegroundVisible,
+      ),
     );
     unawaited(
       AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
@@ -4233,6 +4236,11 @@ class _MultiDeviceAcquisitionPageState
   void _startBleAlertAlarm() {
     _stopBleAlertAlarm();
     _playBleAlertCue();
+    if (!Platform.isAndroid) {
+      // iOS: un solo avviso per disconnessione, niente ripetizione.
+      return;
+    }
+
     _bleAlertBeepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       _playBleAlertCue();
     });
@@ -4244,14 +4252,12 @@ class _MultiDeviceAcquisitionPageState
   }
 
   void _playBleAlertCue() {
-    // iOS: avviso silenzioso. Niente suono ne vibrazione: resta il popup.
-    if (!Platform.isAndroid) {
-      return;
+    if (Platform.isAndroid) {
+      unawaited(
+        AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
+      );
     }
 
-    unawaited(
-      AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
-    );
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
@@ -5535,7 +5541,10 @@ class _WearableBleCommunicationLogPageState
     _notifyWearableBleAlertChanged();
 
     unawaited(
-      DisconnectionNotifications.showDisconnected(widget.deviceName),
+      DisconnectionNotifications.showDisconnected(
+        widget.deviceName,
+        appInForeground: _ActiveAcquisitionRuntime.isForegroundVisible,
+      ),
     );
     unawaited(
       AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
@@ -5747,6 +5756,11 @@ class _WearableBleCommunicationLogPageState
   void _startWearableBleAlertAlarm() {
     _stopWearableBleAlertAlarm();
     _playWearableBleAlertCue();
+    if (!Platform.isAndroid) {
+      // iOS: un solo avviso per disconnessione, niente ripetizione.
+      return;
+    }
+
     _bleAlertBeepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       _playWearableBleAlertCue();
     });
@@ -5758,14 +5772,12 @@ class _WearableBleCommunicationLogPageState
   }
 
   void _playWearableBleAlertCue() {
-    // iOS: avviso silenzioso. Niente suono ne vibrazione: resta il popup.
-    if (!Platform.isAndroid) {
-      return;
+    if (Platform.isAndroid) {
+      unawaited(
+        AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
+      );
     }
 
-    unawaited(
-      AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
-    );
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
@@ -7255,7 +7267,10 @@ class _AcquisitionInitializationPageState
     _initializationStarted = false;
 
     unawaited(
-      DisconnectionNotifications.showDisconnected(_deviceDisplayName),
+      DisconnectionNotifications.showDisconnected(
+        _deviceDisplayName,
+        appInForeground: _ActiveAcquisitionRuntime.isForegroundVisible,
+      ),
     );
     unawaited(
       AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
@@ -7634,6 +7649,11 @@ class _AcquisitionInitializationPageState
   void _startSingleBleAlertAlarm() {
     _stopSingleBleAlertAlarm();
     _playSingleBleAlertCue();
+    if (!Platform.isAndroid) {
+      // iOS: un solo avviso per disconnessione, niente ripetizione.
+      return;
+    }
+
     _bleAlertBeepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       _playSingleBleAlertCue();
     });
@@ -7645,14 +7665,12 @@ class _AcquisitionInitializationPageState
   }
 
   void _playSingleBleAlertCue() {
-    // iOS: avviso silenzioso. Niente suono ne vibrazione: resta il popup.
-    if (!Platform.isAndroid) {
-      return;
+    if (Platform.isAndroid) {
+      unawaited(
+        AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
+      );
     }
 
-    unawaited(
-      AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
-    );
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }

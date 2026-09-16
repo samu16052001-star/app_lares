@@ -62,8 +62,15 @@ class DisconnectionNotifications {
   /// One notification per disconnection, tagged with the device name.
   /// Each device keeps its own notification id, so simultaneous
   /// disconnections do not overwrite each other.
-  static Future<void> showDisconnected(String deviceName) async {
-    if (!Platform.isIOS) {
+  ///
+  /// With the app in foreground the alert is left to the in-app cue (sound and
+  /// vibration) plus the dialog, so the notification is skipped: iOS would
+  /// otherwise add a banner with a second sound.
+  static Future<void> showDisconnected(
+    String deviceName, {
+    required bool appInForeground,
+  }) async {
+    if (!Platform.isIOS || appInForeground) {
       return;
     }
 
