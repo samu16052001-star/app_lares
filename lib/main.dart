@@ -16,6 +16,7 @@ import 'package:app_lares/services/acquisition_recovery_store.dart';
 import 'package:app_lares/services/acquisition_csv_logger.dart';
 import 'package:app_lares/services/android_acquisition_foreground_service.dart';
 import 'package:app_lares/services/device_alias_store.dart';
+import 'package:app_lares/services/disconnection_notifications.dart';
 import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
@@ -114,11 +115,16 @@ class _ActiveAcquisitionRuntime {
 
   static Future<void> markActive() async {
     _isActive = true;
+    // Ask for the notification permission here: it is the single point every
+    // acquisition flow goes through, and the alert must work in background.
+    unawaited(DisconnectionNotifications.initialize());
   }
 
   static Future<void> markInactive() async {
     _isActive = false;
     _multiDeviceManager = null;
+    // Single exit point of every acquisition flow: drop pending alerts.
+    unawaited(DisconnectionNotifications.clearAll());
   }
 
   static Future<void> handlePaused() async {
@@ -2164,6 +2170,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       session.environmentalV2NotificationsStarted = false;
     }
 
+    unawaited(
+      DisconnectionNotifications.showDisconnected(session.deviceName),
+    );
     unawaited(
       AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
         session.deviceName,
@@ -5526,6 +5535,9 @@ class _WearableBleCommunicationLogPageState
     _notifyWearableBleAlertChanged();
 
     unawaited(
+      DisconnectionNotifications.showDisconnected(widget.deviceName),
+    );
+    unawaited(
       AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
         widget.deviceName,
       ),
@@ -7242,6 +7254,9 @@ class _AcquisitionInitializationPageState
     _notifySingleBleAlertChanged();
     _initializationStarted = false;
 
+    unawaited(
+      DisconnectionNotifications.showDisconnected(_deviceDisplayName),
+    );
     unawaited(
       AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
         _deviceDisplayName,
