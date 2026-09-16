@@ -18,6 +18,7 @@ import 'package:app_lares/services/android_acquisition_foreground_service.dart';
 import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
+import 'package:app_lares/services/respiratory_device_name_store.dart';
 import 'package:app_lares/services/unified_acquisition_csv_logger.dart';
 import 'package:app_lares/services/wearable_acquisition_csv_logger.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
@@ -1118,6 +1119,7 @@ class _ConnectedDeviceSession {
     required this.deviceId,
     required this.deviceName,
     required this.type,
+    this.customName,
     this.polarAddress,
     this.polarRssi,
   });
@@ -1130,8 +1132,15 @@ class _ConnectedDeviceSession {
 
   BluetoothDevice? device;
   final String deviceId;
+  // Original BLE name: never replace this with a user-defined name.
   final String deviceName;
   final KnownDeviceType type;
+  String? customName;
+
+  String get displayName => type == KnownDeviceType.respiratoryMonitor
+      ? customName ?? deviceName
+      : deviceName;
+
   String? polarDeviceId;
   String? polarAddress;
   int? polarRssi;
@@ -1512,10 +1521,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     try {
       for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
         if (!session.isConnected) {
-          throw StateError('${session.deviceName} is disconnected.');
+          throw StateError('${session.displayName} is disconnected.');
         }
         if (!session.isConfigured) {
-          throw StateError('${session.deviceName} is not configured.');
+          throw StateError('${session.displayName} is not configured.');
         }
 
         session
@@ -1537,7 +1546,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
             await _initializePolarH10(session);
             break;
           case KnownDeviceType.unsupported:
-            throw StateError('${session.deviceName} is unsupported.');
+            throw StateError('${session.displayName} is unsupported.');
         }
 
         session
@@ -1707,7 +1716,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           ..disconnectedDuringAcquisition = true
           ..reconnectStatus = _BleReconnectStatus.failed
           ..reconnectFailureMessage =
-              'Could not reconnect to ${session.deviceName}. Make sure the strap is worn and another app is not connected.';
+              'Could not reconnect to ${session.displayName}. Make sure the strap is worn and another app is not connected.';
         notifyListeners();
       }
       return;
@@ -1769,9 +1778,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           );
           break;
         case KnownDeviceType.polarH10:
-          throw StateError('${session.deviceName} is managed by the Polar SDK.');
+          throw StateError('${session.displayName} is managed by the Polar SDK.');
         case KnownDeviceType.unsupported:
-          throw StateError('${session.deviceName} is unsupported.');
+          throw StateError('${session.displayName} is unsupported.');
       }
       if (!_canContinueAutomaticBleReconnect() ||
           !_sessions.contains(session)) {
@@ -1803,7 +1812,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         ..disconnectedDuringAcquisition = true
         ..reconnectStatus = _BleReconnectStatus.failed
         ..reconnectFailureMessage =
-            'Could not reconnect to ${session.deviceName}. Move closer and try again.';
+            'Could not reconnect to ${session.displayName}. Move closer and try again.';
       notifyListeners();
     }
   }
@@ -2006,7 +2015,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       acquisitionType: _sessions.length == 1
           ? _sessions.first.type.name
           : 'multi-device',
-      deviceNames: [for (final session in _sessions) session.deviceName],
+      deviceNames: [for (final session in _sessions) session.displayName],
       deviceTypes: [for (final session in _sessions) session.type.name],
       configurationSummaries: _recoveryConfigurationSummaries,
       startedAt: _startedAt ?? DateTime.now(),
@@ -2098,7 +2107,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     unawaited(
       AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
-        session.deviceName,
+        session.displayName,
       ),
     );
     _bleAutoReconnectCoordinator.start();
@@ -2159,7 +2168,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     await service.initialize();
     if (!service.isReadyToContinue) {
-      throw StateError('${session.deviceName} BLE setup is not complete.');
+      throw StateError('${session.displayName} BLE setup is not complete.');
     }
 
     await service.startConfigurationSequence(
@@ -2179,14 +2188,14 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
                 state == WearableBleSequenceState.stopped;
           });
     if (state != WearableBleSequenceState.streaming) {
-      throw StateError('${session.deviceName} did not enter streaming mode.');
+      throw StateError('${session.displayName} did not enter streaming mode.');
     }
   }
 
   Future<void> _initializePolarH10(_ConnectedDeviceSession session) async {
     final configuration = session.polarConfiguration;
     if (configuration == null || !configuration.isValid) {
-      throw StateError('${session.deviceName} Polar H10 configuration is invalid.');
+      throw StateError('${session.displayName} Polar H10 configuration is invalid.');
     }
 
     session
@@ -2218,7 +2227,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
       final configuration = session.polarConfiguration;
       if (configuration == null || !configuration.isValid) {
-        session.errorMessage = '${session.deviceName} Polar H10 configuration is invalid.';
+        session.errorMessage = '${session.displayName} Polar H10 configuration is invalid.';
         continue;
       }
 
@@ -2318,7 +2327,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   Future<void> _reconnectPolarH10(_ConnectedDeviceSession session) async {
     final configuration = session.polarConfiguration;
     if (configuration == null || !configuration.isValid) {
-      throw StateError('${session.deviceName} Polar H10 configuration is invalid.');
+      throw StateError('${session.displayName} Polar H10 configuration is invalid.');
     }
 
     await session.polarEventsSubscription?.cancel();
@@ -2437,7 +2446,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     unawaited(
       csvLogger.appendPolarHrSample(
         receivedAt: sample.receivedAt,
-        deviceName: session.deviceName,
+        deviceName: session.displayName,
         gpsCoordinates: gpsLocationService.currentCoordinates,
         hrBpm: sample.hrBpm,
       ),
@@ -2460,7 +2469,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     unawaited(
       csvLogger.appendPolarEcgSamples(
-        deviceName: session.deviceName,
+        deviceName: session.displayName,
         gpsCoordinatesBySample: [
           for (var index = 0; index < samples.length; index += 1)
             gpsLocationService.currentCoordinates,
@@ -2510,7 +2519,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     unawaited(
       csvLogger.appendPolarAccelerometerSamples(
-        deviceName: session.deviceName,
+        deviceName: session.displayName,
         gpsCoordinatesBySample: [
           for (var index = 0; index < samples.length; index += 1)
             gpsLocationService.currentCoordinates,
@@ -2636,7 +2645,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     unawaited(
       csvLogger.appendEnvironmentalMessage(
         receivedAt: message.receivedAt,
-        deviceName: session.deviceName,
+        deviceName: session.displayName,
         gpsCoordinates: gpsLocationService.currentCoordinates,
         value: message.value,
       ),
@@ -2828,7 +2837,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     unawaited(
       csvLogger.appendWearableAgmBatch(
         receivedAt: event.receivedAt,
-        deviceName: session.deviceName,
+        deviceName: session.displayName,
         gpsCoordinates: gpsCoordinates,
         samples: event.samples,
       ),
@@ -2865,6 +2874,10 @@ class BluetoothScanningPage extends StatefulWidget {
 
 class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   final Map<String, ScanResult> _scanResults = {};
+  final Map<String, String> _savedRespiratoryNames = {};
+  final Map<String, TextEditingController> _respiratoryNameControllers = {};
+  late final Future<void> _namesLoaded;
+  bool _isSavingNames = false;
   final Map<String, int> _discoveryOrder = {};
   final Set<String> _connectingDeviceIds = {};
   final _MultiDeviceSessionManager _sessionManager =
@@ -2883,6 +2896,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     super.initState();
     _sessionManager.addListener(_handleSessionManagerChanged);
     _listenToScanState();
+    _namesLoaded = _loadRespiratoryNames();
   }
 
   @override
@@ -2892,7 +2906,45 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     _isScanningSubscription?.cancel();
     FlutterBluePlus.stopScan();
     unawaited(_sessionManager.disposeSessions());
+    for (final controller in _respiratoryNameControllers.values) {
+      controller.dispose();
+    }
     super.dispose();
+  }
+
+  Future<void> _loadRespiratoryNames() async {
+    try {
+      final names = await RespiratoryDeviceNameStore.loadAll();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _savedRespiratoryNames.addAll(names);
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'Could not load saved device names: $error';
+        });
+      }
+    }
+  }
+
+  bool get _hasValidRespiratoryNames {
+    // A pending IMU connection must receive its editable name before continuing.
+    for (final id in _connectingDeviceIds) {
+      final result = _scanResults[id];
+      if (result != null &&
+          _deviceType(result) == KnownDeviceType.respiratoryMonitor) {
+        return false;
+      }
+    }
+    return _sessionManager.sessions.every(
+      (session) => session.type != KnownDeviceType.respiratoryMonitor ||
+          (_respiratoryNameControllers[session.deviceId]
+                  ?.text.trim().isNotEmpty ??
+              false),
+    );
   }
 
   void _handleSessionManagerChanged() {
@@ -3032,8 +3084,13 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   }
 
   Future<void> _connectToDevice(ScanResult result) async {
+    await _namesLoaded;
+    if (!mounted || _isSavingNames) {
+      return;
+    }
     final device = result.device;
     final id = _deviceId(device);
+    final originalName = _originalDeviceName(result);
     final displayName = _displayDeviceName(result);
     final deviceType = _deviceType(result);
 
@@ -3063,7 +3120,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         _sessionManager.addConnectedSession(
           _ConnectedDeviceSession(
             deviceId: id,
-            deviceName: displayName,
+            deviceName: originalName,
             type: deviceType,
             polarAddress: id,
             polarRssi: result.rssi,
@@ -3087,12 +3144,22 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         return;
       }
 
+      if (deviceType == KnownDeviceType.respiratoryMonitor) {
+        final controller = _respiratoryNameControllers.putIfAbsent(
+          id,
+          () => TextEditingController(),
+        );
+        controller.text = displayName;
+      }
       _sessionManager.addConnectedSession(
         _ConnectedDeviceSession(
           device: device,
           deviceId: id,
-          deviceName: displayName,
+          deviceName: originalName,
           type: deviceType,
+          customName: deviceType == KnownDeviceType.respiratoryMonitor
+              ? _savedRespiratoryNames[id]
+              : null,
         ),
       );
       setState(() {
@@ -3141,6 +3208,16 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   }
 
   String _displayDeviceName(ScanResult result) {
+    if (_deviceType(result) == KnownDeviceType.respiratoryMonitor) {
+      final savedName = _savedRespiratoryNames[_deviceId(result.device)];
+      if (savedName != null) {
+        return savedName;
+      }
+    }
+    return _originalDeviceName(result);
+  }
+
+  String _originalDeviceName(ScanResult result) {
     final names = _deviceNameCandidates(result);
     final environmentalV2Name =
         KnownDeviceClassifier.environmentalV2NameFrom(names);
@@ -3165,24 +3242,65 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   }
 
   Future<void> _continueToDeviceConfiguration() async {
-    if (!_sessionManager.hasConnectedDevices) {
+    if (!_sessionManager.hasConnectedDevices ||
+        !_hasValidRespiratoryNames ||
+        _isSavingNames) {
       return;
     }
 
-    await _stopScanBeforeNavigation();
-    if (!mounted) {
-      return;
-    }
+    setState(() {
+      _isSavingNames = true;
+    });
+    try {
+      final respiratorySessions = _sessionManager.sessions
+          .where((session) =>
+              session.type == KnownDeviceType.respiratoryMonitor)
+          .toList(growable: false);
+      final names = <String, String>{
+        for (final session in respiratorySessions)
+          session.deviceId:
+              _respiratoryNameControllers[session.deviceId]!.text.trim(),
+      };
+      for (final entry in names.entries) {
+        await RespiratoryDeviceNameStore.save(entry.key, entry.value);
+      }
+      if (!mounted) {
+        return;
+      }
+      for (final session in respiratorySessions) {
+        final name = names[session.deviceId]!;
+        session.customName = name;
+        _respiratoryNameControllers[session.deviceId]!.text = name;
+      }
+      _savedRespiratoryNames.addAll(names);
 
-    unawaited(
-      Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => _MultiDeviceConfigurationPage(
-            manager: _sessionManager,
+      await _stopScanBeforeNavigation();
+      if (!mounted || !_sessionManager.hasConnectedDevices) {
+        return;
+      }
+
+      unawaited(
+        Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => _MultiDeviceConfigurationPage(
+              manager: _sessionManager,
+            ),
           ),
         ),
-      ),
-    );
+      );
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'Could not save device names: $error';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSavingNames = false;
+        });
+      }
+    }
   }
 
   Future<void> _stopScanBeforeNavigation() async {
@@ -3195,7 +3313,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
   Future<void> _disconnectFromSession(_ConnectedDeviceSession session) async {
     final id = session.deviceId;
-    final displayName = session.deviceName;
+    final displayName = session.displayName;
 
     setState(() {
       _connectingDeviceIds.add(id);
@@ -3373,12 +3491,30 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
                           const SizedBox(height: 8),
                           for (final session in connectedSessions)
                             ListTile(
+                              key: ValueKey(session.deviceId),
                               contentPadding: EdgeInsets.zero,
                               leading: const Icon(Icons.bluetooth_connected),
-                              title: Text(session.deviceName),
+                              title: session.type ==
+                                      KnownDeviceType.respiratoryMonitor
+                                  ? TextField(
+                                      controller: _respiratoryNameControllers[
+                                          session.deviceId],
+                                      enabled: !_isSavingNames,
+                                      decoration: InputDecoration(
+                                        labelText: 'Device name',
+                                        errorText: _respiratoryNameControllers[
+                                                    session.deviceId]!
+                                                .text.trim().isEmpty
+                                            ? 'Enter a device name'
+                                            : null,
+                                      ),
+                                      onChanged: (_) => setState(() {}),
+                                    )
+                                  : Text(session.displayName),
                               subtitle: Text(session.type.label),
                               trailing: FilledButton(
-                                onPressed: _connectingDeviceIds.contains(
+                                onPressed: _isSavingNames ||
+                                    _connectingDeviceIds.contains(
                                   session.deviceId,
                                 )
                                     ? null
@@ -3410,7 +3546,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
                             isConnected:
                                 _sessionForDeviceId(_deviceId(result.device)) !=
                                     null,
-                            isBusy: _connectingDeviceIds.contains(
+                            isBusy: _isSavingNames || _connectingDeviceIds.contains(
                               _deviceId(result.device),
                             ),
                             onPressed: () => unawaited(_toggleConnection(result)),
@@ -3427,7 +3563,9 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
                 width: double.infinity,
                 height: 52,
                 child: FilledButton(
-                  onPressed: _sessionManager.hasConnectedDevices
+                  onPressed: _sessionManager.hasConnectedDevices &&
+                          _hasValidRespiratoryNames &&
+                          !_isSavingNames
                       ? _continueToDeviceConfiguration
                       : null,
                   child: const Text('Continue'),
@@ -3560,6 +3698,7 @@ class _MultiDeviceConfigurationPageState
             builder: (_) => WearableDeviceConfigurationPage(
               device: session.bleDevice,
               deviceName: session.deviceName,
+              customName: session.customName,
               initialConfiguration: session.wearableConfiguration,
               onConfigurationConfirmed: (configuration) {
                 widget.manager.configureWearable(session, configuration);
@@ -3572,7 +3711,7 @@ class _MultiDeviceConfigurationPageState
         await Navigator.of(context).push(
           MaterialPageRoute<void>(
             builder: (_) => PolarH10ConfigurationPage(
-              deviceName: session.deviceName,
+              deviceName: session.displayName,
               initialConfiguration: session.polarConfiguration,
               onConfigurationConfirmed: (configuration) {
                 widget.manager.configurePolarH10(session, configuration);
@@ -3623,7 +3762,7 @@ class _MultiDeviceConfigurationPageState
                       final session = sessions[index];
                       return Card(
                         child: ListTile(
-                          title: Text(session.deviceName),
+                          title: Text(session.displayName),
                           subtitle: Text(session.type.label),
                           leading: const Icon(Icons.bluetooth_connected),
                           trailing: session.isConfigured
@@ -3886,7 +4025,7 @@ class _MultiDeviceAcquisitionPageState
   ) {
     return _BleDisconnectionAlertItem(
       id: session.deviceId,
-      deviceName: session.deviceName,
+      deviceName: session.displayName,
       status: session.reconnectStatus,
       reconnectEnabled:
           !widget.manager.isBleReconnectOperationInProgress &&
@@ -4097,7 +4236,7 @@ class _MultiDeviceAcquisitionPageState
           disconnected ? Icons.bluetooth_disabled : Icons.bluetooth_connected,
           color: disconnected ? colorScheme.error : colorScheme.primary,
         ),
-        title: Text(session.deviceName),
+        title: Text(session.displayName),
         subtitle: Text(
           disconnected ? '${session.type.label} - Disconnected' : session.type.label,
         ),
@@ -4639,13 +4778,16 @@ class WearableDeviceConfigurationPage extends StatefulWidget {
     super.key,
     required this.device,
     required this.deviceName,
+    this.customName,
     this.initialConfiguration,
     this.onConfigurationConfirmed,
     this.onDisconnected,
   });
 
   final BluetoothDevice device;
+  // Keep the BLE name separate for the legacy acquisition reconnect flow.
   final String deviceName;
+  final String? customName;
   final WearableDeviceConfiguration? initialConfiguration;
   final ValueChanged<WearableDeviceConfiguration>? onConfigurationConfirmed;
   final VoidCallback? onDisconnected;
@@ -4660,6 +4802,9 @@ class _WearableDeviceConfigurationPageState
   WearableConfigurationBleService? _service;
   WearableAcquisitionCsvLogger? _csvLogger;
   GpsLocationService? _gpsLocationService;
+  String? _customName;
+
+  String get _displayName => _customName ?? widget.deviceName;
 
   static const List<int> _odrValues = [12, 26, 52, 104, 208, 416];
   static const List<int> _accGValues = [2, 4, 8, 16];
@@ -4685,6 +4830,7 @@ class _WearableDeviceConfigurationPageState
   @override
   void initState() {
     super.initState();
+    _customName = widget.customName;
     final initialConfiguration = widget.initialConfiguration;
     if (initialConfiguration != null) {
       odr = initialConfiguration.odr;
@@ -4796,6 +4942,7 @@ class _WearableDeviceConfigurationPageState
             service: service,
             csvLogger: csvLogger,
             deviceName: widget.deviceName,
+            customName: _customName,
             stopWearableCsvLogging: _stopWearableCsvLogging,
             onAcquisitionStopped: _handleWearableAcquisitionStopped,
             backgroundStatusMessage: _backgroundStatusMessage,
@@ -4849,7 +4996,7 @@ class _WearableDeviceConfigurationPageState
     await _ActiveAcquisitionRuntime.markActive();
     await AcquisitionRecoveryStore.saveActive(
       acquisitionType: KnownDeviceType.respiratoryMonitor.name,
-      deviceNames: [widget.deviceName],
+      deviceNames: [_displayName],
       deviceTypes: [KnownDeviceType.respiratoryMonitor.name],
       configurationSummaries: [
         _summarizeWearableConfiguration(
@@ -4896,6 +5043,11 @@ class _WearableDeviceConfigurationPageState
       return;
     }
 
+    // The standalone wearable path must resolve the same persisted IMU name
+    // before subscribing to AGM data, while retaining widget.deviceName for BLE.
+    _customName ??= await RespiratoryDeviceNameStore.load(
+      widget.device.remoteId.toString(),
+    );
     await csvLogger.start();
     await gpsLocationService.start();
     final gpsStatusMessage = gpsLocationService.statusMessage;
@@ -4911,7 +5063,7 @@ class _WearableDeviceConfigurationPageState
       unawaited(
         csvLogger.appendAgmBatch(
           receivedAt: event.receivedAt,
-          deviceName: widget.deviceName,
+          deviceName: _displayName,
           gpsCoordinates: gpsCoordinates,
           samples: event.samples,
         ),
@@ -5055,6 +5207,7 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
     required this.service,
     required this.csvLogger,
     required this.deviceName,
+    this.customName,
     required this.stopWearableCsvLogging,
     required this.onAcquisitionStopped,
     this.backgroundStatusMessage,
@@ -5062,7 +5215,12 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
 
   final WearableConfigurationBleService service;
   final WearableAcquisitionCsvLogger csvLogger;
+  // Original BLE name used by _BleReconnectHelper.
   final String deviceName;
+  final String? customName;
+
+  String get displayName => customName ?? deviceName;
+
   final Future<void> Function() stopWearableCsvLogging;
   final VoidCallback onAcquisitionStopped;
   final String? backgroundStatusMessage;
@@ -5215,7 +5373,7 @@ class _WearableBleCommunicationLogPageState
 
     unawaited(
       AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
-        widget.deviceName,
+        widget.displayName,
       ),
     );
     _bleAutoReconnectCoordinator.start();
@@ -5296,7 +5454,7 @@ class _WearableBleCommunicationLogPageState
         _bleDisconnectedDuringAcquisition = true;
         _bleReconnectStatus = _BleReconnectStatus.failed;
         _bleReconnectFailureMessage =
-            'Could not reconnect to ${widget.deviceName}. Move closer and try again.';
+            'Could not reconnect to ${widget.displayName}. Move closer and try again.';
       });
       _notifyWearableBleAlertChanged();
     }
@@ -5389,7 +5547,7 @@ class _WearableBleCommunicationLogPageState
   _BleDisconnectionAlertItem get _wearableBleAlertItem {
     return _BleDisconnectionAlertItem(
       id: widget.service.device.remoteId.toString(),
-      deviceName: widget.deviceName,
+      deviceName: widget.displayName,
       status: _bleReconnectStatus,
       reconnectEnabled: !_bleAutoReconnectCoordinator.isOperationInProgress &&
           !_isStoppingAcquisition &&
