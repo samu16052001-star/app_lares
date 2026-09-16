@@ -4235,12 +4235,14 @@ class _MultiDeviceAcquisitionPageState
   }
 
   void _playBleAlertCue() {
-    if (Platform.isAndroid) {
-      unawaited(
-        AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
-      );
+    // iOS: avviso silenzioso. Niente suono ne vibrazione: resta il popup.
+    if (!Platform.isAndroid) {
+      return;
     }
 
+    unawaited(
+      AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
+    );
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
@@ -5744,12 +5746,14 @@ class _WearableBleCommunicationLogPageState
   }
 
   void _playWearableBleAlertCue() {
-    if (Platform.isAndroid) {
-      unawaited(
-        AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
-      );
+    // iOS: avviso silenzioso. Niente suono ne vibrazione: resta il popup.
+    if (!Platform.isAndroid) {
+      return;
     }
 
+    unawaited(
+      AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
+    );
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
@@ -7626,12 +7630,14 @@ class _AcquisitionInitializationPageState
   }
 
   void _playSingleBleAlertCue() {
-    if (Platform.isAndroid) {
-      unawaited(
-        AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
-      );
+    // iOS: avviso silenzioso. Niente suono ne vibrazione: resta il popup.
+    if (!Platform.isAndroid) {
+      return;
     }
 
+    unawaited(
+      AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue(),
+    );
     unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
