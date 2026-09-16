@@ -630,6 +630,41 @@ String _mergeStatusMessage(String? current, String message) {
   return '$current\n$message';
 }
 
+Future<bool> _confirmStopAcquisition(BuildContext context) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (dialogContext) {
+      final colorScheme = Theme.of(dialogContext).colorScheme;
+      return PopScope<bool>(
+        canPop: false,
+        child: AlertDialog(
+          title: const Text('Stop acquisition?'),
+          content: const Text(
+            'Are you sure you want to stop the acquisition? '
+            'This action will end the current acquisition.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: colorScheme.error,
+                foregroundColor: colorScheme.onError,
+              ),
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Stop acquisition'),
+            ),
+          ],
+        ),
+      );
+    },
+  );
+  return confirmed == true;
+}
+
 enum _BleReconnectStatus {
   disconnected,
   reconnecting,
@@ -3906,6 +3941,7 @@ class _MultiDeviceAcquisitionPage extends StatefulWidget {
 
 class _MultiDeviceAcquisitionPageState
     extends State<_MultiDeviceAcquisitionPage> with WidgetsBindingObserver {
+  bool _stopConfirmationOpen = false;
   final Set<String> _dismissedBleAlertKeys = {};
   Timer? _bleAlertBeepTimer;
   BuildContext? _bleAlertDialogContext;
@@ -4085,6 +4121,24 @@ class _MultiDeviceAcquisitionPageState
     return widget.manager.disconnectedSessionsDuringAcquisition.where((session) {
       return !_dismissedBleAlertKeys.contains(_bleAlertKey(session));
     }).toList(growable: false);
+  }
+
+  Future<void> _requestStopAcquisition() async {
+    if (!mounted || _stopConfirmationOpen || widget.manager.isStopping) {
+      return;
+    }
+
+    _stopConfirmationOpen = true;
+    final bool confirmed;
+    try {
+      confirmed = await _confirmStopAcquisition(context);
+    } finally {
+      _stopConfirmationOpen = false;
+    }
+    if (!mounted || !confirmed) {
+      return;
+    }
+    await _stopAcquisition();
   }
 
   Future<void> _stopAcquisition() async {
@@ -4591,7 +4645,7 @@ class _MultiDeviceAcquisitionPageState
         width: double.infinity,
         height: 48,
         child: FilledButton(
-          onPressed: widget.manager.isStopping ? null : _stopAcquisition,
+          onPressed: widget.manager.isStopping ? null : _requestStopAcquisition,
           child: Text(
             widget.manager.isStopping ? 'Stopping...' : 'Stop acquisition',
           ),
@@ -5232,6 +5286,7 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
 
 class _WearableBleCommunicationLogPageState
     extends State<WearableBleCommunicationLogPage> with WidgetsBindingObserver {
+  bool _stopConfirmationOpen = false;
   static const Duration _visibleChartWindow = Duration(seconds: 2);
   static const Duration _uiRefreshInterval = Duration(milliseconds: 500);
 
@@ -5654,6 +5709,27 @@ class _WearableBleCommunicationLogPageState
     });
   }
 
+  Future<void> _requestStopAcquisition() async {
+    if (!mounted ||
+        _stopConfirmationOpen ||
+        _isStoppingAcquisition ||
+        widget.service.isStopping) {
+      return;
+    }
+
+    _stopConfirmationOpen = true;
+    final bool confirmed;
+    try {
+      confirmed = await _confirmStopAcquisition(context);
+    } finally {
+      _stopConfirmationOpen = false;
+    }
+    if (!mounted || !confirmed) {
+      return;
+    }
+    await _stopAcquisition();
+  }
+
   Future<void> _stopAcquisition() async {
     if (_isStoppingAcquisition || widget.service.isStopping) {
       return;
@@ -5916,7 +5992,7 @@ class _WearableBleCommunicationLogPageState
         width: double.infinity,
         height: 48,
         child: FilledButton(
-          onPressed: isStopping ? null : _stopAcquisition,
+          onPressed: isStopping ? null : _requestStopAcquisition,
           child: Text(isStopping ? 'Stopping...' : 'Stop acquisition'),
         ),
       ),
@@ -6896,6 +6972,7 @@ class AcquisitionInitializationPage extends StatefulWidget {
 
 class _AcquisitionInitializationPageState
     extends State<AcquisitionInitializationPage> with WidgetsBindingObserver {
+  bool _stopConfirmationOpen = false;
   late BluetoothDevice _activeDevice;
   late final String _deviceDisplayName;
   late final BleConfigurationService _service;
@@ -7584,6 +7661,27 @@ class _AcquisitionInitializationPageState
     return platformName.isEmpty ? 'Unknown device' : platformName;
   }
 
+  Future<void> _requestStopAcquisition() async {
+    if (!mounted ||
+        _stopConfirmationOpen ||
+        _isStoppingAcquisition ||
+        _acquisitionStopped) {
+      return;
+    }
+
+    _stopConfirmationOpen = true;
+    final bool confirmed;
+    try {
+      confirmed = await _confirmStopAcquisition(context);
+    } finally {
+      _stopConfirmationOpen = false;
+    }
+    if (!mounted || !confirmed) {
+      return;
+    }
+    await _stopAcquisition();
+  }
+
   Future<void> _stopAcquisition() async {
     if (_isStoppingAcquisition || _acquisitionStopped) {
       return;
@@ -7832,7 +7930,7 @@ class _AcquisitionInitializationPageState
         width: double.infinity,
         height: 48,
         child: FilledButton(
-          onPressed: _isStoppingAcquisition ? null : _stopAcquisition,
+          onPressed: _isStoppingAcquisition ? null : _requestStopAcquisition,
           child: Text(
             _isStoppingAcquisition ? 'Stopping...' : 'Stop acquisition',
           ),
