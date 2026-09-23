@@ -1359,7 +1359,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   final List<_ConnectedDeviceSession> _sessions = [];
   final UnifiedAcquisitionCsvLogger csvLogger = UnifiedAcquisitionCsvLogger();
   final GpsLocationService gpsLocationService = GpsLocationService();
-  final OpenRemoteMqttService mqttService = OpenRemoteMqttService();
+  final OpenRemoteMqttService mqttService = OpenRemoteMqttService(
+    includeConnectionDiagnostics: true,
+  );
   late final _BleAutoReconnectCoordinator _bleAutoReconnectCoordinator;
   final Set<String> _dismissedBleAutoReconnectAlertKeys = {};
 

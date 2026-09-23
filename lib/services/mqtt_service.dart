@@ -35,7 +35,9 @@ class OpenRemoteMqttException implements Exception {
 }
 
 class OpenRemoteMqttService {
-  OpenRemoteMqttService();
+  OpenRemoteMqttService({this.includeConnectionDiagnostics = false});
+
+  final bool includeConnectionDiagnostics;
 
   final StreamController<OpenRemoteMqttState> _stateController =
       StreamController<OpenRemoteMqttState>.broadcast();
@@ -228,10 +230,16 @@ class OpenRemoteMqttService {
         manualAttempt: manualAttempt,
       );
     } on TimeoutException {
+      // Capture the observed MQTT status before error cleanup disconnects it.
+      final connectionStatus = _client?.connectionStatus;
       _handleConnectError(
         _connectionFailureMessage(
           'OpenRemote connection timed out.',
           config: _config,
+          detail: includeConnectionDiagnostics
+              ? 'MQTT state: ${connectionStatus?.state.name ?? 'unavailable'}; '
+                  'return code: ${connectionStatus?.returnCode?.name ?? 'unavailable'}.'
+              : null,
           hint: 'check network reachability, broker status and OR_PORT.',
         ),
         manualAttempt: manualAttempt,
