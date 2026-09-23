@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
+import 'package:uuid/uuid.dart';
 
 enum OpenRemoteMqttStatus {
   disconnected,
@@ -35,9 +36,15 @@ class OpenRemoteMqttException implements Exception {
 }
 
 class OpenRemoteMqttService {
-  OpenRemoteMqttService({this.includeConnectionDiagnostics = false});
+  OpenRemoteMqttService({
+    this.includeConnectionDiagnostics = false,
+    bool useUniqueClientId = false,
+  }) : _clientIdSuffix = useUniqueClientId ? const Uuid().v4() : null;
 
   final bool includeConnectionDiagnostics;
+  // Each current-flow session has its own ID, retained across all retries.
+  // Leave the legacy client ID unchanged unless explicitly enabled.
+  final String? _clientIdSuffix;
 
   final StreamController<OpenRemoteMqttState> _stateController =
       StreamController<OpenRemoteMqttState>.broadcast();
@@ -156,7 +163,10 @@ class OpenRemoteMqttService {
     );
 
     try {
-      _config ??= await _OpenRemoteMqttConfig.load(assetId: _assetId!);
+      _config ??= await _OpenRemoteMqttConfig.load(
+        assetId: _assetId!,
+        clientIdSuffix: _clientIdSuffix,
+      );
       final config = _config!;
       final client = MqttServerClient(config.host, config.clientId)
         ..port = config.port
@@ -476,7 +486,10 @@ class _OpenRemoteMqttConfig {
   String topicForAttribute(String attribute) =>
       '$realm/$clientId/writeattributevalue/$attribute/$assetId';
 
-  static Future<_OpenRemoteMqttConfig> load({required String assetId}) async {
+  static Future<_OpenRemoteMqttConfig> load({
+    required String assetId,
+    String? clientIdSuffix,
+  }) async {
     // Local .env credentials are acceptable only for this internal prototype,
     // not for a publicly distributed app.
     try {
@@ -509,7 +522,9 @@ class _OpenRemoteMqttConfig {
       useTls: useTls,
       tlsInsecure: tlsInsecure,
       realm: realm,
-      clientId: clientPrefix,
+      clientId: clientIdSuffix == null
+          ? clientPrefix
+          : '$clientPrefix-$clientIdSuffix',
       username: '$realm:$rawUsername',
       password: password,
       assetId: assetId,
