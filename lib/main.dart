@@ -1332,23 +1332,28 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     );
   }
 
+  static const _openRemoteAssetIdByEnvironmentalDeviceName = <String, String>{
+    'LARES_ENV_V1_106': '7l9c0BynTv7UqckE045gaf',
+    'LARES_ENV_V1_06': '39xOKe65bmS7yhutTrk100',
+  };
+
   static const _openRemoteAttributeByEnvironmentalPrefix = <String, String>{
-    'PM10': 'PM10',
-    'CO2': 'CO2',
-    'CO': 'CO',
-    'PM2.5': 'PM25',
-    'TEM1': 'InternalTemperature',
-    'HUM1': 'InternalHumidity',
-    'VOC': 'VOC',
-    'NOX': 'NOX',
-    'VOCi': 'VOCindex',
-    'NOXi': 'NOXindex',
-    'NH3': 'NH3',
-    'NO2': 'NO2',
-    'PM1.0': 'PM1',
-    'TEM2': 'ExternalTemperature',
-    'HUM2': 'ExternalHumidity',
-    'PRE': 'Pressure',
+    'CO2': 'co2',
+    'CO': 'co',
+    'PM2.5': 'pm2_5',
+    'PM10': 'pm10',
+    'TEM1': 'internalTemperature',
+    'HUM1': 'internalHumidity',
+    'VOC': 'voc',
+    'NOX': 'nox',
+    'VOCi': 'vocIndex',
+    'NOXi': 'noxIndex',
+    'NH3': 'nh3',
+    'NO2': 'no2',
+    'PM1.0': 'pm1',
+    'TEM2': 'externalTemperature',
+    'HUM2': 'externalHumidity',
+    'PRE': 'pressure',
   };
 
   final List<_ConnectedDeviceSession> _sessions = [];
@@ -1404,9 +1409,17 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
   bool get isAndroidBackgroundServiceActive => _foregroundServiceStarted;
 
-  bool get canUseOpenRemote {
-    return _sessions.length == 1 &&
-        _sessions.first.type == KnownDeviceType.environmentalMonitor;
+  bool get canUseOpenRemote => _openRemoteAssetId != null;
+
+  String? get _openRemoteAssetId {
+    if (_sessions.length != 1 ||
+        _sessions.first.type != KnownDeviceType.environmentalMonitor) {
+      return null;
+    }
+
+    return _openRemoteAssetIdByEnvironmentalDeviceName[
+      _sessions.first.deviceName
+    ];
   }
 
   List<String> get _recoveryConfigurationSummaries {
@@ -1602,7 +1615,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   Future<void> connectOpenRemote() async {
-    if (!canUseOpenRemote ||
+    final assetId = _openRemoteAssetId;
+    if (assetId == null ||
         mqttState.status == OpenRemoteMqttStatus.connecting ||
         mqttState.status == OpenRemoteMqttStatus.connected) {
       return;
@@ -1610,7 +1624,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     _openRemoteLocationConnectionPending =
         !_disposed && _acquisitionStarted && !_isStopping;
-    await mqttService.connect();
+    await mqttService.connect(assetId: assetId);
     if (mqttService.isConnected) {
       _completePendingOpenRemoteLocationAuthorization();
     } else {
@@ -7564,7 +7578,9 @@ class _AcquisitionInitializationPageState
       return;
     }
 
-    await _mqttService.connect();
+    // Preserve the legacy target explicitly; device mapping belongs to the
+    // current multi-device session manager only.
+    await _mqttService.connect(assetId: '1zKVSJ8J0enUWtWRBY4bul');
   }
 
   Future<void> _publishPm10IfConnected(String bleValue) async {

@@ -42,6 +42,7 @@ class OpenRemoteMqttService {
 
   MqttServerClient? _client;
   _OpenRemoteMqttConfig? _config;
+  String? _assetId;
   Timer? _reconnectTimer;
   bool _connectRequested = false;
   bool _connectInProgress = false;
@@ -59,11 +60,18 @@ class OpenRemoteMqttService {
 
   bool get isConnected => _state.isConnected;
 
-  Future<void> connect() async {
+  Future<void> connect({required String assetId}) async {
     if (_disposed || _connectInProgress || isConnected) {
       return;
     }
 
+    if (assetId.isEmpty || (_assetId != null && _assetId != assetId)) {
+      return;
+    }
+
+    // Bind this service to the manually selected asset, including retries and
+    // automatic reconnections. Both measurement and location topics use it.
+    _assetId ??= assetId;
     _connectRequested = true;
     _reconnectAttempt = 0;
     _reconnectTimer?.cancel();
@@ -146,7 +154,7 @@ class OpenRemoteMqttService {
     );
 
     try {
-      _config ??= await _OpenRemoteMqttConfig.load();
+      _config ??= await _OpenRemoteMqttConfig.load(assetId: _assetId!);
       final config = _config!;
       final client = MqttServerClient(config.host, config.clientId)
         ..port = config.port
@@ -445,7 +453,6 @@ class _OpenRemoteMqttConfig {
     required this.username,
     required this.password,
     required this.assetId,
-    required this.attribute,
   });
 
   final String host;
@@ -457,15 +464,11 @@ class _OpenRemoteMqttConfig {
   final String username;
   final String password;
   final String assetId;
-  final String attribute;
-
-  String get topic =>
-      topicForAttribute(attribute);
 
   String topicForAttribute(String attribute) =>
       '$realm/$clientId/writeattributevalue/$attribute/$assetId';
 
-  static Future<_OpenRemoteMqttConfig> load() async {
+  static Future<_OpenRemoteMqttConfig> load({required String assetId}) async {
     // Local .env credentials are acceptable only for this internal prototype,
     // not for a publicly distributed app.
     try {
@@ -491,8 +494,6 @@ class _OpenRemoteMqttConfig {
     ]);
     final rawUsername = _required('OR_USERNAME');
     final password = _required('OR_PASSWORD');
-    final assetId = _required('OR_ASSET_ID');
-    final attribute = _required('OR_ATTRIBUTE');
 
     return _OpenRemoteMqttConfig(
       host: host,
@@ -504,7 +505,6 @@ class _OpenRemoteMqttConfig {
       username: '$realm:$rawUsername',
       password: password,
       assetId: assetId,
-      attribute: attribute,
     );
   }
 
