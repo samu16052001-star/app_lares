@@ -1,8 +1,14 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 
 class GpsLocationService {
+  static const EventChannel _androidPositions =
+      EventChannel('app_lares/acquisition_location');
+  static const MethodChannel _androidRuntime =
+      MethodChannel('app_lares/acquisition_foreground_service');
   final StreamController<Position> _livePositionController =
       StreamController<Position>.broadcast(sync: true);
   StreamSubscription<Position>? _positionSubscription;
@@ -12,6 +18,7 @@ class GpsLocationService {
   bool _locationServicesEnabled = false;
   bool _hasLocationPermission = false;
   String? _statusMessage;
+  Future<void>? _androidResumeFuture;
 
   String? get statusMessage => _statusMessage;
 
@@ -69,6 +76,33 @@ class GpsLocationService {
     _serviceStatusSubscription = null;
   }
 
+  Future<void> resumeAfterAndroidActivityAttached() async {
+    if (!Platform.isAndroid || !_isStarted || _positionSubscription != null) {
+      return;
+    }
+    final pending = _androidResumeFuture;
+    if (pending != null) return pending;
+    final operation = _resumeAndroidGps();
+    _androidResumeFuture = operation;
+    try {
+      await operation;
+    } finally {
+      _androidResumeFuture = null;
+    }
+  }
+
+  Future<void> _resumeAndroidGps() async {
+    if (await _androidRuntime.invokeMethod<bool>('isActivityAttached') != true ||
+        !_isStarted || _positionSubscription != null) {
+      return;
+    }
+    await _serviceStatusSubscription?.cancel();
+    _serviceStatusSubscription = null;
+    if (!_isStarted) return;
+    _isStarted = false;
+    await start();
+  }
+
   Future<void> dispose() async {
     await stop();
     await _livePositionController.close();
@@ -77,6 +111,11 @@ class GpsLocationService {
   Future<bool> _ensurePermission() async {
     var permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
+      // A sticky Android service restart has no Activity for a permission dialog.
+      if (Platform.isAndroid &&
+          await _androidRuntime.invokeMethod<bool>('isActivityAttached') != true) {
+        return false;
+      }
       permission = await Geolocator.requestPermission();
     }
 
@@ -118,15 +157,23 @@ class GpsLocationService {
       distanceFilter: 0,
     );
 
-    _positionSubscription = Geolocator.getPositionStream(
-      locationSettings: locationSettings,
-    ).listen(
+    final positions = Platform.isAndroid
+        ? _androidPositions.receiveBroadcastStream(<String, Object>{
+            'accuracy': locationSettings.accuracy.index,
+            'distanceFilter': locationSettings.distanceFilter,
+          }).map((event) => Position.fromMap(Map<String, dynamic>.from(event as Map)))
+        : Geolocator.getPositionStream(locationSettings: locationSettings);
+    _positionSubscription = positions.listen(
       (position) {
         _latestPosition = position;
+        _statusMessage = null;
         _livePositionController.add(position);
       },
       onError: (_) {
         _latestPosition = null;
+        if (Platform.isAndroid) {
+          _statusMessage = 'GPS is temporarily unavailable. GPS coordinates will be saved as NA.';
+        }
       },
     );
   }

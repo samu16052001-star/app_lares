@@ -8,9 +8,18 @@ import 'polar_h10_event.dart';
 import 'polar_h10_models.dart';
 
 class PolarH10PlatformService {
-  PolarH10PlatformService._();
+  PolarH10PlatformService._([this._sessionDeviceId]);
 
   static final PolarH10PlatformService instance = PolarH10PlatformService._();
+  static final Map<String, PolarH10PlatformService> _deviceServices = {};
+
+  static PolarH10PlatformService forDevice(String deviceId) =>
+      _deviceServices.putIfAbsent(
+        deviceId,
+        () => PolarH10PlatformService._(deviceId),
+      );
+
+  final String? _sessionDeviceId;
   static final DateTime _polarTimestampEpochUtc = DateTime.utc(2000);
   static final DateTime _minimumReasonablePolarTimestampUtc =
       DateTime.utc(2020);
@@ -20,6 +29,7 @@ class PolarH10PlatformService {
       MethodChannel('app_lares/polar_h10_control');
   static const EventChannel _eventsChannel =
       EventChannel('app_lares/polar_h10_events');
+  static Stream<Map<Object?, Object?>>? _sharedEvents;
 
   Stream<PolarH10Event>? _events;
 
@@ -28,9 +38,13 @@ class PolarH10PlatformService {
       return const Stream<PolarH10Event>.empty();
     }
 
-    return _events ??= _eventsChannel.receiveBroadcastStream().map(
-          (event) => _parseEvent(Map<Object?, Object?>.from(event as Map)),
-        );
+    final rawEvents = _sharedEvents ??= _eventsChannel
+        .receiveBroadcastStream()
+        .map((event) => Map<Object?, Object?>.from(event as Map));
+    return _events ??= rawEvents
+        .where((event) => _sessionDeviceId == null ||
+            event['sessionDeviceId'] == _sessionDeviceId)
+        .map(_parseEvent);
   }
 
   Future<void> prepare({
@@ -63,6 +77,7 @@ class PolarH10PlatformService {
 
     await _controlChannel.invokeMethod<void>('stop', {
       'disconnect': disconnect,
+      if (_sessionDeviceId != null) 'sessionDeviceId': _sessionDeviceId,
     });
   }
 
@@ -89,6 +104,7 @@ class PolarH10PlatformService {
     }
 
     await _controlChannel.invokeMethod<void>(method, {
+      'sessionDeviceId': _sessionDeviceId ?? identity.deviceId,
       'device': identity.toJson(),
       'configuration': {
         'hrEnabled': configuration.hrEnabled,

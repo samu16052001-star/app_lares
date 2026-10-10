@@ -30,11 +30,36 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart' show Position;
 import 'package:permission_handler/permission_handler.dart';
+import 'package:uuid/uuid.dart';
+
+part 'acquisition_runtime.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   FlutterBluePlus.setOperationQueueMode(OperationQueueMode.perDevice);
-  final recoverySnapshot = await AcquisitionRecoveryStore.load();
+  AcquisitionRecoverySnapshot? recoverySnapshot;
+  try {
+    recoverySnapshot = await AcquisitionRecoveryStore.load();
+  } catch (error) {
+    if (!Platform.isAndroid) rethrow;
+    _ActiveAcquisitionRuntime.recoveryError = 'Could not read the saved acquisition: $error';
+    recoverySnapshot = const AcquisitionRecoverySnapshot(
+      isActive: true, acquisitionType: 'unknown', deviceNames: [],
+      deviceTypes: [], configurationSummaries: [], startedAtIso8601: null,
+      logicalRoute: 'recovery', status: 'recovery_error',
+    );
+  }
+  if (Platform.isAndroid) {
+    if (recoverySnapshot == null) await AndroidAcquisitionForegroundService.stop();
+    AndroidAcquisitionForegroundService.setActivityAttachedHandler(
+      _ActiveAcquisitionRuntime.handleResumed,
+    );
+    _ActiveAcquisitionRuntime._isForegroundVisible =
+        await AndroidAcquisitionForegroundService.isActivityAttached();
+    if (recoverySnapshot?.status != 'recovery_error') {
+      await _ActiveAcquisitionRuntime.restore(recoverySnapshot);
+    }
+  }
   runApp(LaresApp(recoverySnapshot: recoverySnapshot));
 }
 
@@ -94,8 +119,9 @@ class _LaresAppState extends State<LaresApp> with WidgetsBindingObserver {
         useMaterial3: true,
       ),
       home: widget.recoverySnapshot == null
-          ? const AccessCodePage()
-          : AcquisitionRecoveryPage(snapshot: widget.recoverySnapshot!),
+          ? (_ActiveAcquisitionRuntime.activePage ?? const AccessCodePage())
+          : (_ActiveAcquisitionRuntime.activePage ??
+              AcquisitionRecoveryPage(snapshot: widget.recoverySnapshot!)),
     );
   }
 }
@@ -104,6 +130,44 @@ class _ActiveAcquisitionRuntime {
   static bool _isActive = false;
   static bool _isForegroundVisible = true;
   static _MultiDeviceSessionManager? _multiDeviceManager;
+  static Object? activeOwner;
+  static Widget Function()? _pageBuilder;
+  static Future<void> Function()? _resume;
+  static Timer? _heartbeat;
+  static Future<void>? _restoration;
+  static String? recoveryError;
+
+  static Widget? get activePage => _pageBuilder?.call();
+
+  static void registerSingleOwner(
+    Object owner,
+    Widget Function() pageBuilder,
+    Future<void> Function() resume,
+  ) {
+    if (activeOwner != null && !identical(activeOwner, owner)) {
+      throw StateError('An acquisition already owns this runtime.');
+    }
+    activeOwner = owner;
+    _pageBuilder = pageBuilder;
+    _resume = resume;
+  }
+
+  static Future<void> restore(AcquisitionRecoverySnapshot? snapshot) async {
+    if (!Platform.isAndroid || snapshot == null || _isActive) return;
+    if (_restoration != null) return _restoration;
+    final operation = _restoreSavedAcquisition(snapshot);
+    _restoration = operation;
+    try {
+      await operation;
+    } catch (error) {
+      recoveryError = error.toString();
+      if (activeOwner == null) {
+        try { await AndroidAcquisitionForegroundService.stop(); } catch (_) {}
+      }
+    } finally {
+      _restoration = null;
+    }
+  }
 
   static bool get isForegroundVisible => _isForegroundVisible;
 
@@ -113,11 +177,27 @@ class _ActiveAcquisitionRuntime {
 
   static Future<void> markActive() async {
     _isActive = true;
+    if (Platform.isAndroid) {
+      _heartbeat ??= Timer.periodic(const Duration(seconds: 5), (_) {
+        unawaited(AcquisitionRecoveryStore.heartbeat().catchError((_) {}));
+      });
+    }
   }
 
   static Future<void> markInactive() async {
     _isActive = false;
     _multiDeviceManager = null;
+    activeOwner = null;
+    _pageBuilder = null;
+    _resume = null;
+    _heartbeat?.cancel();
+    _heartbeat = null;
+  }
+
+  static void beginStopping() {
+    _isActive = false;
+    _heartbeat?.cancel();
+    _heartbeat = null;
   }
 
   static Future<void> handlePaused() async {
@@ -153,7 +233,7 @@ class _ActiveAcquisitionRuntime {
 
     await AcquisitionRecoveryStore.updateStatus(
       logicalRoute: 'detached',
-      status: 'interrupted',
+      status: Platform.isAndroid ? 'running_in_background' : 'interrupted',
     );
   }
 
@@ -169,9 +249,11 @@ class _ActiveAcquisitionRuntime {
     );
     await _ensureAndroidForegroundService();
     await _multiDeviceManager?.refreshAfterResume();
+    await _resume?.call();
   }
 
   static Future<void> _ensureAndroidForegroundService() async {
+    if (!_isActive) return;
     try {
       await AndroidAcquisitionForegroundService.start();
     } catch (_) {
@@ -180,9 +262,8 @@ class _ActiveAcquisitionRuntime {
   }
 }
 
-class AcquisitionRecoveryPage extends StatelessWidget {
-  const AcquisitionRecoveryPage({
-    super.key,
+class _LegacyAcquisitionRecoveryPage extends StatelessWidget {
+  const _LegacyAcquisitionRecoveryPage({
     required this.snapshot,
   });
 
@@ -837,6 +918,7 @@ class _BleReconnectHelper {
     required String deviceId,
     required String deviceName,
     bool requireUnambiguousEnvironmentalV2NameFallback = false,
+    bool allowNameFallback = true,
   }) async {
     late final Object savedDeviceError;
 
@@ -851,6 +933,7 @@ class _BleReconnectHelper {
       deviceName: deviceName,
       requireUnambiguousEnvironmentalV2NameFallback:
           requireUnambiguousEnvironmentalV2NameFallback,
+      allowNameFallback: allowNameFallback,
     );
     if (scannedDevice == null) {
       throw savedDeviceError;
@@ -881,6 +964,7 @@ class _BleReconnectHelper {
     required String deviceId,
     required String deviceName,
     required bool requireUnambiguousEnvironmentalV2NameFallback,
+    required bool allowNameFallback,
   }) async {
     final hasPermissions = await _requestBluetoothReconnectPermissions();
     if (!hasPermissions) {
@@ -905,6 +989,8 @@ class _BleReconnectHelper {
           }
           return;
         }
+
+        if (!allowNameFallback) continue;
 
         if (requireUnambiguousEnvironmentalV2NameFallback) {
           if (_scanResultMatchesEnvironmentalV2Name(result, deviceName)) {
@@ -941,6 +1027,14 @@ class _BleReconnectHelper {
   static Future<bool> _requestBluetoothReconnectPermissions() async {
     if (!Platform.isAndroid) {
       return true;
+    }
+
+    // Background retry may use granted permissions but must never ask an
+    // Activity-dependent plugin to present a dialog without an Activity.
+    if (!await AndroidAcquisitionForegroundService.isActivityAttached()) {
+      final scanStatus = await Permission.bluetoothScan.status;
+      final connectStatus = await Permission.bluetoothConnect.status;
+      return scanStatus.isGranted && connectStatus.isGranted;
     }
 
     final statuses = await [
@@ -1018,11 +1112,14 @@ class _BleAutoReconnectCoordinator {
   Timer? _retryTimer;
   bool _active = false;
   bool _operationInProgress = false;
+  Future<void>? _inFlight;
   int _generation = 0;
 
   bool get isActive => _active;
 
   bool get isOperationInProgress => _operationInProgress;
+
+  Future<void> waitForIdle() async { await _inFlight; }
 
   void start() {
     if (_active || !_canRun) {
@@ -1078,7 +1175,7 @@ class _BleAutoReconnectCoordinator {
 
     _operationInProgress = true;
     _notify();
-    return _completeOperation(generation, operation);
+    return _inFlight = _completeOperation(generation, operation);
   }
 
   Future<void> _completeOperation(
@@ -1159,6 +1256,11 @@ class _ConnectedDeviceSession {
     this.polarRssi,
   });
 
+  factory _ConnectedDeviceSession.fromRecoveryDevice(Map<String, dynamic> value) =>
+      _decodeAcquisitionDevice(value);
+
+  Map<String, dynamic> toRecoveryDevice() => _encodeAcquisitionDevice(this);
+
   static const Duration wearableVisibleChartWindow = Duration(seconds: 2);
   static const Duration polarVisibleEcgWindow = Duration(seconds: 5);
   static const int polarVisibleEcgSampleCount = 650;
@@ -1198,6 +1300,10 @@ class _ConnectedDeviceSession {
   bool isConnected = true;
   bool isInitializing = false;
   bool isInitialized = false;
+  // A process restart needs configuration replay; ordinary radio reconnects
+  // continue using the existing notification-only reconnect path.
+  bool needsProcessRecovery = false;
+  bool interruptionPending = false;
   bool environmentalV2ConfigurationApplied = false;
   bool environmentalV2NotificationsRequested = false;
   bool environmentalV2NotificationsStarted = false;
@@ -1332,6 +1438,15 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     );
   }
 
+  static Future<void> restore(AcquisitionRecoverySnapshot snapshot) =>
+      _restoreMultiDeviceAcquisition(snapshot);
+
+  // Recovery helpers notify through the owner, where ChangeNotifier's
+  // protected notification API belongs.
+  void _notifySessionChanged() {
+    notifyListeners();
+  }
+
   static const _openRemoteAssetIdByEnvironmentalDeviceName = <String, String>{
     'LARES_ENV_V1_106': '7l9c0BynTv7UqckE045gaf',
     'LARES_ENV_V1_06': '39xOKe65bmS7yhutTrk100',
@@ -1379,6 +1494,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   bool _openRemoteLocationAuthorized = false;
   bool _foregroundServiceStarted = false;
   DateTime? _startedAt;
+  String _sessionId = const Uuid().v4();
+  bool _openRemoteConnectRequested = false;
+  Future<void>? _streamStartup;
+  Future<void>? _androidStopFuture;
   String? backgroundStatusMessage;
 
   List<_ConnectedDeviceSession> get sessions => List.unmodifiable(_sessions);
@@ -1488,7 +1607,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     } catch (_) {}
     if (session.isPolarManaged) {
       try {
-        await PolarH10PlatformService.instance.stop();
+        await PolarH10PlatformService.forDevice(session.deviceId).stop();
       } catch (_) {}
     } else {
       try {
@@ -1536,9 +1655,19 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    if (Platform.isAndroid) {
+      _ActiveAcquisitionRuntime.registerSingleOwner(
+        this,
+        () => _MultiDeviceAcquisitionInitializationPage(manager: this),
+        () async {},
+      );
+    }
+
     _initializationStarted = true;
+    try {
     _invalidateOpenRemoteLocationAuthorization();
-    await csvLogger.start();
+    if (Platform.isAndroid) _startedAt = DateTime.now();
+    await csvLogger.start(startedAt: _startedAt, sessionId: _sessionId);
     await gpsLocationService.start();
     _openRemoteLocationSubscription ??= gpsLocationService.livePositions.listen(
       _handleOpenRemoteLivePosition,
@@ -1569,7 +1698,6 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       });
     }
 
-    try {
       for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
         if (!session.isConnected) {
           throw StateError('${session.displayName} is disconnected.');
@@ -1607,8 +1735,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       }
 
       _acquisitionStarted = true;
-      _startedAt = DateTime.now();
+      _startedAt ??= DateTime.now();
       await _activateAndroidBackgroundSupport();
+      if (Platform.isAndroid) await _startRuntimeStreams();
       notifyListeners();
     } catch (error) {
       await stopAll();
@@ -1627,6 +1756,13 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     _openRemoteLocationConnectionPending =
         !_disposed && _acquisitionStarted && !_isStopping;
+    if (Platform.isAndroid) {
+      _openRemoteConnectRequested = true;
+      await AcquisitionRecoveryStore.mergeRuntimeState({
+        'openRemoteConnectRequested': true,
+        'openRemoteAssetId': assetId,
+      });
+    }
     await mqttService.connect(assetId: assetId);
     if (mqttService.isConnected) {
       _completePendingOpenRemoteLocationAuthorization();
@@ -1650,6 +1786,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     _openRemoteLocationAuthorized = true;
+    if (Platform.isAndroid) {
+      unawaited(AcquisitionRecoveryStore.mergeRuntimeState({
+        'openRemoteLocationAuthorized': true,
+      }));
+    }
   }
 
   void _invalidateOpenRemoteLocationAuthorization() {
@@ -1686,7 +1827,17 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       } catch (_) {}
     }
 
-    await _activateAndroidBackgroundSupport();
+    if (Platform.isAndroid) {
+      try {
+        await AndroidAcquisitionForegroundService.start();
+        _foregroundServiceStarted = true;
+        await gpsLocationService.resumeAfterAndroidActivityAttached();
+      } catch (error) {
+        backgroundStatusMessage = _mergeStatusMessage(
+          backgroundStatusMessage, 'Android background acquisition: $error',
+        );
+      }
+    }
     notifyListeners();
   }
 
@@ -1751,6 +1902,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         }
         session
           ..isConnected = true
+          ..isInitialized = true
+          ..needsProcessRecovery = false
           ..disconnectedDuringAcquisition = false
           ..reconnectStatus = _BleReconnectStatus.reconnected
           ..reconnectFailureMessage = null;
@@ -1779,6 +1932,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         currentDevice: session.bleDevice,
         deviceId: session.deviceId,
         deviceName: session.deviceName,
+        allowNameFallback: !Platform.isAndroid || !_sessions.any((other) =>
+            other.deviceId != session.deviceId &&
+            _normalizeDeviceNameForReconnect(other.deviceName) ==
+                _normalizeDeviceNameForReconnect(session.deviceName)),
         requireUnambiguousEnvironmentalV2NameFallback:
             session.type == KnownDeviceType.environmentalMonitorV2,
       );
@@ -1796,6 +1953,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         session.device = reconnectedDevice;
       }
 
+      if (session.needsProcessRecovery) {
+        await _initializeRecoveredDevice(session);
+      } else {
       switch (session.type) {
         case KnownDeviceType.environmentalMonitor:
           final service = session.environmentalService;
@@ -1833,6 +1993,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           throw StateError('${session.displayName} is managed by the Polar SDK.');
         case KnownDeviceType.unsupported:
           throw StateError('${session.displayName} is unsupported.');
+      }
       }
       if (!_canContinueAutomaticBleReconnect() ||
           !_sessions.contains(session)) {
@@ -1923,17 +2084,35 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   Future<void> stopAll() async {
+    if (Platform.isAndroid) {
+      final operation = _androidStopFuture ??= _stopAndroidResources();
+      try {
+        await operation;
+      } catch (_) {
+        _androidStopFuture = null;
+        rethrow;
+      }
+      return;
+    }
     if (_isStopping) {
       return;
     }
 
     _bleAutoReconnectCoordinator.cancel();
     _isStopping = true;
+    if (Platform.isAndroid) await AcquisitionRecoveryStore.markStopping();
+    _ActiveAcquisitionRuntime.beginStopping();
     _invalidateOpenRemoteLocationAuthorization();
     notifyListeners();
 
     await _openRemoteLocationSubscription?.cancel();
     _openRemoteLocationSubscription = null;
+    // Let in-flight configuration/reconnect work observe _isStopping before
+    // releasing resources, so it cannot create a stream after Stop completes.
+    if (Platform.isAndroid) {
+      await _bleAutoReconnectCoordinator.waitForIdle();
+      await _streamStartup;
+    }
 
     final sessionsToStop = List<_ConnectedDeviceSession>.from(_sessions);
     for (final session in sessionsToStop) {
@@ -1972,7 +2151,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           break;
         case KnownDeviceType.polarH10:
           try {
-            await PolarH10PlatformService.instance.stop();
+            await PolarH10PlatformService.forDevice(session.deviceId).stop();
           } catch (_) {}
           break;
         case KnownDeviceType.unsupported:
@@ -2007,7 +2186,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     if (_acquisitionStarted) {
-      _bleAutoReconnectCoordinator.cancel();
+      if (!Platform.isAndroid) _bleAutoReconnectCoordinator.cancel();
       return;
     }
 
@@ -2030,7 +2209,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       } catch (_) {}
       if (session.isPolarManaged) {
         try {
-          await PolarH10PlatformService.instance.stop();
+          await PolarH10PlatformService.forDevice(session.deviceId).stop();
         } catch (_) {}
       } else {
         try {
@@ -2051,6 +2230,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    _ActiveAcquisitionRuntime.registerSingleOwner(
+      this, () => _MultiDeviceAcquisitionPage(manager: this), () async {},
+    );
+    _ActiveAcquisitionRuntime.registerMultiDeviceManager(this);
+    await _persistSession();
     await _requestAndroidNotificationPermission();
     try {
       await AndroidAcquisitionForegroundService.start();
@@ -2063,7 +2247,19 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     await _ActiveAcquisitionRuntime.markActive();
+  }
+
+  Future<void> _persistSession() async {
     await AcquisitionRecoveryStore.saveActive(
+      sessionId: _sessionId,
+      workflow: 'multi-device',
+      devices: [for (final session in _sessions) session.toRecoveryDevice()],
+      runtimeState: {
+        'gpsRequested': true,
+        'openRemoteConnectRequested': _openRemoteConnectRequested,
+        'openRemoteAssetId': _openRemoteAssetId,
+        'openRemoteLocationAuthorized': _openRemoteLocationAuthorized,
+      },
       acquisitionType: _sessions.length == 1
           ? _sessions.first.type.name
           : 'multi-device',
@@ -2082,6 +2278,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (!Platform.isAndroid) {
       return;
     }
+
+    if (!await AndroidAcquisitionForegroundService.isActivityAttached()) return;
 
     final status = await Permission.notification.request();
     if (!status.isGranted) {
@@ -2146,6 +2344,19 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   ) {
     if (_isStopping) {
       return;
+    }
+
+    if (Platform.isAndroid && !session.interruptionPending) {
+      session.interruptionPending = true;
+      backgroundStatusMessage = _mergeStatusMessage(
+        backgroundStatusMessage,
+        'A Bluetooth interruption may have caused missing samples. Details are saved with the CSV.',
+      );
+      unawaited(AcquisitionRecoveryStore.recordInterruption(
+        deviceId: session.deviceId,
+        startedAt: DateTime.now(),
+        reason: 'ble_disconnected',
+      ));
     }
 
     session
@@ -2255,16 +2466,23 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       ..polarStreamsStarted = false;
     await session.polarEventsSubscription?.cancel();
     session.polarEventsSubscription =
-        PolarH10PlatformService.instance.events.listen(
+        PolarH10PlatformService.forDevice(session.deviceId).events.listen(
       (event) {
         _handlePolarH10Event(session, event);
       },
     );
 
-    await PolarH10PlatformService.instance.prepare(
+    await PolarH10PlatformService.forDevice(session.deviceId).prepare(
       identity: session.polarIdentity,
       configuration: configuration,
     );
+  }
+
+  Future<void> _startRuntimeStreams() {
+    return _streamStartup ??= () async {
+      await startPolarStreamsForAcquisition();
+      await startEnvironmentalV2NotificationsForAcquisition();
+    }();
   }
 
   Future<void> startPolarStreamsForAcquisition() async {
@@ -2273,6 +2491,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     for (final session in _sessions.where((session) => session.isPolarManaged)) {
+      if (Platform.isAndroid && (_isStopping || _disposed)) return;
       if (session.polarStreamsStarted || !session.isInitialized) {
         continue;
       }
@@ -2284,7 +2503,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       }
 
       try {
-        await PolarH10PlatformService.instance.startStreams(
+        await PolarH10PlatformService.forDevice(session.deviceId).startStreams(
           identity: session.polarIdentity,
           configuration: configuration,
         );
@@ -2384,12 +2603,12 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     await session.polarEventsSubscription?.cancel();
     session.polarEventsSubscription =
-        PolarH10PlatformService.instance.events.listen(
+        PolarH10PlatformService.forDevice(session.deviceId).events.listen(
       (event) {
         _handlePolarH10Event(session, event);
       },
     );
-    await PolarH10PlatformService.instance.reconnectAndStart(
+    await PolarH10PlatformService.forDevice(session.deviceId).reconnectAndStart(
       identity: session.polarIdentity,
       configuration: configuration,
     );
@@ -2492,6 +2711,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     PolarH10HrSample sample,
   ) {
+    _recordRecoveredSample(session);
     session
       ..latestPolarHrSample = sample
       ..isConnected = true;
@@ -2513,6 +2733,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (samples.isEmpty) {
       return;
     }
+    _recordRecoveredSample(session);
 
     session
       ..isConnected = true
@@ -2562,6 +2783,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (samples.isEmpty) {
       return;
     }
+    _recordRecoveredSample(session);
 
     session
       ..isConnected = true
@@ -2692,11 +2914,13 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     BleNotificationMessage message,
   ) {
+    _recordRecoveredSample(session);
     session.environmentalMessages.add(message);
     _updateEnvironmentalLiveMeasurement(session, message);
     unawaited(
       csvLogger.appendEnvironmentalMessage(
         receivedAt: message.receivedAt,
+        deviceId: session.deviceId,
         deviceName: session.displayName,
         gpsCoordinates: gpsLocationService.currentCoordinates,
         value: message.value,
@@ -2714,6 +2938,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     EnvironmentalV2NotificationMessage message,
   ) {
+    _recordRecoveredSample(session);
     final configuration = session.environmentalV2Configuration;
     if (configuration == null ||
         !configuration.isMessageTypeEnabled(message.type)) {
@@ -2866,6 +3091,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     WearableAgmReceivedBatch event,
   ) {
+    _recordRecoveredSample(session);
     final sample = event.firstSample;
     session.latestWearableSampleReceivedAt = event.receivedAt;
     final cutoff = event.receivedAt.subtract(
@@ -3157,7 +3383,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
     try {
       if (deviceType == KnownDeviceType.polarH10) {
-        if (_sessionManager.sessions.any(
+        if (!Platform.isAndroid && _sessionManager.sessions.any(
           (session) => session.type == KnownDeviceType.polarH10,
         )) {
           setState(() {
@@ -3971,10 +4197,10 @@ class _MultiDeviceAcquisitionPageState
     widget.manager.addListener(_handleManagerChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _syncBleDisconnectionAlertDialog();
-      unawaited(widget.manager.startPolarStreamsForAcquisition());
-      unawaited(
-        widget.manager.startEnvironmentalV2NotificationsForAcquisition(),
-      );
+      if (!Platform.isAndroid) {
+        unawaited(widget.manager.startPolarStreamsForAcquisition());
+        unawaited(widget.manager.startEnvironmentalV2NotificationsForAcquisition());
+      }
     });
   }
 
@@ -3982,7 +4208,7 @@ class _MultiDeviceAcquisitionPageState
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     widget.manager.removeListener(_handleManagerChanged);
-    widget.manager.cancelAutomaticBleReconnect();
+    if (!Platform.isAndroid) widget.manager.cancelAutomaticBleReconnect();
     _stopBleAlertAlarm();
     super.dispose();
   }
@@ -4844,6 +5070,352 @@ class _MultiDeviceAcquisitionCompletedPage extends StatelessWidget {
   }
 }
 
+/// Android acquisition ownership is independent of either configuration or
+/// chart State. The retained engine and foreground service keep this owner alive.
+class _WearableAcquisitionController extends ChangeNotifier {
+  _WearableAcquisitionController({
+    required this.service,
+    required this.csvLogger,
+    required this.gpsLocationService,
+    required this.deviceName,
+    required this.customName,
+    required this.configuration,
+    required this.sessionId,
+    required this.startedAt,
+  }) {
+    coordinator = _BleAutoReconnectCoordinator(
+      runAutomaticCycle: _reconnect,
+      hasPendingWork: () => disconnected && !_dismissed,
+      canContinue: () => !_stopped && !stopping,
+      onStateChanged: notifyListeners,
+    );
+  }
+
+  final WearableConfigurationBleService service;
+  final WearableAcquisitionCsvLogger csvLogger;
+  final GpsLocationService gpsLocationService;
+  final String deviceName;
+  final String? customName;
+  final WearableDeviceConfiguration configuration;
+  final String sessionId;
+  final DateTime startedAt;
+  late final _BleAutoReconnectCoordinator coordinator;
+  StreamSubscription<WearableAgmReceivedBatch>? _samples;
+  StreamSubscription<BluetoothConnectionState>? _connection;
+  StreamSubscription<WearableBleSequenceState>? _sequence;
+  bool disconnected = false;
+  bool stopping = false;
+  bool _stopped = false;
+  bool _dismissed = false;
+  bool _needsProcessRecovery = false;
+  bool _interruptionPending = false;
+  Future<void>? _stopFuture;
+  int disconnectionVersion = 0;
+  _BleReconnectStatus reconnectStatus = _BleReconnectStatus.disconnected;
+  String? reconnectFailureMessage;
+  String? backgroundStatusMessage;
+
+  String get displayName => customName ?? deviceName;
+  String get deviceId => service.device.remoteId.toString();
+
+  WearableBleCommunicationLogPage buildPage() {
+    return WearableBleCommunicationLogPage._withController(this);
+  }
+
+  static void _ignoreStoppedCallback() {}
+
+  Future<void> start({AcquisitionRecoverySnapshot? recovery}) async {
+    final currentOwner = _ActiveAcquisitionRuntime.activeOwner;
+    if (currentOwner != null && !identical(currentOwner, this)) {
+      throw StateError('An acquisition already owns this runtime.');
+    }
+    // Transfer the service callback as well as subscriptions; the configuration
+    // widget must no longer be retained by the hardware service.
+    service.onStateChanged = null;
+    if (recovery == null && await AndroidAcquisitionForegroundService.isActivityAttached()) {
+      final notificationStatus = await Permission.notification.request();
+      if (!notificationStatus.isGranted) {
+        backgroundStatusMessage =
+            'Android background acquisition may be unreliable without the persistent notification.';
+      }
+    }
+    await AndroidAcquisitionForegroundService.start();
+    await csvLogger.start(
+      existingFilePath: recovery?.csvFilePath,
+      existingFileName: recovery?.csvFileName,
+      startedAt: startedAt,
+      sessionId: sessionId,
+    );
+    await gpsLocationService.start();
+    final gpsWarning = gpsLocationService.statusMessage;
+    if (gpsWarning != null) {
+      backgroundStatusMessage = _mergeStatusMessage(backgroundStatusMessage, gpsWarning);
+    }
+    final session = _ConnectedDeviceSession(
+      device: service.device,
+      deviceId: deviceId,
+      deviceName: deviceName,
+      customName: customName,
+      type: KnownDeviceType.respiratoryMonitor,
+    )..wearableConfiguration = configuration;
+    await AcquisitionRecoveryStore.saveActive(
+      sessionId: sessionId,
+      workflow: 'single-wearable',
+      acquisitionType: KnownDeviceType.respiratoryMonitor.name,
+      deviceNames: [displayName],
+      deviceTypes: [KnownDeviceType.respiratoryMonitor.name],
+      configurationSummaries: [_summarizeWearableConfiguration(configuration)],
+      devices: [session.toRecoveryDevice()],
+      startedAt: startedAt,
+      logicalRoute: 'acquisition',
+      status: recovery == null ? 'running' : 'recovering',
+      csvFileName: csvLogger.fileName,
+      csvFilePath: csvLogger.file?.path,
+      runtimeState: recovery?.runtimeState ?? <String, dynamic>{'gpsEnabled': true},
+    );
+    _samples = service.agmBatchesStream.listen((event) {
+      unawaited(csvLogger.appendAgmBatch(
+        receivedAt: event.receivedAt,
+        deviceName: displayName,
+        gpsCoordinates: gpsLocationService.currentCoordinates,
+        samples: event.samples,
+      ));
+      if (_interruptionPending) {
+        _interruptionPending = false;
+        _needsProcessRecovery = false;
+        unawaited(AcquisitionRecoveryStore.closeInterruption(deviceId));
+        unawaited(AcquisitionRecoveryStore.updateStatus(
+          logicalRoute: 'acquisition',
+          status: 'running',
+        ));
+      }
+    });
+    _sequence = service.sequenceStateStream.listen((state) {
+      if (_needsProcessRecovery &&
+          (state == WearableBleSequenceState.error ||
+              state == WearableBleSequenceState.timeout)) {
+        disconnected = false;
+        _markDisconnected();
+      }
+    });
+    _ActiveAcquisitionRuntime.registerSingleOwner(this, buildPage, resume);
+    await _ActiveAcquisitionRuntime.markActive();
+    _attachConnection();
+    if (recovery != null) {
+      _needsProcessRecovery = true;
+      _interruptionPending = true;
+      backgroundStatusMessage = _mergeStatusMessage(
+        backgroundStatusMessage,
+        'Acquisition was interrupted. Possible data gaps are recorded in the session event log.',
+      );
+      await AcquisitionRecoveryStore.recordInterruption(
+        deviceId: deviceId,
+        startedAt: DateTime.tryParse(recovery.lastHeartbeatIso8601 ?? '') ?? startedAt,
+        reason: 'acquisition_process_restarted',
+      );
+      _markDisconnected();
+    } else {
+      await service.startConfigurationSequence(
+        odr: configuration.odr,
+        mag: configuration.mag,
+        accG: configuration.accG,
+        gyrDPS: configuration.gyrDPS,
+        calibrationEnabled: configuration.calibrationEnabled,
+      );
+    }
+  }
+
+  static Future<void> restore(AcquisitionRecoverySnapshot snapshot) async {
+    if (_ActiveAcquisitionRuntime.activeOwner case final _WearableAcquisitionController owner) {
+      await owner.resume();
+      return;
+    }
+    final session = _ConnectedDeviceSession.fromRecoveryDevice(snapshot.devices.single);
+    final owner = _WearableAcquisitionController(
+      service: WearableConfigurationBleService(session.device!),
+      csvLogger: WearableAcquisitionCsvLogger(),
+      gpsLocationService: GpsLocationService(),
+      deviceName: session.deviceName,
+      customName: session.customName,
+      configuration: session.wearableConfiguration!,
+      sessionId: snapshot.sessionId,
+      startedAt: DateTime.parse(snapshot.startedAtIso8601!),
+    );
+    try {
+      await owner.start(recovery: snapshot);
+    } catch (_) {
+      await owner.releaseAfterFailedStart();
+      rethrow;
+    }
+  }
+
+  void _attachConnection() {
+    unawaited(_connection?.cancel());
+    _connection = service.connectionState.listen((state) {
+      if (state == BluetoothConnectionState.disconnected &&
+          !stopping && !_stopped && !service.isStopping && !service.isStopped) {
+        _markDisconnected();
+      }
+    });
+  }
+
+  void _markDisconnected() {
+    if (stopping || _stopped || disconnected) return;
+    disconnected = true;
+    _dismissed = false;
+    disconnectionVersion += 1;
+    reconnectStatus = _BleReconnectStatus.disconnected;
+    reconnectFailureMessage = null;
+    if (!_interruptionPending) {
+      _interruptionPending = true;
+      backgroundStatusMessage = _mergeStatusMessage(
+        backgroundStatusMessage,
+        'Acquisition was interrupted by a Bluetooth disconnection. Possible data gaps are recorded in the session event log.',
+      );
+      unawaited(AcquisitionRecoveryStore.recordInterruption(
+        deviceId: deviceId,
+        startedAt: DateTime.now(),
+        reason: 'ble_disconnected',
+      ));
+    }
+    unawaited(AndroidAcquisitionForegroundService.showBleDisconnectionAlert(displayName));
+    notifyListeners();
+    coordinator.start();
+  }
+
+  Future<void> _reconnect() async {
+    if (!disconnected || stopping || _stopped || _dismissed) return;
+    reconnectStatus = _BleReconnectStatus.reconnecting;
+    reconnectFailureMessage = null;
+    notifyListeners();
+    try {
+      final device = await _BleReconnectHelper.reconnect(
+        currentDevice: service.device,
+        deviceId: deviceId,
+        deviceName: deviceName,
+      );
+      if (stopping || _stopped) return;
+      if (_needsProcessRecovery) {
+        await service.recoverConfigurationSequence(
+          reconnectedDevice: device,
+          odr: configuration.odr,
+          mag: configuration.mag,
+          accG: configuration.accG,
+          gyrDPS: configuration.gyrDPS,
+          calibrationEnabled: configuration.calibrationEnabled,
+        );
+      } else {
+        await service.resumeNotificationsAfterReconnect(reconnectedDevice: device);
+      }
+      if (stopping || _stopped) return;
+      _attachConnection();
+      disconnected = false;
+      reconnectStatus = _BleReconnectStatus.reconnected;
+      await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
+    } catch (_) {
+      if (stopping || _stopped) return;
+      try { await service.device.disconnect(); } catch (_) {}
+      reconnectStatus = _BleReconnectStatus.failed;
+      reconnectFailureMessage =
+          'Could not reconnect to $displayName. Move closer and try again.';
+    }
+    notifyListeners();
+  }
+
+  Future<void> resume() async {
+    if (_stopped || stopping) return;
+    await gpsLocationService.resumeAfterAndroidActivityAttached();
+    if (disconnected && !_dismissed) coordinator.start();
+  }
+
+  Future<void> reconnectNow() async {
+    _dismissed = false;
+    await coordinator.requestImmediate();
+  }
+
+  void dismissReconnect() {
+    _dismissed = true;
+    coordinator.cancel();
+  }
+
+  Future<void> _stopLogging() async {
+    try {
+      await _samples?.cancel();
+      _samples = null;
+      await gpsLocationService.stop();
+    } finally {
+      await csvLogger.stop();
+    }
+  }
+
+  Future<void> stop() async {
+    final pending = _stopFuture;
+    if (pending != null) return pending;
+    if (_stopped) return;
+    final operation = _stopAcquisitionResources();
+    _stopFuture = operation;
+    try {
+      await operation;
+    } finally {
+      if (!_stopped) _stopFuture = null;
+    }
+  }
+
+  Future<void> _stopAcquisitionResources() async {
+    await AcquisitionRecoveryStore.markStopping();
+    _ActiveAcquisitionRuntime.beginStopping();
+    stopping = true;
+    coordinator.cancel();
+    notifyListeners();
+    try {
+      await coordinator.waitForIdle();
+      await _connection?.cancel();
+      await _sequence?.cancel();
+      try {
+        await service.stopAcquisition();
+      } catch (_) {
+        // A disconnected device cannot acknowledge STOP; the confirmed local
+        // session still ends and must never be resurrected on the next launch.
+        try { await service.dispose(); } catch (_) {}
+        try { await service.device.disconnect(); } catch (_) {}
+      }
+    } finally {
+      try {
+        await _stopLogging();
+      } finally {
+        _stopped = true;
+        notifyListeners();
+        try {
+          await AcquisitionRecoveryStore.clear();
+        } finally {
+          await _ActiveAcquisitionRuntime.markInactive();
+          await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
+          await AndroidAcquisitionForegroundService.stop();
+        }
+      }
+    }
+  }
+
+  Future<void> releaseAfterFailedStart() async {
+    _stopped = true;
+    coordinator.cancel();
+    try {
+      await coordinator.waitForIdle();
+      await _connection?.cancel();
+      await _sequence?.cancel();
+      try {
+        await _stopLogging();
+      } finally {
+        await service.dispose();
+      }
+    } finally {
+      if (identical(_ActiveAcquisitionRuntime.activeOwner, this)) {
+        await _ActiveAcquisitionRuntime.markInactive();
+      }
+    }
+  }
+}
+
 class WearableDeviceConfigurationPage extends StatefulWidget {
   const WearableDeviceConfigurationPage({
     super.key,
@@ -4873,6 +5445,7 @@ class _WearableDeviceConfigurationPageState
   WearableConfigurationBleService? _service;
   WearableAcquisitionCsvLogger? _csvLogger;
   GpsLocationService? _gpsLocationService;
+  _WearableAcquisitionController? _androidAcquisition;
   String? _customName;
 
   String get _displayName => _customName ?? widget.deviceName;
@@ -4933,6 +5506,7 @@ class _WearableDeviceConfigurationPageState
 
   @override
   void dispose() {
+    _androidAcquisition?.removeListener(_handleAndroidOwnerChanged);
     if (!_isConfigurationOnly) {
       _isDisposing = true;
       if (!_configurationSequenceStarted || _wearableAcquisitionStopped) {
@@ -4994,6 +5568,35 @@ class _WearableDeviceConfigurationPageState
     });
 
     try {
+      if (Platform.isAndroid) {
+        _customName ??= await RespiratoryDeviceNameStore.load(
+          widget.device.remoteId.toString(),
+        );
+        final controller = _WearableAcquisitionController(
+          service: service,
+          csvLogger: csvLogger,
+          gpsLocationService: _gpsLocationService!,
+          deviceName: widget.deviceName,
+          customName: _customName,
+          configuration: WearableDeviceConfiguration(
+            odr: odr,
+            mag: mag,
+            accG: accG,
+            gyrDPS: gyrDPS,
+            calibrationEnabled: calibrationEnabled,
+          ),
+          sessionId: const Uuid().v4(),
+          startedAt: DateTime.now(),
+        );
+        _androidAcquisition = controller;
+        controller.addListener(_handleAndroidOwnerChanged);
+        await controller.start();
+        if (!mounted) return;
+        await Navigator.of(context).push(
+          MaterialPageRoute<void>(builder: (_) => controller.buildPage()),
+        );
+        return;
+      }
       await _startWearableCsvLogging();
       await service.startConfigurationSequence(
         odr: odr,
@@ -5021,9 +5624,21 @@ class _WearableDeviceConfigurationPageState
         ),
       );
     } catch (error) {
+      final controller = _androidAcquisition;
+      if (controller != null) {
+        controller.removeListener(_handleAndroidOwnerChanged);
+        await controller.releaseAfterFailedStart();
+        final stored = await AcquisitionRecoveryStore.load();
+        if (stored?.sessionId == controller.sessionId) {
+          await AcquisitionRecoveryStore.clear();
+        }
+        _androidAcquisition = null;
+      }
       await _stopWearableCsvLogging();
-      await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
-      await AndroidAcquisitionForegroundService.stop();
+      if (_ActiveAcquisitionRuntime.activeOwner == null) {
+        await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
+        await AndroidAcquisitionForegroundService.stop();
+      }
       _configurationSequenceStarted = false;
       if (!mounted) {
         return;
@@ -5104,6 +5719,12 @@ class _WearableDeviceConfigurationPageState
   void _handleWearableAcquisitionStopped() {
     _wearableAcquisitionStopped = true;
     _notifyDisconnected();
+  }
+
+  void _handleAndroidOwnerChanged() {
+    if (mounted && _androidAcquisition?._stopped == true) {
+      _handleWearableAcquisitionStopped();
+    }
   }
 
   Future<void> _startWearableCsvLogging() async {
@@ -5282,7 +5903,18 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
     required this.stopWearableCsvLogging,
     required this.onAcquisitionStopped,
     this.backgroundStatusMessage,
-  });
+  }) : _controller = null;
+
+  WearableBleCommunicationLogPage._withController(
+    _WearableAcquisitionController controller,
+  ) : service = controller.service,
+      csvLogger = controller.csvLogger,
+      deviceName = controller.deviceName,
+      customName = controller.customName,
+      stopWearableCsvLogging = controller._stopLogging,
+      onAcquisitionStopped = _WearableAcquisitionController._ignoreStoppedCallback,
+      backgroundStatusMessage = null,
+      _controller = controller;
 
   final WearableConfigurationBleService service;
   final WearableAcquisitionCsvLogger csvLogger;
@@ -5295,6 +5927,7 @@ class WearableBleCommunicationLogPage extends StatefulWidget {
   final Future<void> Function() stopWearableCsvLogging;
   final VoidCallback onAcquisitionStopped;
   final String? backgroundStatusMessage;
+  final _WearableAcquisitionController? _controller;
 
   @override
   State<WearableBleCommunicationLogPage> createState() =>
@@ -5329,26 +5962,39 @@ class _WearableBleCommunicationLogPageState
   int _bleDisconnectionAlertVersion = 0;
   _BleReconnectStatus _bleReconnectStatus = _BleReconnectStatus.disconnected;
   String? _bleReconnectFailureMessage;
-  late final _BleAutoReconnectCoordinator _bleAutoReconnectCoordinator;
+  late final _BleAutoReconnectCoordinator _legacyBleAutoReconnectCoordinator;
+  _BleAutoReconnectCoordinator get _bleAutoReconnectCoordinator =>
+      widget._controller?.coordinator ?? _legacyBleAutoReconnectCoordinator;
   bool _isStoppingAcquisition = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _bleAutoReconnectCoordinator = _BleAutoReconnectCoordinator(
-      runAutomaticCycle: _runWearableAutomaticBleReconnectCycle,
-      hasPendingWork: _hasWearableAutomaticBleReconnectWork,
-      canContinue: _canContinueWearableAutomaticBleReconnect,
-      onStateChanged: _handleWearableAutoReconnectStateChanged,
-    );
+    if (widget._controller == null) {
+      _legacyBleAutoReconnectCoordinator = _BleAutoReconnectCoordinator(
+        runAutomaticCycle: _runWearableAutomaticBleReconnectCycle,
+        hasPendingWork: _hasWearableAutomaticBleReconnectWork,
+        canContinue: _canContinueWearableAutomaticBleReconnect,
+        onStateChanged: _handleWearableAutoReconnectStateChanged,
+      );
+    }
     _agmBatchesSubscription = widget.service.agmBatchesStream.listen(
       _handleAgmBatch,
     );
     _sdsStatusSubscription = widget.service.sdsStatusStream.listen(
       _handleSdsStatus,
     );
-    _attachWearableConnectionListener();
+    final controller = widget._controller;
+    if (controller == null) {
+      _attachWearableConnectionListener();
+    } else {
+      controller.addListener(_handleControllerChanged);
+      _copyControllerState();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _syncWearableBleDisconnectionAlertDialog();
+      });
+    }
   }
 
   @override
@@ -5358,7 +6004,10 @@ class _WearableBleCommunicationLogPageState
     unawaited(_sdsStatusSubscription?.cancel());
     unawaited(_connectionSubscription?.cancel());
     _uiRefreshTimer?.cancel();
-    _bleAutoReconnectCoordinator.cancel(notify: false);
+    widget._controller?.removeListener(_handleControllerChanged);
+    if (widget._controller == null) {
+      _bleAutoReconnectCoordinator.cancel(notify: false);
+    }
     _stopWearableBleAlertAlarm();
     _bleAlertRevision.dispose();
     super.dispose();
@@ -5388,6 +6037,22 @@ class _WearableBleCommunicationLogPageState
 
       _markWearableBleDisconnected();
     });
+  }
+
+  void _copyControllerState() {
+    final controller = widget._controller!;
+    _bleDisconnectedDuringAcquisition = controller.disconnected;
+    _bleDisconnectionAlertVersion = controller.disconnectionVersion;
+    _bleReconnectStatus = controller.reconnectStatus;
+    _bleReconnectFailureMessage = controller.reconnectFailureMessage;
+    _isStoppingAcquisition = controller.stopping;
+  }
+
+  void _handleControllerChanged() {
+    if (!mounted) return;
+    setState(_copyControllerState);
+    _notifyWearableBleAlertChanged();
+    _syncWearableBleDisconnectionAlertDialog();
   }
 
   void _handleAgmBatch(WearableAgmReceivedBatch event) {
@@ -5458,6 +6123,11 @@ class _WearableBleCommunicationLogPageState
   }
 
   Future<void> _reconnectWearableAfterDisconnection() async {
+    final controller = widget._controller;
+    if (controller != null) {
+      await controller.reconnectNow();
+      return;
+    }
     if (!_canAttemptWearableBleReconnect()) {
       return;
     }
@@ -5635,7 +6305,11 @@ class _WearableBleCommunicationLogPageState
   void _closeWearableBleAlertDialog({required bool dismissCurrentDevice}) {
     if (dismissCurrentDevice && _bleDisconnectedDuringAcquisition) {
       _dismissedBleAlertKeys.add(_wearableBleAlertKey);
-      _bleAutoReconnectCoordinator.cancel();
+      if (widget._controller case final controller?) {
+        controller.dismissReconnect();
+      } else {
+        _bleAutoReconnectCoordinator.cancel();
+      }
     }
 
     _stopWearableBleAlertAlarm();
@@ -5749,6 +6423,34 @@ class _WearableBleCommunicationLogPageState
 
   Future<void> _stopAcquisition() async {
     if (_isStoppingAcquisition || widget.service.isStopping) {
+      return;
+    }
+
+    final controller = widget._controller;
+    if (controller != null) {
+      var csvFinalizeFailed = false;
+      try {
+        await controller.stop();
+      } catch (_) {
+        csvFinalizeFailed = true;
+      }
+      if (!mounted) return;
+      if (!controller._stopped) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not stop acquisition')),
+        );
+        return;
+      }
+      if (csvFinalizeFailed) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not finalize CSV file')),
+        );
+      }
+      unawaited(Navigator.of(context).pushReplacement(
+        MaterialPageRoute<void>(
+          builder: (_) => WearableAcquisitionCompletedPage(csvLogger: widget.csvLogger),
+        ),
+      ));
       return;
     }
 
@@ -5957,7 +6659,7 @@ class _WearableBleCommunicationLogPageState
       return const SizedBox.shrink();
     }
 
-    final warning = widget.backgroundStatusMessage;
+    final warning = widget._controller?.backgroundStatusMessage ?? widget.backgroundStatusMessage;
     final colorScheme = Theme.of(context).colorScheme;
     final backgroundColor = warning == null
         ? Colors.green.shade50
@@ -6977,18 +7679,143 @@ class AcquisitionInitializationPage extends StatefulWidget {
     super.key,
     required this.device,
     required this.configuration,
-  });
+    this.recoverySnapshot,
+  }) : _runtime = null;
+
+  AcquisitionInitializationPage._withRuntime(
+    _EnvironmentalAcquisitionController runtime,
+  ) : device = runtime.initialDevice,
+      configuration = runtime.configuration,
+      recoverySnapshot = runtime.recoverySnapshot,
+      _runtime = runtime;
 
   final BluetoothDevice device;
   final BleConfiguration configuration;
+  final AcquisitionRecoverySnapshot? recoverySnapshot;
+  final _EnvironmentalAcquisitionController? _runtime;
 
   @override
-  State<AcquisitionInitializationPage> createState() =>
-      _AcquisitionInitializationPageState();
+  State<AcquisitionInitializationPage> createState() => _AcquisitionInitializationPageState();
 }
 
-class _AcquisitionInitializationPageState
-    extends State<AcquisitionInitializationPage> with WidgetsBindingObserver {
+// This State owns only the presentation. Android acquisition ownership belongs
+// to the engine runtime, which remains alive when its Activity/view detaches.
+class _AcquisitionInitializationPageState extends State<AcquisitionInitializationPage> {
+  late final _EnvironmentalAcquisitionController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    final retained = Platform.isAndroid ? _ActiveAcquisitionRuntime.activeOwner : null;
+    _controller = widget._runtime ??
+        (retained is _EnvironmentalAcquisitionController ? retained :
+          _EnvironmentalAcquisitionController(
+            initialDevice: widget.device,
+            configuration: widget.configuration,
+            recoverySnapshot: widget.recoverySnapshot,
+          ));
+    _controller.attach(this);
+    _controller.addListener(_refresh);
+    if (Platform.isAndroid) {
+      unawaited(_controller.start());
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_controller.start());
+      });
+    }
+  }
+
+  void _refresh() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _controller.removeListener(_refresh);
+    _controller.detach(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => _controller.build(context);
+}
+
+class _EnvironmentalAcquisitionController extends ChangeNotifier with WidgetsBindingObserver {
+  _EnvironmentalAcquisitionController({
+    required this.initialDevice,
+    required this.configuration,
+    this.recoverySnapshot,
+  }) {
+    _initialize();
+    if (Platform.isAndroid) {
+      _ActiveAcquisitionRuntime.registerSingleOwner(this, () => page, resume);
+    }
+  }
+
+  final BluetoothDevice initialDevice;
+  final BleConfiguration configuration;
+  final AcquisitionRecoverySnapshot? recoverySnapshot;
+  late final DateTime _startedAt = DateTime.tryParse(recoverySnapshot?.startedAtIso8601 ?? '') ?? DateTime.now();
+  late final String _sessionId = recoverySnapshot?.sessionId.isNotEmpty == true
+      ? recoverySnapshot!.sessionId : const Uuid().v4();
+  _AcquisitionInitializationPageState? _view;
+  bool _disposed = false;
+  bool _androidResourcesStopped = false;
+  bool _needsProcessRecovery = false;
+  bool _interruptionPending = false;
+  bool _androidSessionPrepared = false;
+  Future<void>? _startFuture;
+  bool get mounted => !_disposed;
+  bool get _viewAttached => _view?.mounted ?? false;
+  BuildContext get context => _view!.context;
+
+  AcquisitionInitializationPage get page =>
+      AcquisitionInitializationPage._withRuntime(this);
+
+  static Future<_EnvironmentalAcquisitionController> restore(AcquisitionRecoverySnapshot snapshot) async {
+    final session = _ConnectedDeviceSession.fromRecoveryDevice(snapshot.devices.single);
+    final controller = _EnvironmentalAcquisitionController(
+      initialDevice: session.bleDevice,
+      configuration: session.environmentalConfiguration!,
+      recoverySnapshot: snapshot,
+    );
+    await controller.start();
+    return controller;
+  }
+
+  Future<void> start() => _startFuture ??= _startInitialization();
+
+  Future<void> resume() async {
+    if (_disposed || _acquisitionStopped) return;
+    if (Platform.isAndroid) await _gpsLocationService.resumeAfterAndroidActivityAttached();
+    if (_needsProcessRecovery) _bleAutoReconnectCoordinator.start();
+    if (_viewAttached) _syncSingleBleDisconnectionAlertDialog();
+  }
+
+  void attach(_AcquisitionInitializationPageState view) {
+    _view = view;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_viewAttached) _syncSingleBleDisconnectionAlertDialog();
+    });
+  }
+
+  void detach(_AcquisitionInitializationPageState view) {
+    if (!identical(_view, view)) return;
+    _view = null;
+    _bleAlertDialogContext = null;
+    _bleAlertDialogOpen = false;
+    _stopSingleBleAlertAlarm();
+    if (!Platform.isAndroid || (!_initializationStarted && !_acquisitionStarted && !_csvLogger.isStarted) || _acquisitionStopped) {
+      _disposeRuntime();
+    }
+  }
+
+  void setState(VoidCallback update) {
+    if (_disposed) return;
+    update();
+    notifyListeners();
+  }
+
   bool _stopConfirmationOpen = false;
   late BluetoothDevice _activeDevice;
   late final String _deviceDisplayName;
@@ -7031,12 +7858,10 @@ class _AcquisitionInitializationPageState
     status: OpenRemoteMqttStatus.disconnected,
   );
 
-  @override
-  void initState() {
-    super.initState();
+  void _initialize() {
     WidgetsBinding.instance.addObserver(this);
-    _activeDevice = widget.device;
-    _deviceDisplayName = _deviceName(_activeDevice);
+    _activeDevice = initialDevice;
+    _deviceDisplayName = recoverySnapshot?.deviceNames.firstOrNull ?? _deviceName(_activeDevice);
     _service = BleConfigurationService(_activeDevice);
     _mqttService = OpenRemoteMqttService();
     _csvLogger = AcquisitionCsvLogger();
@@ -7050,7 +7875,7 @@ class _AcquisitionInitializationPageState
     _visibleMeasurements = _measurementDefinitions
         .where(
           (definition) =>
-              widget.configuration.enabledOptions[definition.label] ?? false,
+              configuration.enabledOptions[definition.label] ?? false,
         )
         .toList(growable: false);
     _visibleMeasurementsByPrefix = {
@@ -7060,6 +7885,18 @@ class _AcquisitionInitializationPageState
     _messagesSubscription = _service.messages.listen((message) {
       if (_acquisitionStopped) {
         return;
+      }
+      if (Platform.isAndroid && _interruptionPending) {
+        // A connection/configuration handshake does not prove the data stream
+        // resumed. End the gap only when an actual notification is received.
+        _interruptionPending = false;
+        unawaited(AcquisitionRecoveryStore.closeInterruption(
+          _activeDevice.remoteId.toString(),
+        ).then((_) => AcquisitionRecoveryStore.updateStatus(
+          logicalRoute: _ActiveAcquisitionRuntime.isForegroundVisible
+              ? 'acquisition' : 'background',
+          status: 'running',
+        )).catchError((_) { _interruptionPending = true; }));
       }
 
       if (mounted) {
@@ -7099,9 +7936,7 @@ class _AcquisitionInitializationPageState
       }
     });
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _startInitialization();
-    });
+
   }
 
   @override
@@ -7121,6 +7956,7 @@ class _AcquisitionInitializationPageState
     _connectionSubscription = _service.connectionState.listen((state) {
       if (_acquisitionStopped ||
           _isStoppingAcquisition ||
+          (Platform.isAndroid && recoverySnapshot != null && _isInitializing) ||
           state != BluetoothConnectionState.disconnected) {
         return;
       }
@@ -7169,6 +8005,18 @@ class _AcquisitionInitializationPageState
       _bleReconnectFailureMessage = null;
     }
     _notifySingleBleAlertChanged();
+    if (Platform.isAndroid) {
+      _interruptionPending = true;
+      _backgroundStatusMessage = _mergeStatusMessage(
+        _backgroundStatusMessage,
+        'Data reception was interrupted. The interruption is recorded in session metadata beside the CSV.',
+      );
+      unawaited(AcquisitionRecoveryStore.recordInterruption(
+        deviceId: _activeDevice.remoteId.toString(),
+        startedAt: DateTime.now(),
+        reason: 'BLE connection interrupted',
+      ));
+    }
     _initializationStarted = false;
 
     unawaited(
@@ -7185,12 +8033,17 @@ class _AcquisitionInitializationPageState
     _syncSingleBleDisconnectionAlertDialog();
   }
 
-  @override
-  void dispose() {
+  void _disposeRuntime() {
+    if (_disposed) return;
+    _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     _bleAutoReconnectCoordinator.cancel(notify: false);
     _stopSingleBleAlertAlarm();
     _bleAlertRevision.dispose();
+    if (_androidResourcesStopped) {
+      super.dispose();
+      return;
+    }
     if (_acquisitionStarted && !_acquisitionStopped) {
       super.dispose();
       return;
@@ -7210,56 +8063,109 @@ class _AcquisitionInitializationPageState
   }
 
   Future<void> _startInitialization() async {
-    if (_initializationStarted) {
-      return;
-    }
-
+    if (_initializationStarted || _disposed) return;
     _initializationStarted = true;
-
-    if (mounted) {
-      setState(() {
-        _isInitializing = true;
-        _errorMessage = null;
-        _canRetry = false;
-        _requiresReconnect = false;
-        _bleDisconnectedDuringActiveAcquisition = false;
-        _bleReconnectStatus = _BleReconnectStatus.disconnected;
-        _bleReconnectFailureMessage = null;
-        if (!_acquisitionStarted) {
-          _messages.clear();
-          _liveMeasurementValues.clear();
-          _chartSamplesByPrefix.clear();
-        }
-      });
-    }
-
+    setState(() {
+      _isInitializing = true;
+      _errorMessage = null;
+      _canRetry = false;
+      _requiresReconnect = false;
+      if (!_acquisitionStarted) {
+        _messages.clear();
+        _liveMeasurementValues.clear();
+        _chartSamplesByPrefix.clear();
+      }
+    });
     try {
-      await _service.initialize(widget.configuration);
+      if (Platform.isAndroid) {
+        if (recoverySnapshot != null && recoverySnapshot!.csvFilePath == null) {
+          throw StateError('The original acquisition CSV path is unavailable.');
+        }
+        final previous = recoverySnapshot;
+        if (previous != null) {
+          _interruptionPending = true;
+          await AcquisitionRecoveryStore.recordInterruption(
+            deviceId: _activeDevice.remoteId.toString(),
+            startedAt: DateTime.tryParse(previous.lastHeartbeatIso8601 ?? '') ??
+                DateTime.tryParse(previous.startedAtIso8601 ?? '') ?? DateTime.now(),
+            reason: 'Acquisition process interrupted; samples may be missing since the last persisted heartbeat',
+          );
+        }
+        // Open and persist the original output before enabling data streams.
+        await _csvLogger.start(
+          existingFilePath: recoverySnapshot?.csvFilePath,
+          existingFileName: recoverySnapshot?.csvFileName,
+          startedAt: _startedAt,
+          sessionId: _sessionId,
+        );
+        await _activateAndroidBackgroundSupport();
+        _androidSessionPrepared = true;
+        await _gpsLocationService.start();
+        if (recoverySnapshot != null) {
+          _acquisitionStarted = true;
+          _needsProcessRecovery = true;
+          _backgroundStatusMessage = _mergeStatusMessage(
+            _backgroundStatusMessage,
+            'Acquisition resumed after an interruption. Samples during the interruption may be missing; details are retained with the CSV.',
+          );
+          if (recoverySnapshot!.runtimeState['openRemoteEnabled'] == true) {
+            unawaited(_connectOpenRemote());
+          }
+          final gpsStatusMessage = _gpsLocationService.statusMessage;
+          if (gpsStatusMessage != null) {
+            _backgroundStatusMessage = _mergeStatusMessage(
+              _backgroundStatusMessage, gpsStatusMessage,
+            );
+          }
+          await AcquisitionRecoveryStore.updateStatus(
+            logicalRoute: 'acquisition', status: 'recovering',
+          );
+          _isInitializing = false;
+          // Present the recovered acquisition immediately. The existing
+          // coordinator exclusively owns connection/configuration attempts,
+          // so startup does not wait for an absent device or create a second
+          // competing reconnect operation.
+          _markSingleBleDisconnectedDuringAcquisition();
+          return;
+        }
+      }
+      await _service.initialize(configuration);
+      _needsProcessRecovery = false;
       if (!_csvLogger.isStarted) {
         await _csvLogger.start();
         await _gpsLocationService.start();
-        final gpsStatusMessage = _gpsLocationService.statusMessage;
-        if (gpsStatusMessage != null) {
-          _backgroundStatusMessage = _mergeStatusMessage(
-            _backgroundStatusMessage,
-            gpsStatusMessage,
-          );
-        }
+      }
+      final gpsStatusMessage = _gpsLocationService.statusMessage;
+      if (gpsStatusMessage != null) {
+        _backgroundStatusMessage = _mergeStatusMessage(_backgroundStatusMessage, gpsStatusMessage);
       }
       _acquisitionStarted = true;
-      await _activateAndroidBackgroundSupport();
-      if (!mounted) {
-        return;
+      if (!Platform.isAndroid) await _activateAndroidBackgroundSupport();
+      if (Platform.isAndroid) {
+        await AcquisitionRecoveryStore.updateStatus(logicalRoute: 'acquisition', status: 'running');
       }
-
       setState(() {
         _isInitializing = false;
+        _bleDisconnectedDuringActiveAcquisition = false;
+        _bleReconnectStatus = _BleReconnectStatus.reconnected;
       });
     } catch (error) {
-      if (!mounted) {
+      if (_disposed) return;
+      if (Platform.isAndroid && recoverySnapshot != null &&
+          (!_csvLogger.isStarted || !_androidSessionPrepared)) {
+        await _abandonFailedRestoration();
+        rethrow;
+      }
+      if (Platform.isAndroid && recoverySnapshot != null && _csvLogger.isStarted) {
+        // Missing devices remain part of this session. Retry with the same
+        // coordinator and timing as an ordinary active-acquisition disconnect.
+        _acquisitionStarted = true;
+        _needsProcessRecovery = true;
+        _isInitializing = false;
+        _errorMessage = null;
+        _markSingleBleDisconnectedDuringAcquisition();
         return;
       }
-
       setState(() {
         _isInitializing = false;
         _errorMessage = error.toString();
@@ -7267,23 +8173,72 @@ class _AcquisitionInitializationPageState
         _requiresReconnect = false;
       });
       await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
-      await AndroidAcquisitionForegroundService.stop();
+      // An Android session with an open CSV remains recoverable on reopening.
+      if (!Platform.isAndroid || !_csvLogger.isStarted) {
+        await AndroidAcquisitionForegroundService.stop();
+      }
     }
   }
 
+  Future<void> _abandonFailedRestoration() async {
+    // Keep the recovery envelope intact so an unavailable original CSV can be
+    // retried. This partially constructed controller must not own the screen.
+    _bleAutoReconnectCoordinator.cancel(notify: false);
+    try {
+      await _messagesSubscription?.cancel();
+      await _connectionSubscription?.cancel();
+      await _mqttStateSubscription?.cancel();
+      await Future.wait<void>([
+        _csvLogger.stop(), _gpsLocationService.dispose(),
+        _mqttService.dispose(), _service.dispose(),
+      ]);
+    } catch (_) {
+      // The original restoration error remains the useful user-facing error.
+    }
+    _androidResourcesStopped = true;
+    _disposeRuntime();
+    await _ActiveAcquisitionRuntime.markInactive();
+    try {
+      await AndroidAcquisitionForegroundService.stop();
+    } catch (_) {}
+  }
+
   Future<void> _activateAndroidBackgroundSupport() async {
-    if (!Platform.isAndroid) {
-      return;
+    if (!Platform.isAndroid) return;
+    if (await AndroidAcquisitionForegroundService.isActivityAttached()) {
+      final notificationStatus = await Permission.notification.request();
+      if (!notificationStatus.isGranted) {
+        _backgroundStatusMessage = _mergeStatusMessage(
+          _backgroundStatusMessage,
+          'Android background acquisition may be unreliable without the persistent notification.',
+        );
+      }
     }
-
-    final notificationStatus = await Permission.notification.request();
-    if (!notificationStatus.isGranted) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        'Android background acquisition may be unreliable without the persistent notification.',
-      );
-    }
-
+    final session = _ConnectedDeviceSession(
+      device: _activeDevice,
+      deviceId: _activeDevice.remoteId.toString(),
+      deviceName: _deviceDisplayName,
+      type: KnownDeviceType.environmentalMonitor,
+    )..environmentalConfiguration = configuration;
+    await AcquisitionRecoveryStore.saveActive(
+      sessionId: _sessionId,
+      workflow: 'single-environmental',
+      devices: [session.toRecoveryDevice()],
+      runtimeState: {
+        ...?recoverySnapshot?.runtimeState,
+        'gpsEnabled': true,
+      },
+      acquisitionType: 'environmentalMonitor',
+      deviceNames: [_deviceDisplayName],
+      deviceTypes: [KnownDeviceType.environmentalMonitor.name],
+      configurationSummaries: [_summarizeEnvironmentalConfiguration(configuration)],
+      startedAt: _startedAt,
+      logicalRoute: 'acquisition',
+      status: _acquisitionStarted ? 'running' : 'initializing',
+      csvFileName: _csvLogger.fileName,
+      csvFilePath: _csvLogger.file?.path,
+    );
+    await _ActiveAcquisitionRuntime.markActive();
     try {
       await AndroidAcquisitionForegroundService.start();
       _foregroundServiceStarted = true;
@@ -7293,21 +8248,6 @@ class _AcquisitionInitializationPageState
         'Android background acquisition may be unreliable: $error',
       );
     }
-
-    await _ActiveAcquisitionRuntime.markActive();
-    await AcquisitionRecoveryStore.saveActive(
-      acquisitionType: 'environmentalMonitor',
-      deviceNames: [_deviceDisplayName],
-      deviceTypes: [KnownDeviceType.environmentalMonitor.name],
-      configurationSummaries: [
-        _summarizeEnvironmentalConfiguration(widget.configuration),
-      ],
-      startedAt: DateTime.now(),
-      logicalRoute: 'acquisition',
-      status: 'running',
-      csvFileName: _csvLogger.fileName,
-      csvFilePath: _csvLogger.file?.path,
-    );
   }
 
   Future<void> _retryInitialization() async {
@@ -7397,9 +8337,15 @@ class _AcquisitionInitializationPageState
       if (!_canContinueSingleAutomaticBleReconnect()) {
         return;
       }
-      await _service.resumeNotificationsAfterReconnect(
-        reconnectedDevice: reconnectedDevice,
-      );
+      if (_needsProcessRecovery) {
+        _service.device = reconnectedDevice;
+        await _service.initialize(configuration);
+        _needsProcessRecovery = false;
+      } else {
+        await _service.resumeNotificationsAfterReconnect(
+          reconnectedDevice: reconnectedDevice,
+        );
+      }
       _attachConnectionListener();
 
       if (!_canContinueSingleAutomaticBleReconnect()) {
@@ -7439,7 +8385,7 @@ class _AcquisitionInitializationPageState
   }
 
   bool _canContinueSingleAutomaticBleReconnect() {
-    return mounted && !_isStoppingAcquisition && !_acquisitionStopped;
+    return !_disposed && !_isStoppingAcquisition && !_acquisitionStopped;
   }
 
   bool _canAttemptSingleBleReconnect() {
@@ -7459,7 +8405,7 @@ class _AcquisitionInitializationPageState
   }
 
   void _syncSingleBleDisconnectionAlertDialog() {
-    if (!mounted || !Platform.isAndroid) {
+    if (!_viewAttached || !Platform.isAndroid) {
       return;
     }
 
@@ -7480,7 +8426,7 @@ class _AcquisitionInitializationPageState
   }
 
   void _showSingleBleAlertDialog() {
-    if (_bleAlertDialogOpen || !mounted) {
+    if (_bleAlertDialogOpen || !_viewAttached) {
       return;
     }
 
@@ -7539,7 +8485,7 @@ class _AcquisitionInitializationPageState
     _stopSingleBleAlertAlarm();
     final dialogContext = _bleAlertDialogContext;
     _bleAlertDialogContext = null;
-    if (dialogContext != null) {
+    if (dialogContext != null && dialogContext.mounted) {
       Navigator.of(dialogContext).pop();
     }
   }
@@ -7583,6 +8529,12 @@ class _AcquisitionInitializationPageState
 
     // Preserve the legacy target explicitly; device mapping belongs to the
     // current multi-device session manager only.
+    if (Platform.isAndroid) {
+      await AcquisitionRecoveryStore.mergeRuntimeState({
+        'openRemoteEnabled': true,
+        'openRemoteAssetId': '1zKVSJ8J0enUWtWRBY4bul',
+      });
+    }
     await _mqttService.connect(assetId: '1zKVSJ8J0enUWtWRBY4bul');
   }
 
@@ -7681,7 +8633,7 @@ class _AcquisitionInitializationPageState
   }
 
   Future<void> _requestStopAcquisition() async {
-    if (!mounted ||
+    if (!_viewAttached ||
         _stopConfirmationOpen ||
         _isStoppingAcquisition ||
         _acquisitionStopped) {
@@ -7695,17 +8647,23 @@ class _AcquisitionInitializationPageState
     } finally {
       _stopConfirmationOpen = false;
     }
-    if (!mounted || !confirmed) {
+    if (!_viewAttached || !confirmed) {
       return;
     }
     await _stopAcquisition();
   }
 
   Future<void> _stopAcquisition() async {
+    if (Platform.isAndroid) {
+      await _stopAndroidAcquisition();
+      return;
+    }
     if (_isStoppingAcquisition || _acquisitionStopped) {
       return;
     }
 
+    if (Platform.isAndroid) await AcquisitionRecoveryStore.markStopping();
+    _ActiveAcquisitionRuntime.beginStopping();
     _bleAutoReconnectCoordinator.cancel();
     setState(() {
       _isStoppingAcquisition = true;
@@ -7717,22 +8675,38 @@ class _AcquisitionInitializationPageState
       _messagesSubscription = null;
       await _csvLogger.stop();
       await _gpsLocationService.stop();
+      if (Platform.isAndroid) {
+        await _connectionSubscription?.cancel();
+        _connectionSubscription = null;
+        await _mqttStateSubscription?.cancel();
+        _mqttStateSubscription = null;
+        await _mqttService.dispose();
+        await _service.dispose();
+      }
       await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
       await AndroidAcquisitionForegroundService.stop();
       await AcquisitionRecoveryStore.clear();
       await _ActiveAcquisitionRuntime.markInactive();
 
-      if (!mounted) {
+      if (!_viewAttached) {
+        return;
+      }
+      final viewContext = context;
+      if (!viewContext.mounted) {
         return;
       }
 
-      await Navigator.of(context).push(
+      await Navigator.of(viewContext).push(
         MaterialPageRoute<void>(
           builder: (_) => AcquisitionCompletedPage(csvLogger: _csvLogger),
         ),
       );
     } catch (error) {
-      if (!mounted) {
+      if (!_viewAttached) {
+        return;
+      }
+      final viewContext = context;
+      if (!viewContext.mounted) {
         return;
       }
 
@@ -7740,20 +8714,85 @@ class _AcquisitionInitializationPageState
         _acquisitionStopped = false;
         _isStoppingAcquisition = false;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
+      ScaffoldMessenger.of(viewContext).showSnackBar(
         const SnackBar(content: Text('Could not stop acquisition')),
       );
     }
   }
 
-  @override
+  Future<void> _stopAndroidAcquisition() async {
+    if (_isStoppingAcquisition || _acquisitionStopped) return;
+    try {
+      await AcquisitionRecoveryStore.markStopping();
+      _ActiveAcquisitionRuntime.beginStopping();
+    } catch (error) {
+      if (_viewAttached) {
+        final viewContext = context;
+        if (!viewContext.mounted) {
+          return;
+        }
+        ScaffoldMessenger.of(viewContext).showSnackBar(
+          const SnackBar(content: Text('Could not save acquisition stop. Please try again.')),
+        );
+      }
+      return;
+    }
+    _bleAutoReconnectCoordinator.cancel();
+    _stopSingleBleAlertAlarm();
+    _closeSingleBleAlertDialog(dismissCurrentDevice: false);
+    setState(() {
+      _isStoppingAcquisition = true;
+      _acquisitionStopped = true;
+    });
+    Object? cleanupError;
+    Future<void> clean(Future<void> Function() operation) async {
+      try {
+        await operation();
+      } catch (error) {
+        cleanupError ??= error;
+      }
+    }
+    // Teardown all owners even if one plugin fails. The durable tombstone is
+    // already terminal, so neither a late callback nor a restart can resume it.
+    await clean(_bleAutoReconnectCoordinator.waitForIdle);
+    await clean(() async { await _messagesSubscription?.cancel(); });
+    _messagesSubscription = null;
+    await clean(() async { await _connectionSubscription?.cancel(); });
+    _connectionSubscription = null;
+    await clean(_csvLogger.stop);
+    await clean(_gpsLocationService.dispose);
+    await clean(() async { await _mqttStateSubscription?.cancel(); });
+    _mqttStateSubscription = null;
+    await clean(_mqttService.dispose);
+    await clean(_service.dispose);
+    await clean(() => _activeDevice.disconnect());
+    await clean(AndroidAcquisitionForegroundService.clearBleDisconnectionAlert);
+    await clean(AndroidAcquisitionForegroundService.stop);
+    await clean(AcquisitionRecoveryStore.clear);
+    _androidResourcesStopped = true;
+    await _ActiveAcquisitionRuntime.markInactive();
+    if (!_viewAttached) return;
+    final viewContext = context;
+    if (!viewContext.mounted) {
+      return;
+    }
+    if (cleanupError != null) {
+      ScaffoldMessenger.of(viewContext).showSnackBar(
+        SnackBar(content: Text('Acquisition stopped. Some resources could not be closed cleanly: $cleanupError')),
+      );
+    }
+    await Navigator.of(viewContext).push(
+      MaterialPageRoute<void>(builder: (_) => AcquisitionCompletedPage(csvLogger: _csvLogger)),
+    );
+  }
+
   Widget build(BuildContext context) {
     final title = _isInitializing || (_errorMessage != null && !_acquisitionStarted)
         ? 'Acquisition Initialization'
         : 'Acquisition in progress...';
 
     return PopScope(
-      canPop: !_isInitializing,
+        canPop: Platform.isAndroid ? !_isInitializing && !_acquisitionStarted : !_isInitializing,
       child: AbsorbPointer(
         absorbing: _isInitializing,
         child: Scaffold(

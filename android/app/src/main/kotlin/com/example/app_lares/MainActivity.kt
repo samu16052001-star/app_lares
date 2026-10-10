@@ -1,71 +1,43 @@
 package com.example.app_lares
 
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.MethodChannel
 
+/** A view of the process-owned acquisition engine, never its owner. */
 class MainActivity : FlutterActivity() {
-    private var polarH10Manager: PolarH10Manager? = null
+    override fun onCreate(savedInstanceState: Bundle?) {
+        LaresAcquisitionRuntime.activityAttached = true
+        super.onCreate(savedInstanceState)
+    }
+
+    override fun provideFlutterEngine(context: Context): FlutterEngine =
+        LaresAcquisitionRuntime.engine(context)
+
+    override fun shouldDestroyEngineWithHost(): Boolean = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-        super.configureFlutterEngine(flutterEngine)
+        // Plugins and native channels are registered once by the runtime. Registering
+        // them here would replace live listeners every time an Activity is recreated.
+    }
 
-        polarH10Manager = PolarH10Manager(
-            this,
-            flutterEngine.dartExecutor.binaryMessenger
-        )
+    override fun onResume() {
+        super.onResume()
+        LaresAcquisitionRuntime.onActivityResumed()
+    }
 
-        MethodChannel(
-            flutterEngine.dartExecutor.binaryMessenger,
-            "app_lares/acquisition_foreground_service"
-        ).setMethodCallHandler { call, result ->
-            when (call.method) {
-                "startAcquisitionForegroundService" -> {
-                    try {
-                        LaresAcquisitionForegroundService.start(this)
-                        result.success(null)
-                    } catch (error: Exception) {
-                        result.error(
-                            "FOREGROUND_SERVICE_START_FAILED",
-                            error.message,
-                            null
-                        )
-                    }
-                }
-                "stopAcquisitionForegroundService" -> {
-                    try {
-                        LaresAcquisitionForegroundService.stop(this)
-                        result.success(null)
-                    } catch (error: Exception) {
-                        result.error(
-                            "FOREGROUND_SERVICE_STOP_FAILED",
-                            error.message,
-                            null
-                        )
-                    }
-                }
-                "showBleDisconnectionAlert" -> {
-                    val deviceName = call.argument<String>("deviceName")
-                        ?: "BLE device"
-                    LaresBleAlertNotifications.show(this, deviceName)
-                    result.success(null)
-                }
-                "clearBleDisconnectionAlert" -> {
-                    LaresBleAlertNotifications.clear(this)
-                    result.success(null)
-                }
-                "playBleDisconnectionAlarmCue" -> {
-                    LaresBleAlertNotifications.playAlarmCue(this)
-                    result.success(null)
-                }
-                else -> result.notImplemented()
-            }
-        }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        LaresAcquisitionRuntime.onActivityResumed()
     }
 
     override fun onDestroy() {
-        polarH10Manager?.dispose()
-        polarH10Manager = null
         super.onDestroy()
+        LaresAcquisitionRuntime.onActivityDestroyed(applicationContext, isChangingConfigurations)
+        // Detaching the rendering surface must not destroy the isolate, GATT
+        // clients, Polar SDK, location subscription, timers, or CSV writers.
     }
 }

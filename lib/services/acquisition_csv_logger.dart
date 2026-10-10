@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:share_plus/share_plus.dart';
 
+import 'acquisition_csv_file.dart';
+
 class AcquisitionCsvLogger {
   static final RegExp _counterPattern = RegExp(r'^\d+$');
   static const List<_CsvSensorField> _sensorFields = [
@@ -95,6 +97,10 @@ class AcquisitionCsvLogger {
 
   File? _file;
   IOSink? _sink;
+  AcquisitionCsvFile? _output;
+  Future<void>? _startFuture;
+  Future<void>? _stopFuture;
+  Future<void> _writeQueue = Future<void>.value();
   String? _fileName;
   bool _isStarted = false;
   bool _isStopped = false;
@@ -112,29 +118,82 @@ class AcquisitionCsvLogger {
 
   bool get isStopped => _isStopped;
 
-  Future<void> start() async {
+  Future<void> start({
+    String? existingFilePath,
+    String? existingFileName,
+    DateTime? startedAt,
+    String? sessionId,
+  }) {
+    final pending = _startFuture;
+    if (pending != null) return pending;
+    final operation = _start(
+      existingFilePath: existingFilePath,
+      existingFileName: existingFileName,
+      startedAt: startedAt,
+      sessionId: sessionId,
+    );
+    _startFuture = operation;
+    return operation.catchError((Object error, StackTrace stackTrace) {
+      _startFuture = null;
+      Error.throwWithStackTrace(error, stackTrace);
+    });
+  }
+
+  Future<void> _start({
+    String? existingFilePath,
+    String? existingFileName,
+    DateTime? startedAt,
+    String? sessionId,
+  }) async {
     if (_isStarted) {
       return;
     }
 
-    final now = DateTime.now();
-    _fileName = 'Acquisition_data_${_formatFileTimestamp(now)}.csv';
-    final path = '${Directory.systemTemp.path}${Platform.pathSeparator}$_fileName';
-    final file = File(path);
+    final now = Platform.isAndroid ? startedAt ?? DateTime.now() : DateTime.now();
+    _fileName = Platform.isAndroid && existingFilePath != null
+        ? existingFileName ?? File(existingFilePath).uri.pathSegments.last
+        : 'Acquisition_data_${_formatFileTimestamp(now)}.csv';
+    final output = await AcquisitionCsvFile.open(
+      fileName: _fileName!,
+      existingFilePath: Platform.isAndroid ? existingFilePath : null,
+      sessionId: sessionId,
+    );
 
-    await file.create(recursive: true);
-    final sink = file.openWrite(mode: FileMode.writeOnly);
-    sink.writeln('TIMESTAMP;DEVICE_NAME;DATA_RECEIVED;GPS_COORDINATES');
-    await sink.flush();
-
-    _file = file;
-    _sink = sink;
+    _output = output;
+    _file = output.file;
+    _sink = output.sink;
     _isStarted = true;
     _isStopped = false;
+    _stopFuture = null;
     _clearCurrentCluster();
   }
 
   Future<void> appendBleMessage({
+    required DateTime receivedAt,
+    required String deviceName,
+    required String gpsCoordinates,
+    required String value,
+  }) {
+    if (Platform.isAndroid) {
+      if (_stopFuture != null) {
+        return Future<void>.value();
+      }
+      return _enqueue(() => _appendBleMessage(
+            receivedAt: receivedAt,
+            deviceName: deviceName,
+            gpsCoordinates: gpsCoordinates,
+            value: value,
+          ));
+    }
+    return _appendBleMessage(
+      receivedAt: receivedAt,
+      deviceName: deviceName,
+      gpsCoordinates: gpsCoordinates,
+      value: value,
+    );
+  }
+
+  Future<void> _appendBleMessage({
     required DateTime receivedAt,
     required String deviceName,
     required String gpsCoordinates,
@@ -150,7 +209,7 @@ class AcquisitionCsvLogger {
       final counter = int.parse(trimmedValue);
       if (counter >= 1) {
         _handleCounter(counter, receivedAt, deviceName, gpsCoordinates, sink);
-        await sink.flush();
+        await _output!.flush();
       }
       return;
     }
@@ -158,7 +217,12 @@ class AcquisitionCsvLogger {
     _handleDataMessage(trimmedValue);
   }
 
-  Future<void> stop() async {
+  Future<void> stop() {
+    return _stopFuture ??=
+        Platform.isAndroid ? _enqueue(_stop) : _stop();
+  }
+
+  Future<void> _stop() async {
     if (_isStopped) {
       return;
     }
@@ -172,8 +236,14 @@ class AcquisitionCsvLogger {
     }
 
     _flushCurrentClusterIfNeeded(sink);
-    await sink.flush();
-    await sink.close();
+    await _output!.close();
+    _output = null;
+  }
+
+  Future<void> _enqueue(Future<void> Function() action) {
+    final next = _writeQueue.catchError((_) {}).then((_) => action());
+    _writeQueue = next.catchError((_) {});
+    return next;
   }
 
   Future<void> exportToDownloadsOrShare() async {

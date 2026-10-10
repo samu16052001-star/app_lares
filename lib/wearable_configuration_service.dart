@@ -45,7 +45,7 @@ class WearableConfigurationBleService {
   static const int _maxLogEntries = 200;
 
   BluetoothDevice device;
-  final VoidCallback? onStateChanged;
+  VoidCallback? onStateChanged;
 
   final StreamController<List<String>> _logController =
       StreamController<List<String>>.broadcast();
@@ -203,6 +203,36 @@ class WearableConfigurationBleService {
       _log('CONFIG write error: $error');
       rethrow;
     }
+  }
+
+  /// Replays the saved setup only when the acquisition isolate was lost. A
+  /// normal radio reconnect still uses resumeNotificationsAfterReconnect.
+  Future<void> recoverConfigurationSequence({
+    required BluetoothDevice reconnectedDevice,
+    required int odr,
+    required int mag,
+    required int accG,
+    required int gyrDPS,
+    required bool calibrationEnabled,
+  }) async {
+    if (_isDisposed) {
+      throw StateError('Wearable BLE service is disposed.');
+    }
+    _sequenceTimer?.cancel();
+    _sequenceTimer = null;
+    _stopPeriodicTimestampTimer();
+    await _cancelConnectionStateSubscription();
+    await _clearNotificationSubscriptionForReconnect();
+    device = reconnectedDevice;
+    _setSequenceState(WearableBleSequenceState.idle);
+    await initialize();
+    await startConfigurationSequence(
+      odr: odr,
+      mag: mag,
+      accG: accG,
+      gyrDPS: gyrDPS,
+      calibrationEnabled: calibrationEnabled,
+    );
   }
 
   Future<void> stopAcquisition() async {

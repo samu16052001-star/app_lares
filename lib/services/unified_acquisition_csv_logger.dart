@@ -5,6 +5,8 @@ import 'package:app_lares/polar_h10/polar_h10_models.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:share_plus/share_plus.dart';
 
+import 'acquisition_csv_file.dart';
+
 class UnifiedAcquisitionCsvLogger {
   static final RegExp _counterPattern = RegExp(r'^\d+$');
   static const List<_CsvSensorField> _sensorFields = [
@@ -61,6 +63,8 @@ class UnifiedAcquisitionCsvLogger {
 
   File? _file;
   IOSink? _sink;
+  AcquisitionCsvFile? _output;
+  Future<void>? _startFuture;
   String? _fileName;
   bool _isStarted = false;
   bool _isStopped = false;
@@ -78,24 +82,50 @@ class UnifiedAcquisitionCsvLogger {
 
   bool get isStopped => _isStopped;
 
-  Future<void> start() async {
+  Future<void> start({
+    String? existingFilePath,
+    String? existingFileName,
+    DateTime? startedAt,
+    String? sessionId,
+  }) {
+    final pending = _startFuture;
+    if (pending != null) return pending;
+    final operation = _start(
+      existingFilePath: existingFilePath,
+      existingFileName: existingFileName,
+      startedAt: startedAt,
+      sessionId: sessionId,
+    );
+    _startFuture = operation;
+    return operation.catchError((Object error, StackTrace stackTrace) {
+      _startFuture = null;
+      Error.throwWithStackTrace(error, stackTrace);
+    });
+  }
+
+  Future<void> _start({
+    String? existingFilePath,
+    String? existingFileName,
+    DateTime? startedAt,
+    String? sessionId,
+  }) async {
     if (_isStarted) {
       return;
     }
 
-    final now = DateTime.now();
-    _fileName = 'Acquisition_data_${_formatFileTimestamp(now)}.csv';
-    final path =
-        '${Directory.systemTemp.path}${Platform.pathSeparator}$_fileName';
-    final file = File(path);
+    final now = Platform.isAndroid ? startedAt ?? DateTime.now() : DateTime.now();
+    _fileName = Platform.isAndroid && existingFilePath != null
+        ? existingFileName ?? File(existingFilePath).uri.pathSegments.last
+        : 'Acquisition_data_${_formatFileTimestamp(now)}.csv';
+    final output = await AcquisitionCsvFile.open(
+      fileName: _fileName!,
+      existingFilePath: Platform.isAndroid ? existingFilePath : null,
+      sessionId: sessionId,
+    );
 
-    await file.create(recursive: true);
-    final sink = file.openWrite(mode: FileMode.writeOnly);
-    sink.writeln('TIMESTAMP;DEVICE_NAME;DATA_RECEIVED;GPS_COORDINATES');
-    await sink.flush();
-
-    _file = file;
-    _sink = sink;
+    _output = output;
+    _file = output.file;
+    _sink = output.sink;
     _isStarted = true;
     _isStopped = false;
     _stopFuture = null;
@@ -105,6 +135,7 @@ class UnifiedAcquisitionCsvLogger {
 
   Future<void> appendEnvironmentalMessage({
     required DateTime receivedAt,
+    String? deviceId,
     required String deviceName,
     required String gpsCoordinates,
     required String value,
@@ -122,16 +153,20 @@ class UnifiedAcquisitionCsvLogger {
           _handleCounter(
             counter,
             receivedAt,
+            Platform.isAndroid ? deviceId ?? deviceName : deviceName,
             deviceName,
             gpsCoordinates,
             sink,
           );
-          await sink.flush();
+          await _output!.flush();
         }
         return;
       }
 
-      _handleDataMessage(deviceName, trimmedValue);
+      _handleDataMessage(
+        Platform.isAndroid ? deviceId ?? deviceName : deviceName,
+        trimmedValue,
+      );
     });
   }
 
@@ -172,7 +207,7 @@ class UnifiedAcquisitionCsvLogger {
       cluster.values[messageType] = value;
 
       if (closesCurrentRow) {
-        await sink.flush();
+        await _output!.flush();
       }
     });
   }
@@ -197,7 +232,7 @@ class UnifiedAcquisitionCsvLogger {
           _escapeCsvField(gpsCoordinates),
         ].join(';'),
       );
-      await sink.flush();
+      await _output!.flush();
     });
   }
 
@@ -221,7 +256,7 @@ class UnifiedAcquisitionCsvLogger {
           _escapeCsvField(gpsCoordinates),
         ].join(';'),
       );
-      await sink.flush();
+      await _output!.flush();
     });
   }
 
@@ -250,7 +285,7 @@ class UnifiedAcquisitionCsvLogger {
           ].join(';'),
         );
       }
-      await sink.flush();
+      await _output!.flush();
     });
   }
 
@@ -283,7 +318,7 @@ class UnifiedAcquisitionCsvLogger {
           ].join(';'),
         );
       }
-      await sink.flush();
+      await _output!.flush();
     });
   }
 
@@ -312,8 +347,8 @@ class UnifiedAcquisitionCsvLogger {
       _sink = null;
 
       if (sink != null) {
-        await sink.flush();
-        await sink.close();
+        await _output!.close();
+        _output = null;
       }
     });
     _stopFuture = stopFuture;
@@ -373,12 +408,13 @@ class UnifiedAcquisitionCsvLogger {
   void _handleCounter(
     int counter,
     DateTime receivedAt,
+    String deviceId,
     String deviceName,
     String gpsCoordinates,
     IOSink sink,
   ) {
     final cluster = _environmentalClusters.putIfAbsent(
-      deviceName,
+      deviceId,
       _EnvironmentalClusterState.new,
     );
     _flushEnvironmentalClusterIfNeeded(cluster, sink);
