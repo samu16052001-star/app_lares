@@ -67,6 +67,8 @@ class WearableConfigurationBleService {
   bool _isDisposed = false;
   bool _periodicTimestampWriteInProgress = false;
   bool _mtuRequested = false;
+  int? _lastAg2PacketCounter;
+  int? _expectedAg2NextTicks;
   bool _hasBlockingMtuIssue = false;
   bool _serviceDiscoveryCompleted = false;
   bool _targetServiceFound = false;
@@ -454,6 +456,11 @@ class WearableConfigurationBleService {
     }
 
     final receivedAt = DateTime.now();
+    if (WearableAg2PacketParser.startsWithAg2Header(value)) {
+      _handleAg2Packet(value, receivedAt);
+      return;
+    }
+
     if (WearableAgmPacketParser.startsWithAgmHeader(value) ||
         WearableAgmPacketParser.hasValidLength(value)) {
       _handleAgmPacket(value, receivedAt);
@@ -478,19 +485,70 @@ class WearableConfigurationBleService {
   void _handleAgmPacket(List<int> value, DateTime receivedAt) {
     try {
       final samples = WearableAgmPacketParser.parseBatch(value);
-      _startPeriodicTimestampTimerIfNeeded(receivedAt);
-      if (!_agmBatchesController.isClosed) {
-        _agmBatchesController.add(
-          WearableAgmReceivedBatch(
-            receivedAt: receivedAt,
-            samples: samples,
-          ),
-        );
-      }
-      _log(_formatAgmSample(samples.first));
+      _publishImuSamples(samples, receivedAt);
     } catch (_) {
       // Invalid AGM batches are intentionally ignored.
     }
+  }
+
+  void _handleAg2Packet(List<int> value, DateTime receivedAt) {
+    try {
+      final packet = WearableAg2PacketParser.parsePacket(value);
+      _checkAg2Continuity(packet);
+      _publishImuSamples(packet.samples, receivedAt);
+    } catch (_) {
+      // Invalid AG2 packets are intentionally ignored, like invalid AGM batches.
+    }
+  }
+
+  /// AGM and AG2 samples go to the same stream, so CSV logging, charts and
+  /// MQTT work the same way with both packet formats.
+  void _publishImuSamples(
+    List<WearableAgmSample> samples,
+    DateTime receivedAt,
+  ) {
+    _startPeriodicTimestampTimerIfNeeded(receivedAt);
+    if (!_agmBatchesController.isClosed) {
+      _agmBatchesController.add(
+        WearableAgmReceivedBatch(
+          receivedAt: receivedAt,
+          samples: samples,
+        ),
+      );
+    }
+    _log(_formatAgmSample(samples.first));
+  }
+
+  /// Logs lost AG2 notifications (packet counter jump) and missing samples
+  /// (first timestamp not equal to the one expected after the previous packet).
+  void _checkAg2Continuity(WearableAg2Packet packet) {
+    final lastCounter = _lastAg2PacketCounter;
+    final expectedTicks = _expectedAg2NextTicks;
+    final isNewAcquisition = packet.packetCounter == 0;
+
+    if (!isNewAcquisition && lastCounter != null) {
+      final expectedCounter = (lastCounter + 1) & 0xFF;
+      if (packet.packetCounter != expectedCounter) {
+        _log(
+          'AG2 packet counter jump: expected $expectedCounter, '
+          'received ${packet.packetCounter}.',
+        );
+      }
+    }
+
+    if (!isNewAcquisition &&
+        expectedTicks != null &&
+        packet.stepTicks > 0 &&
+        packet.firstTicks != expectedTicks) {
+      final deltaTicks = (packet.firstTicks - expectedTicks) & 0xFFFFFFFF;
+      _log(
+        'AG2 gap: about ${deltaTicks ~/ packet.stepTicks} samples missing '
+        'before this packet.',
+      );
+    }
+
+    _lastAg2PacketCounter = packet.packetCounter;
+    _expectedAg2NextTicks = packet.nextTicks;
   }
 
   void _handleSdsPacket(List<int> value, DateTime receivedAt) {
@@ -796,11 +854,13 @@ class WearableAgmReceivedBatch {
     required List<WearableAgmSample> samples,
   }) : samples = List.unmodifiable(samples) {
     if (this.samples.isEmpty ||
-        this.samples.length > WearableAgmPacketParser.maxSamplesPerBatch) {
+        this.samples.length > WearableAg2PacketParser.maxSamplesPerPacket) {
       throw ArgumentError.value(
         samples.length,
         'samples.length',
-        'AGM batches must contain between 1 and 5 samples.',
+        'IMU batches must contain between 1 and '
+            '${WearableAg2PacketParser.maxSamplesPerPacket} samples '
+            '(5 for AGM, up to 19 for AG2).',
       );
     }
   }
