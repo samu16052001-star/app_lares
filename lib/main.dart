@@ -1936,6 +1936,22 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _openRemoteLocationSubscription = null;
 
     final sessionsToStop = List<_ConnectedDeviceSession>.from(_sessions);
+
+    // 1. STOP to all the IMUs at the same time, while their data subscriptions
+    //    are still active. stopAcquisition() keeps listening until the IMU
+    //    sends its END packet (or a short timeout), so the last samples reach
+    //    the CSV. Before, the app stopped listening to every device first and
+    //    then stopped the IMUs one by one: the last 10/20/32 samples of
+    //    IMU1/IMU2/IMU3 (S13) were only on the SD.
+    await Future.wait(
+      sessionsToStop
+          .where(
+            (session) => session.type == KnownDeviceType.respiratoryMonitor,
+          )
+          .map(_stopWearableSession),
+    );
+
+    // 2. Only now stop listening to every device.
     for (final session in sessionsToStop) {
       await session.cancelLiveSubscriptions();
     }
@@ -1959,16 +1975,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           } catch (_) {}
           break;
         case KnownDeviceType.respiratoryMonitor:
-          final service = session.wearableService;
-          if (service != null && !service.isStopped) {
-            try {
-              await service.stopAcquisition();
-            } catch (_) {
-              try {
-                await service.dispose();
-              } catch (_) {}
-            }
-          }
+          // Already stopped in step 1 (no-op if it is stopped).
+          await _stopWearableSession(session);
           break;
         case KnownDeviceType.polarH10:
           try {
@@ -1999,6 +2007,23 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _acquisitionStarted = false;
     _isStopping = false;
     notifyListeners();
+  }
+
+  /// Sends STOP to one IMU and waits for its last samples (see stopAll).
+  /// Never throws, so one IMU cannot block the others.
+  Future<void> _stopWearableSession(_ConnectedDeviceSession session) async {
+    final service = session.wearableService;
+    if (service == null || service.isStopped) {
+      return;
+    }
+
+    try {
+      await service.stopAcquisition();
+    } catch (_) {
+      try {
+        await service.dispose();
+      } catch (_) {}
+    }
   }
 
   Future<void> disposeSessions() async {

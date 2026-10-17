@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:app_lares/wearable_agm_packet_parser.dart';
+import 'package:app_lares/wearable_end_packet_parser.dart';
 import 'package:app_lares/wearable_sds_packet_parser.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -40,6 +41,10 @@ class WearableConfigurationBleService {
   static const Duration _configDoneTimeout = Duration(seconds: 10);
   static const Duration _calibrationDoneTimeout = Duration(seconds: 22);
   static const Duration _periodicTimestampInterval = Duration(seconds: 60);
+  // After STOP the app keeps listening until the IMU sends its END packet
+  // (firmware from 14/10/2026) or until this timeout (older firmware).
+  static const Duration _endOfAcquisitionTimeout =
+      Duration(milliseconds: 1500);
   static const int _requestedAttMtu = 247;
   static const int _minimumBatchedAgmAttMtu = 218;
   static const int _maxLogEntries = 200;
@@ -69,6 +74,9 @@ class WearableConfigurationBleService {
   bool _mtuRequested = false;
   int? _lastAg2PacketCounter;
   int? _expectedAg2NextTicks;
+  int _samplesReceivedSinceStart = 0;
+  Completer<WearableEndPacket?>? _endOfAcquisitionCompleter;
+  WearableEndPacket? _lastEndPacket;
   bool _hasBlockingMtuIssue = false;
   bool _serviceDiscoveryCompleted = false;
   bool _targetServiceFound = false;
@@ -113,6 +121,12 @@ class WearableConfigurationBleService {
   bool get isStopping => _sequenceState == WearableBleSequenceState.stopping;
 
   bool get isStopped => _sequenceState == WearableBleSequenceState.stopped;
+
+  /// Samples received since the last START (AGM and AG2).
+  int get samplesReceivedSinceStart => _samplesReceivedSinceStart;
+
+  /// END packet received after the last STOP, if the firmware sent one.
+  WearableEndPacket? get lastEndPacket => _lastEndPacket;
 
   bool get isReadyToContinue {
     return _mtuRequested &&
@@ -216,17 +230,33 @@ class WearableConfigurationBleService {
     _sequenceTimer?.cancel();
     _sequenceTimer = null;
     _stopPeriodicTimestampTimer();
+    // Created before writing STOP: the END packet can arrive before the write
+    // future completes.
+    _endOfAcquisitionCompleter = Completer<WearableEndPacket?>();
+    _lastEndPacket = null;
     _log('Sending STOP command.');
 
     try {
       await _writeCommand('STOP');
     } catch (error) {
+      _endOfAcquisitionCompleter = null;
       _setSequenceState(WearableBleSequenceState.error);
       _log('STOP write error: $error');
       rethrow;
     }
 
-    _log('STOP command sent successfully.');
+    _log('STOP command sent successfully. Waiting for the last samples.');
+    // Notifications are still processed while stopping: the samples produced
+    // before the IMU received STOP, and the last partial AG2 packet, still
+    // reach the CSV. Before this change they were dropped (6-32 samples per
+    // IMU at the end of every recording, still present on the SD).
+    final endPacket = await _waitForEndOfAcquisition();
+    if (endPacket == null) {
+      _log(
+        'No END packet within ${_endOfAcquisitionTimeout.inMilliseconds} ms '
+        '(firmware older than 14/10/2026?): closing anyway.',
+      );
+    }
     await _cleanupAfterStop();
 
     try {
@@ -451,11 +481,17 @@ class WearableConfigurationBleService {
   }
 
   void _handleNotification(List<int> value) {
-    if (isStopping || isStopped) {
+    // While stopping, notifications are still handled (last samples + END).
+    if (isStopped) {
       return;
     }
 
     final receivedAt = DateTime.now();
+    if (WearableEndPacketParser.startsWithEndHeader(value)) {
+      _handleEndPacket(value);
+      return;
+    }
+
     if (WearableAg2PacketParser.startsWithAg2Header(value)) {
       _handleAg2Packet(value, receivedAt);
       return;
@@ -507,7 +543,10 @@ class WearableConfigurationBleService {
     List<WearableAgmSample> samples,
     DateTime receivedAt,
   ) {
-    _startPeriodicTimestampTimerIfNeeded(receivedAt);
+    _samplesReceivedSinceStart += samples.length;
+    if (!isStopping) {
+      _startPeriodicTimestampTimerIfNeeded(receivedAt);
+    }
     if (!_agmBatchesController.isClosed) {
       _agmBatchesController.add(
         WearableAgmReceivedBatch(
@@ -549,6 +588,46 @@ class WearableConfigurationBleService {
 
     _lastAg2PacketCounter = packet.packetCounter;
     _expectedAg2NextTicks = packet.nextTicks;
+  }
+
+  /// END packet: the IMU has sent its last sample after STOP. Logs how many
+  /// samples the IMU recorded and how many reached the app.
+  void _handleEndPacket(List<int> value) {
+    final WearableEndPacket packet;
+    try {
+      packet = WearableEndPacketParser.parse(value);
+    } catch (_) {
+      _log('Invalid END packet: ${_hexPayload(value)}');
+      return;
+    }
+
+    _lastEndPacket = packet;
+    final received = _samplesReceivedSinceStart;
+    _log(
+      'END: the IMU recorded ${packet.totalSamples} samples, the app received '
+      '$received (missing: ${packet.totalSamples - received}). '
+      'SD file number: ${packet.sdFileNumber}.',
+    );
+
+    final completer = _endOfAcquisitionCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(packet);
+    }
+  }
+
+  Future<WearableEndPacket?> _waitForEndOfAcquisition() async {
+    final completer = _endOfAcquisitionCompleter;
+    if (completer == null) {
+      return null;
+    }
+
+    try {
+      return await completer.future.timeout(_endOfAcquisitionTimeout);
+    } on TimeoutException {
+      return null;
+    } finally {
+      _endOfAcquisitionCompleter = null;
+    }
   }
 
   void _handleSdsPacket(List<int> value, DateTime receivedAt) {
@@ -631,6 +710,7 @@ class WearableConfigurationBleService {
     }
 
     _setSequenceState(WearableBleSequenceState.preparingStart);
+    _samplesReceivedSinceStart = 0;
 
     try {
       final timestamp = await _currentLocalTimestamp();
