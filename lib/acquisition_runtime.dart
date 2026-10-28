@@ -172,11 +172,9 @@ Future<void> _restoreMultiDeviceAcquisition(AcquisitionRecoverySnapshot snapshot
     manager._handleOpenRemoteLivePosition,
   );
   if (manager.canUseOpenRemote) {
-    manager._mqttStateSubscription = manager.mqttService.states.listen((state) {
-      manager.mqttState = state;
-      if (state.isConnected) manager._completePendingOpenRemoteLocationAuthorization();
-      manager._notifySessionChanged();
-    });
+    manager._mqttStateSubscription = manager.mqttService.states.listen(
+      manager._handleOpenRemoteMqttState,
+    );
   }
   await AcquisitionRecoveryStore.updateStatus(logicalRoute: 'acquisition', status: 'recovering');
   await _ActiveAcquisitionRuntime.markActive();

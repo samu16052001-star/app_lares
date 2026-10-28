@@ -16,6 +16,7 @@ import 'package:app_lares/services/acquisition_recovery_store.dart';
 import 'package:app_lares/services/acquisition_csv_logger.dart';
 import 'package:app_lares/services/android_acquisition_foreground_service.dart';
 import 'package:app_lares/services/gps_location_service.dart';
+import 'package:app_lares/services/environmental_open_remote.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/pm10_parser.dart';
 import 'package:app_lares/services/respiratory_device_name_store.dart';
@@ -1288,6 +1289,7 @@ class _ConnectedDeviceSession {
   PolarH10Configuration? polarConfiguration;
   BleConfigurationService? environmentalService;
   EnvironmentalV2BleService? environmentalV2Service;
+  EnvironmentalV2OpenRemotePublisher? environmentalV2OpenRemotePublisher;
   WearableConfigurationBleService? wearableService;
   StreamSubscription<BluetoothConnectionState>? connectionSubscription;
   StreamSubscription<BleNotificationMessage>? environmentalMessagesSubscription;
@@ -1406,6 +1408,7 @@ class _ConnectedDeviceSession {
   }
 
   Future<void> cancelLiveSubscriptions() async {
+    environmentalV2OpenRemotePublisher?.reset();
     await environmentalMessagesSubscription?.cancel();
     environmentalMessagesSubscription = null;
     await environmentalV2MessagesSubscription?.cancel();
@@ -1446,11 +1449,6 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   void _notifySessionChanged() {
     notifyListeners();
   }
-
-  static const _openRemoteAssetIdByEnvironmentalDeviceName = <String, String>{
-    'LARES_ENV_V1_106': '7l9c0BynTv7UqckE045gaf',
-    'LARES_ENV_V1_06': '39xOKe65bmS7yhutTrk100',
-  };
 
   static const _openRemoteAttributeByEnvironmentalPrefix = <String, String>{
     'CO2': 'co2',
@@ -1531,18 +1529,27 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
   bool get isAndroidBackgroundServiceActive => _foregroundServiceStarted;
 
-  bool get canUseOpenRemote => _openRemoteAssetId != null;
-
-  String? get _openRemoteAssetId {
-    if (_sessions.length != 1 ||
-        _sessions.first.type != KnownDeviceType.environmentalMonitor) {
-      return null;
-    }
-
-    return _openRemoteAssetIdByEnvironmentalDeviceName[
-      _sessions.first.deviceName
-    ];
+  bool get canUseOpenRemote {
+    if (_sessions.isEmpty) return false;
+    final session = _sessions.first;
+    return EnvironmentalOpenRemote.isEligible(
+      sessionDeviceCount: _sessions.length,
+      bleDeviceName: session.deviceName,
+      isEnvironmentalV1: session.type == KnownDeviceType.environmentalMonitor,
+      isEnvironmentalV2:
+          session.type == KnownDeviceType.environmentalMonitorV2 &&
+          KnownDeviceClassifier.environmentalV2NameFrom([session.deviceName]) !=
+              null,
+    );
   }
+
+  String? get _openRemoteAssetId => canUseOpenRemote
+      ? EnvironmentalOpenRemote.assetIdByDeviceName[_sessions.first.deviceName]
+      : null;
+
+  bool get _usesPhoneGpsForOpenRemote =>
+      canUseOpenRemote &&
+      _sessions.first.type == KnownDeviceType.environmentalMonitor;
 
   List<String> get _recoveryConfigurationSummaries {
     return [
@@ -1630,6 +1637,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     EnvironmentalV2Configuration configuration,
   ) {
+    session.environmentalV2OpenRemotePublisher?.reset();
     session.environmentalV2Configuration = configuration;
     notifyListeners();
   }
@@ -1681,21 +1689,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     if (canUseOpenRemote) {
-      _mqttStateSubscription = mqttService.states.listen((state) {
-        mqttState = state;
-        if (state.status == OpenRemoteMqttStatus.connected) {
-          _completePendingOpenRemoteLocationAuthorization();
-        } else if (state.status == OpenRemoteMqttStatus.failed ||
-            state.status == OpenRemoteMqttStatus.disconnected) {
-          _openRemoteLocationConnectionPending = false;
-        }
-        if (state.status == OpenRemoteMqttStatus.failed &&
-            state.message != null &&
-            _sessions.isNotEmpty) {
-          _appendEnvironmentalLog(_sessions.first, 'OpenRemote: ${state.message}');
-        }
-        notifyListeners();
-      });
+      _mqttStateSubscription = mqttService.states.listen(
+        _handleOpenRemoteMqttState,
+      );
     }
 
       for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
@@ -1747,15 +1743,28 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   Future<void> connectOpenRemote() async {
-    final assetId = _openRemoteAssetId;
-    if (assetId == null ||
+    if (_disposed ||
+        _isStopping ||
+        !canUseOpenRemote ||
         mqttState.status == OpenRemoteMqttStatus.connecting ||
         mqttState.status == OpenRemoteMqttStatus.connected) {
       return;
     }
 
+    final assetId = _openRemoteAssetId;
+    if (assetId == null) {
+      mqttState = OpenRemoteMqttState(
+        status: OpenRemoteMqttStatus.failed,
+        message: EnvironmentalOpenRemote.missingAssetMessage(
+          _sessions.first.deviceName,
+        ),
+      );
+      notifyListeners();
+      return;
+    }
+
     _openRemoteLocationConnectionPending =
-        !_disposed && _acquisitionStarted && !_isStopping;
+        _usesPhoneGpsForOpenRemote && _acquisitionStarted;
     if (Platform.isAndroid) {
       _openRemoteConnectRequested = true;
       await AcquisitionRecoveryStore.mergeRuntimeState({
@@ -1771,6 +1780,27 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
   }
 
+  void _handleOpenRemoteMqttState(OpenRemoteMqttState state) {
+    if (mqttState.status != state.status) {
+      for (final session in _sessions) {
+        session.environmentalV2OpenRemotePublisher?.reset();
+      }
+    }
+    mqttState = state;
+    if (state.isConnected) {
+      _completePendingOpenRemoteLocationAuthorization();
+    } else if (state.status == OpenRemoteMqttStatus.failed ||
+        state.status == OpenRemoteMqttStatus.disconnected) {
+      _openRemoteLocationConnectionPending = false;
+    }
+    if (state.status == OpenRemoteMqttStatus.failed &&
+        state.message != null &&
+        _sessions.isNotEmpty) {
+      _appendEnvironmentalLog(_sessions.first, 'OpenRemote: ${state.message}');
+    }
+    notifyListeners();
+  }
+
   void _completePendingOpenRemoteLocationAuthorization() {
     if (!_openRemoteLocationConnectionPending) {
       return;
@@ -1780,7 +1810,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (_disposed ||
         !_acquisitionStarted ||
         _isStopping ||
-        !canUseOpenRemote ||
+        !_usesPhoneGpsForOpenRemote ||
         !mqttService.isConnected) {
       return;
     }
@@ -1888,6 +1918,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    session.environmentalV2OpenRemotePublisher?.reset();
     session
       ..reconnectStatus = _BleReconnectStatus.reconnecting
       ..reconnectFailureMessage = null;
@@ -2308,6 +2339,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         }
 
         session.isConnected = isConnected;
+        session.environmentalV2OpenRemotePublisher?.reset();
         if (!isConnected) {
           if (session.type == KnownDeviceType.environmentalMonitorV2) {
             session.environmentalV2NotificationsStarted = false;
@@ -2346,6 +2378,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    session.environmentalV2OpenRemotePublisher?.reset();
     if (Platform.isAndroid && !session.interruptionPending) {
       session.interruptionPending = true;
       backgroundStatusMessage = _mergeStatusMessage(
@@ -2872,7 +2905,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         !_acquisitionStarted ||
         _isStopping ||
         !_openRemoteLocationAuthorized ||
-        !canUseOpenRemote ||
+        !_usesPhoneGpsForOpenRemote ||
         !_sessions.first.isConnected ||
         !mqttService.isConnected) {
       return;
@@ -2943,6 +2976,19 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (configuration == null ||
         !configuration.isMessageTypeEnabled(message.type)) {
       return;
+    }
+
+    if (!_disposed &&
+        _acquisitionStarted &&
+        !_isStopping &&
+        canUseOpenRemote &&
+        _openRemoteAssetId != null &&
+        identical(_sessions.first, session)) {
+      final publisher = session.environmentalV2OpenRemotePublisher ??=
+          EnvironmentalV2OpenRemotePublisher(mqttService);
+      unawaited(
+        publisher.publish(message: message, configuration: configuration),
+      );
     }
 
     final definition = session.visibleMeasurementsByPrefix[message.type];
