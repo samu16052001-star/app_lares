@@ -9,6 +9,8 @@ abstract final class EnvironmentalOpenRemote {
     'LARES_ENV_V1_106': '7l9c0BynTv7UqckE045gaf',
     'LARES_ENV_V1_06': '39xOKe65bmS7yhutTrk100',
     'LARES_ENV_V2_03': '69sL57iS78gErbeFx9E6rw',
+    'LARES_ENV_V2_01': '3Kh8ASBk0eHWMZhL69iTnC',
+    'LARES_ENV_V2_02': '5NpAq9sHv3PgxpBCGadobt'
   };
 
   static bool isEligible({
