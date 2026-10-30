@@ -47,10 +47,7 @@ class EnvironmentalV2NotificationMessage {
 }
 
 class EnvironmentalV2BleException implements Exception {
-  const EnvironmentalV2BleException(
-    this.message, {
-    this.canRetry = true,
-  });
+  const EnvironmentalV2BleException(this.message, {this.canRetry = true});
 
   final String message;
   final bool canRetry;
@@ -113,16 +110,13 @@ class EnvironmentalV2BleService {
       );
 
       final characteristicMap = _buildCharacteristicMap(_discoveredServices);
-      _verifyEnabledCharacteristics(configuration, characteristicMap);
+      _verifyConfigurationCharacteristics(characteristicMap);
 
       for (final option in EnvironmentalV2Option.values) {
-        if (!configuration.isEnabled(option)) {
-          continue;
-        }
-
         await _writeWithRetries(
           characteristicMap[option.characteristicUuid]!,
           option.characteristicUuid,
+          enabled: configuration.isEnabled(option),
         );
       }
 
@@ -269,15 +263,10 @@ class EnvironmentalV2BleService {
     return characteristics;
   }
 
-  void _verifyEnabledCharacteristics(
-    EnvironmentalV2Configuration configuration,
+  void _verifyConfigurationCharacteristics(
     Map<String, BluetoothCharacteristic> characteristics,
   ) {
     for (final option in EnvironmentalV2Option.values) {
-      if (!configuration.isEnabled(option)) {
-        continue;
-      }
-
       if (!characteristics.containsKey(option.characteristicUuid)) {
         throw EnvironmentalV2BleException(
           'Missing BLE characteristic: ${option.characteristicUuid}',
@@ -289,13 +278,15 @@ class EnvironmentalV2BleService {
 
   Future<void> _writeWithRetries(
     BluetoothCharacteristic characteristic,
-    String uuid,
-  ) async {
+    String uuid, {
+    required bool enabled,
+  }) async {
+    final payload = enabled ? _enabledPayload : _disabledPayload;
     Object? lastError;
 
     for (var attempt = 0; attempt <= _maxAdditionalWriteAttempts; attempt++) {
       try {
-        await characteristic.write(_enabledPayload, withoutResponse: false);
+        await characteristic.write(payload, withoutResponse: false);
         return;
       } catch (error) {
         lastError = error;
@@ -421,6 +412,7 @@ class EnvironmentalV2BleService {
 
   static const int _maxAdditionalWriteAttempts = 5;
   static const List<int> _enabledPayload = <int>[0x01];
+  static const List<int> _disabledPayload = <int>[0x00];
 }
 
 class _EnvironmentalV2NotificationRegistration {
