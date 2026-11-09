@@ -52,15 +52,65 @@ class AndroidAcquisitionForegroundService {
     }
   }
 
-  static Future<void> playBleDisconnectionAlarmCue() async {
+  /// "No IMU data" notification: separate from
+  /// the disconnection alert, silent, vibrates when [alert] is true.
+  static Future<void> showImuNoDataAlert({
+    required String text,
+    required bool alert,
+  }) async {
     if (!Platform.isAndroid) {
       return;
     }
 
     try {
-      await _channel.invokeMethod<void>('playBleDisconnectionAlarmCue');
+      await _channel.invokeMethod<void>(
+        'showImuNoDataAlert',
+        <String, Object?>{'text': text, 'alert': alert},
+      );
     } catch (_) {
-      // Audio/vibration failures must never interrupt acquisition.
+      // Alert notification failures must never interrupt acquisition.
+    }
+  }
+
+  static Future<void> clearImuNoDataAlert() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      await _channel.invokeMethod<void>('clearImuNoDataAlert');
+    } catch (_) {
+      // Best effort cleanup only.
+    }
+  }
+
+  /// Keeps the screen on while the stopwatch runs, like the
+  /// wake lock of time.sesnext.uk.
+  static Future<void> setKeepScreenOn(bool on) async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      await _channel.invokeMethod<void>(
+        'setKeepScreenOn',
+        <String, Object?>{'on': on},
+      );
+    } catch (_) {
+      // Best effort only.
+    }
+  }
+
+  /// Vibration repeated while a device stays disconnected.
+  static Future<void> vibrateBleDisconnectionAlert() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      await _channel.invokeMethod<void>('vibrateBleDisconnectionAlert');
+    } catch (_) {
+      // Vibration failures must never interrupt acquisition.
     }
   }
 }

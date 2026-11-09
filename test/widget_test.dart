@@ -45,7 +45,7 @@ void main() {
     await tester.tap(find.text('Manual Configuration'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Scanning Bluetooth Devices'), findsWidgets);
+    expect(find.text('Scanning Bluetooth Devices...'), findsWidgets);
   });
 
   testWidgets('opens the researcher section with the researcher code', (

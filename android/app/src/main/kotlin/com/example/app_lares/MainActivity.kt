@@ -1,5 +1,6 @@
 package com.example.app_lares
 
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -54,8 +55,29 @@ class MainActivity : FlutterActivity() {
                     LaresBleAlertNotifications.clear(this)
                     result.success(null)
                 }
-                "playBleDisconnectionAlarmCue" -> {
-                    LaresBleAlertNotifications.playAlarmCue(this)
+                "showImuNoDataAlert" -> {
+                    val text = call.argument<String>("text") ?: "No IMU data"
+                    val alert = call.argument<Boolean>("alert") ?: true
+                    LaresBleAlertNotifications.showNoData(this, text, alert)
+                    result.success(null)
+                }
+                "clearImuNoDataAlert" -> {
+                    LaresBleAlertNotifications.clearNoData(this)
+                    result.success(null)
+                }
+                "vibrateBleDisconnectionAlert" -> {
+                    LaresBleAlertNotifications.vibrateAlertCue(this)
+                    result.success(null)
+                }
+                // Stopwatch running: screen kept on, like the
+                // wake lock of time.sesnext.uk.
+                "setKeepScreenOn" -> {
+                    val on = call.argument<Boolean>("on") ?: false
+                    if (on) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    }
                     result.success(null)
                 }
                 else -> result.notImplemented()

@@ -478,12 +478,7 @@ class UnifiedAcquisitionCsvLogger {
   }
 
   String _formatWearableSample(WearableAgmSample sample) {
-    return 't=${sample.timestampMs} ms, acc=(${sample.accX.toStringAsFixed(3)}, '
-        '${sample.accY.toStringAsFixed(3)}, '
-        '${sample.accZ.toStringAsFixed(3)}) g, '
-        'gyr=(${sample.gyrX.toStringAsFixed(3)}, '
-        '${sample.gyrY.toStringAsFixed(3)}, '
-        '${sample.gyrZ.toStringAsFixed(3)}) dps';
+    return formatWearableSampleForCsv(sample);
   }
 
   String _polarDeviceName(String deviceName) {

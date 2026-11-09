@@ -53,7 +53,8 @@ class LaresAcquisitionForegroundService : Service() {
         }
 
         return builder
-            .setSmallIcon(applicationInfo.icon)
+            .setSmallIcon(R.drawable.ic_stat_lares)
+            .setColor(NOTIFICATION_COLOR)
             .setContentTitle(NOTIFICATION_TEXT)
             .setContentText(NOTIFICATION_TEXT)
             .setContentIntent(pendingIntent)
@@ -95,6 +96,8 @@ class LaresAcquisitionForegroundService : Service() {
         private const val CHANNEL_NAME = "Lares acquisition"
         private const val NOTIFICATION_ID = 4205
         private const val NOTIFICATION_TEXT = "Lares app is active"
+        // Blue of the LaRes logo.
+        private const val NOTIFICATION_COLOR = 0xFF013988.toInt()
         fun start(context: Context) {
             val intent = Intent(context, LaresAcquisitionForegroundService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

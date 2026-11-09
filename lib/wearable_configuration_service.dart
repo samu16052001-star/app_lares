@@ -3,6 +3,9 @@ import 'dart:convert';
 
 import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:app_lares/wearable_end_packet_parser.dart';
+import 'package:app_lares/wearable_imu_status.dart';
+import 'package:app_lares/wearable_mag_calibration.dart';
+import 'package:app_lares/wearable_reception_monitor.dart';
 import 'package:app_lares/wearable_sds_packet_parser.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -16,6 +19,9 @@ enum WearableBleSequenceState {
   calibrationStartSent,
   waitingCalibrationDone,
   calibrationDone,
+  magCalibrationStartSent,
+  waitingMagCalibrationDone,
+  magCalibrationDone,
   preparingStart,
   startSent,
   streaming,
@@ -39,10 +45,13 @@ class WearableConfigurationBleService {
       '00002a05-1212-efde-1523-785feabcd123';
 
   static const Duration _configDoneTimeout = Duration(seconds: 10);
+  static const Duration _statusReplyTimeout = Duration(seconds: 2);
   static const Duration _calibrationDoneTimeout = Duration(seconds: 22);
+  // Magnetometer calibration: 20 s of rotation plus margin.
+  static const Duration _magCalibrationDoneTimeout =
+      Duration(seconds: 32);
   static const Duration _periodicTimestampInterval = Duration(seconds: 60);
-  // After STOP the app keeps listening until the IMU sends its END packet
-  // (firmware from 14/10/2026) or until this timeout (older firmware).
+  // After STOP the app keeps listening until the IMU sends its END packet or until this timeout.
   static const Duration _endOfAcquisitionTimeout =
       Duration(milliseconds: 1500);
   static const int _requestedAttMtu = 247;
@@ -72,9 +81,17 @@ class WearableConfigurationBleService {
   bool _isDisposed = false;
   bool _periodicTimestampWriteInProgress = false;
   bool _mtuRequested = false;
-  int? _lastAg2PacketCounter;
-  int? _expectedAg2NextTicks;
+  int? _lastPacketCounter;
+  int? _expectedNextTicks;
   int _samplesReceivedSinceStart = 0;
+  int? _configuredSensorMask;
+  int _configuredOdr = 104;
+  // Last CONFIG command: sent again when an IMU that was switched off and on
+  // during the acquisition reconnects (_restartAcquisitionIfImuRebooted).
+  String? _lastConfigCommand;
+  Completer<WearableImuStatus>? _statusReplyCompleter;
+  bool _restartingAfterReboot = false;
+  final WearableReceptionMonitor _receptionMonitor = WearableReceptionMonitor();
   Completer<WearableEndPacket?>? _endOfAcquisitionCompleter;
   WearableEndPacket? _lastEndPacket;
   bool _hasBlockingMtuIssue = false;
@@ -84,6 +101,22 @@ class WearableConfigurationBleService {
   bool _notifyCharacteristicFound = false;
   bool _notificationsEnabled = false;
   bool _calibrationEnabled = false;
+  bool _magCalibrationEnabled = false;
+  DateTime? _magCalibrationStartedAt;
+  WearableMagCalibrationResult? _lastMagCalibration;
+  String? _magCalibrationWarning;
+  // Data watchdog: last data packet, moment from which data are
+  // expected (START, reconnection) and link state seen by the phone.
+  DateTime? _lastDataAt;
+  DateTime? _noDataWatchdogArmedAt;
+  bool _linkConnected = true;
+  // Safety net of the IMU link. While the app is still
+  // configuring the other devices it reconnects nobody, so the IMU is told
+  // INIT_BUSY before START (it then keeps a slow link instead of
+  // disconnecting) and INIT_DONE when the initialization is finished (sent
+  // again after a reconnection if the IMU was disconnected at that moment).
+  bool _holdSafetyNet = false;
+  bool _initDonePending = false;
   WearableBleSequenceState _sequenceState = WearableBleSequenceState.idle;
 
   Stream<List<String>> get logsStream => _logController.stream;
@@ -111,6 +144,9 @@ class WearableConfigurationBleService {
       WearableBleSequenceState.calibrationStartSent ||
       WearableBleSequenceState.waitingCalibrationDone ||
       WearableBleSequenceState.calibrationDone ||
+      WearableBleSequenceState.magCalibrationStartSent ||
+      WearableBleSequenceState.waitingMagCalibrationDone ||
+      WearableBleSequenceState.magCalibrationDone ||
       WearableBleSequenceState.preparingStart ||
       WearableBleSequenceState.streaming ||
       WearableBleSequenceState.stopping => true,
@@ -122,11 +158,77 @@ class WearableConfigurationBleService {
 
   bool get isStopped => _sequenceState == WearableBleSequenceState.stopped;
 
-  /// Samples received since the last START (AGM and AG2).
+  /// Samples received since the last START (AGM, AG2 and IMD).
   int get samplesReceivedSinceStart => _samplesReceivedSinceStart;
+
+  /// Received/missing samples over the last 10 s (indicator in the UI).
+  WearableReceptionMonitor get receptionMonitor => _receptionMonitor;
+
+  /// Sensors requested with the last CONFIG ([WearableSensorMask] bits), null
+  /// before CONFIG. The data packets say which sensors really arrived.
+  int? get configuredSensorMask => _configuredSensorMask;
 
   /// END packet received after the last STOP, if the firmware sent one.
   WearableEndPacket? get lastEndPacket => _lastEndPacket;
+
+  /// What the person holding the IMU must do while it calibrates, shown in
+  /// the UI; null when no calibration is running. The accelerometer and
+  /// gyroscope calibration assumes the IMU still, flat and face up (a tilted
+  /// IMU gives a wrong accelerometer bias); the magnetometer calibration
+  /// needs the IMU rotated in all directions.
+  String? get calibrationInstruction {
+    switch (_sequenceState) {
+      case WearableBleSequenceState.calibrationStartSent:
+      case WearableBleSequenceState.waitingCalibrationDone:
+        return 'Calibrating: keep the IMU still, flat and face up.';
+      case WearableBleSequenceState.magCalibrationStartSent:
+      case WearableBleSequenceState.waitingMagCalibrationDone:
+        final startedAt = _magCalibrationStartedAt;
+        final elapsed = startedAt == null
+            ? Duration.zero
+            : DateTime.now().difference(startedAt);
+        final remaining = WearableMagCalibrationResult.duration - elapsed;
+        final remainingText = remaining > Duration.zero
+            ? '${(remaining.inMilliseconds / 1000).ceil()} s left'
+            : 'finishing';
+        return 'Magnetometer calibration: rotate the IMU slowly in all '
+            'directions (upside down and on every side), away from metal '
+            'objects ($remainingText).';
+      default:
+        return null;
+    }
+  }
+
+  /// Result of the last magnetometer calibration.
+  WearableMagCalibrationResult? get lastMagCalibration => _lastMagCalibration;
+
+  /// Set when the magnetometer calibration failed or got no reply: the IMU
+  /// goes on with its previous offset. Shown in the UI.
+  String? get magCalibrationWarning => _magCalibrationWarning;
+
+  /// Silence that triggers the "no IMU data" alert for the configured sensors
+  /// and ODR (2 s at 104 Hz), see [WearableNoDataWatchdog].
+  Duration get noDataAlertThreshold => WearableNoDataWatchdog.thresholdFor(
+        sensorMask: _configuredSensorMask,
+        odr: _configuredOdr,
+      );
+
+  /// How long this IMU has sent no data, when that reaches
+  /// [noDataAlertThreshold] while it should be streaming; null otherwise (not
+  /// streaming, stopping, link already closed by the phone, data arriving).
+  Duration? noDataFor(DateTime now) {
+    if (_isDisposed ||
+        !_linkConnected ||
+        _sequenceState != WearableBleSequenceState.streaming) {
+      return null;
+    }
+    return WearableNoDataWatchdog.silenceBeyond(
+      now: now,
+      lastDataAt: _lastDataAt,
+      armedAt: _noDataWatchdogArmedAt,
+      threshold: noDataAlertThreshold,
+    );
+  }
 
   bool get isReadyToContinue {
     return _mtuRequested &&
@@ -184,7 +286,11 @@ class WearableConfigurationBleService {
         !_notificationsEnabled) {
       throw StateError('Wearable BLE notification resume is not complete.');
     }
+    // Link back: data are expected again from now (data watchdog).
+    _linkConnected = true;
+    _noDataWatchdogArmedAt = DateTime.now();
     _resumePeriodicTimestampTimerIfStreaming();
+    await _restartAcquisitionIfImuRebooted();
   }
 
   Future<void> startConfigurationSequence({
@@ -193,7 +299,11 @@ class WearableConfigurationBleService {
     required int accG,
     required int gyrDPS,
     required bool calibrationEnabled,
+    bool magCalibrationEnabled = false,
+    bool holdSafetyNetUntilInitDone = false,
   }) async {
+    // 0 = sensor off: accG = 0 accelerometer off,
+    // gyrDPS = 0 gyroscope off, mag = 0 magnetometer off.
     final command = 'CONFIG:$odr,$mag,$accG,$gyrDPS';
 
     if (!isReadyToContinue) {
@@ -203,6 +313,18 @@ class WearableConfigurationBleService {
     }
 
     _calibrationEnabled = calibrationEnabled;
+    _holdSafetyNet = holdSafetyNetUntilInitDone;
+    _initDonePending = false;
+    // The magnetometer calibration needs the magnetometer on (CONFIG mag = 1).
+    _magCalibrationEnabled = magCalibrationEnabled && mag == 1;
+    _magCalibrationWarning = null;
+    _configuredSensorMask = WearableSensorMask.fromConfiguration(
+      mag: mag,
+      accG: accG,
+      gyrDPS: gyrDPS,
+    );
+    _configuredOdr = odr;
+    _lastConfigCommand = command;
     _setSequenceState(WearableBleSequenceState.configSent);
 
     try {
@@ -353,6 +475,7 @@ class WearableConfigurationBleService {
 
   void _listenToConnectionState() {
     _connectionStateSubscription ??= device.connectionState.listen((state) {
+      _linkConnected = state == BluetoothConnectionState.connected;
       if (state == BluetoothConnectionState.disconnected) {
         _stopPeriodicTimestampTimer();
       }
@@ -497,6 +620,12 @@ class WearableConfigurationBleService {
       return;
     }
 
+    // Before the AGM length check: an IMD packet can be 43, 86, ... bytes long.
+    if (WearableImdPacketParser.startsWithImdHeader(value)) {
+      _handleImdPacket(value, receivedAt);
+      return;
+    }
+
     if (WearableAgmPacketParser.startsWithAgmHeader(value) ||
         WearableAgmPacketParser.hasValidLength(value)) {
       _handleAgmPacket(value, receivedAt);
@@ -521,6 +650,12 @@ class WearableConfigurationBleService {
   void _handleAgmPacket(List<int> value, DateTime receivedAt) {
     try {
       final samples = WearableAgmPacketParser.parseBatch(value);
+      _lastDataAt = receivedAt;
+      _receptionMonitor.addAgmSamples(
+        receivedAt: receivedAt,
+        timestampsMs: [for (final sample in samples) sample.timestampMs],
+        stepMs: _nominalStepTicks(_configuredOdr) * 0.025,
+      );
       _publishImuSamples(samples, receivedAt);
     } catch (_) {
       // Invalid AGM batches are intentionally ignored.
@@ -530,15 +665,52 @@ class WearableConfigurationBleService {
   void _handleAg2Packet(List<int> value, DateTime receivedAt) {
     try {
       final packet = WearableAg2PacketParser.parsePacket(value);
-      _checkAg2Continuity(packet);
+      _handleTickPacket(
+        label: 'AG2',
+        packetCounter: packet.packetCounter,
+        firstTicks: packet.firstTicks,
+        stepTicks: packet.stepTicks,
+        sampleCount: packet.samples.length,
+        receivedAt: receivedAt,
+      );
       _publishImuSamples(packet.samples, receivedAt);
     } catch (_) {
       // Invalid AG2 packets are intentionally ignored, like invalid AGM batches.
     }
   }
 
-  /// AGM and AG2 samples go to the same stream, so CSV logging, charts and
-  /// MQTT work the same way with both packet formats.
+  void _handleImdPacket(List<int> value, DateTime receivedAt) {
+    try {
+      final packet = WearableImdPacketParser.parsePacket(value);
+      _handleTickPacket(
+        label: 'IMD',
+        packetCounter: packet.packetCounter,
+        firstTicks: packet.firstTicks,
+        stepTicks: packet.stepTicks,
+        sampleCount: packet.samples.length,
+        receivedAt: receivedAt,
+      );
+      _publishImuSamples(packet.samples, receivedAt);
+    } catch (_) {
+      // Invalid IMD packets are intentionally ignored, like invalid AGM batches.
+    }
+  }
+
+  /// Sensor ticks (25 us) between two samples at a native ODR, like the
+  /// firmware (6666.67 Hz / 2^k): 384 ticks = 9.6 ms at 104 Hz.
+  static int _nominalStepTicks(int odr) {
+    return switch (odr) {
+      12 || 13 => 3072,
+      26 => 1536,
+      52 => 768,
+      104 => 384,
+      208 => 192,
+      _ => 96,
+    };
+  }
+
+  /// AGM, AG2 and IMD samples go to the same stream, so CSV logging, charts
+  /// and MQTT work the same way with all packet formats.
   void _publishImuSamples(
     List<WearableAgmSample> samples,
     DateTime receivedAt,
@@ -558,36 +730,54 @@ class WearableConfigurationBleService {
     _log(_formatAgmSample(samples.first));
   }
 
-  /// Logs lost AG2 notifications (packet counter jump) and missing samples
-  /// (first timestamp not equal to the one expected after the previous packet).
-  void _checkAg2Continuity(WearableAg2Packet packet) {
-    final lastCounter = _lastAg2PacketCounter;
-    final expectedTicks = _expectedAg2NextTicks;
-    final isNewAcquisition = packet.packetCounter == 0;
+  /// AG2 and IMD packets: logs lost notifications (packet counter jump) and
+  /// missing samples (first timestamp not equal to the one expected after the
+  /// previous packet), and feeds the reception indicator.
+  void _handleTickPacket({
+    required String label,
+    required int packetCounter,
+    required int firstTicks,
+    required int stepTicks,
+    required int sampleCount,
+    required DateTime receivedAt,
+  }) {
+    final lastCounter = _lastPacketCounter;
+    final expectedTicks = _expectedNextTicks;
+    // Counter 0 = first packet after START; after 255 it is just the wrap.
+    final isNewAcquisition =
+        packetCounter == 0 && (lastCounter == null || lastCounter != 0xFF);
 
     if (!isNewAcquisition && lastCounter != null) {
       final expectedCounter = (lastCounter + 1) & 0xFF;
-      if (packet.packetCounter != expectedCounter) {
+      if (packetCounter != expectedCounter) {
         _log(
-          'AG2 packet counter jump: expected $expectedCounter, '
-          'received ${packet.packetCounter}.',
+          '$label packet counter jump: expected $expectedCounter, '
+          'received $packetCounter.',
         );
       }
     }
 
     if (!isNewAcquisition &&
         expectedTicks != null &&
-        packet.stepTicks > 0 &&
-        packet.firstTicks != expectedTicks) {
-      final deltaTicks = (packet.firstTicks - expectedTicks) & 0xFFFFFFFF;
+        stepTicks > 0 &&
+        firstTicks != expectedTicks) {
+      final deltaTicks = (firstTicks - expectedTicks) & 0xFFFFFFFF;
       _log(
-        'AG2 gap: about ${deltaTicks ~/ packet.stepTicks} samples missing '
+        '$label gap: about ${deltaTicks ~/ stepTicks} samples missing '
         'before this packet.',
       );
     }
 
-    _lastAg2PacketCounter = packet.packetCounter;
-    _expectedAg2NextTicks = packet.nextTicks;
+    _lastDataAt = receivedAt;
+    _receptionMonitor.addTickPacket(
+      receivedAt: receivedAt,
+      firstTicks: firstTicks,
+      stepTicks: stepTicks,
+      sampleCount: sampleCount,
+      newAcquisition: isNewAcquisition,
+    );
+    _lastPacketCounter = packetCounter;
+    _expectedNextTicks = (firstTicks + sampleCount * stepTicks) & 0xFFFFFFFF;
   }
 
   /// END packet: the IMU has sent its last sample after STOP. Logs how many
@@ -603,10 +793,15 @@ class WearableConfigurationBleService {
 
     _lastEndPacket = packet;
     final received = _samplesReceivedSinceStart;
+    final counters = packet.bleNotifyFailures == null
+        ? ''
+        : ' Failed notifications in the IMU: ${packet.bleNotifyFailures}, '
+            'dropped from the BLE queue: ${packet.bleQueueDrops}, '
+            'dropped from the SD queue: ${packet.sdQueueDrops}.';
     _log(
       'END: the IMU recorded ${packet.totalSamples} samples, the app received '
       '$received (missing: ${packet.totalSamples - received}). '
-      'SD file number: ${packet.sdFileNumber}.',
+      'SD recording number: ${packet.sdFileNumber}.$counters',
     );
 
     final completer = _endOfAcquisitionCompleter;
@@ -633,12 +828,17 @@ class WearableConfigurationBleService {
   void _handleSdsPacket(List<int> value, DateTime receivedAt) {
     try {
       final status = WearableSdsPacketParser.parse(value);
+      final link = status.link;
+      if (link != null) {
+        _log('BLE link: ${link.summary}.');
+      }
       if (!_sdsStatusController.isClosed) {
         _sdsStatusController.add(
           WearableSdsReceivedStatus(
             receivedAt: receivedAt,
             batteryPercent: status.batteryPercent,
             flushFailureRate: status.flushFailureRate,
+            link: link,
           ),
         );
       }
@@ -650,6 +850,15 @@ class WearableConfigurationBleService {
   void _handleTextNotification(String payload) {
     final trigger = payload.trim();
 
+    final status = WearableImuStatus.tryParse(trigger);
+    if (status != null) {
+      final completer = _statusReplyCompleter;
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(status);
+      }
+      return;
+    }
+
     if (_sequenceState == WearableBleSequenceState.waitingConfigDone &&
         trigger == 'CONFIG_DONE') {
       _handleConfigDone();
@@ -659,6 +868,13 @@ class WearableConfigurationBleService {
     if (_sequenceState == WearableBleSequenceState.waitingCalibrationDone &&
         trigger == 'CALIB_DONE') {
       _handleCalibrationDone();
+      return;
+    }
+
+    final magCalibration = WearableMagCalibrationResult.tryParse(trigger);
+    if (magCalibration != null &&
+        _sequenceState == WearableBleSequenceState.waitingMagCalibrationDone) {
+      _handleMagCalibrationResult(magCalibration);
     }
   }
 
@@ -667,12 +883,105 @@ class WearableConfigurationBleService {
     _sequenceTimer = null;
     _setSequenceState(WearableBleSequenceState.configDone);
 
-    if (_calibrationEnabled) {
+    // After an IMU restart the biases saved in its flash are used: no
+    // calibration while the subject is wearing the IMU.
+    final restarting = _restartingAfterReboot;
+    _restartingAfterReboot = false;
+    if (_calibrationEnabled && !restarting) {
       unawaited(_sendCalibrationStart());
+      return;
+    }
+    if (_magCalibrationEnabled && !restarting) {
+      unawaited(_sendMagCalibrationStart());
       return;
     }
 
     unawaited(_sendStart());
+  }
+
+  /// Called after a reconnection while streaming. If only the link dropped,
+  /// the IMU is still recording (SD and data go on). If the IMU was switched
+  /// off and on, it has lost CONFIG and START: the IMU says which case it is
+  /// (STATUS) and in the second case the same CONFIG
+  /// and a new START are sent, without calibration. The recording goes on in
+  /// a new SD file.
+  Future<void> _restartAcquisitionIfImuRebooted() async {
+    if (_isDisposed || _sequenceState != WearableBleSequenceState.streaming) {
+      return;
+    }
+
+    final status = await _queryImuStatus();
+    if (_isDisposed || _sequenceState != WearableBleSequenceState.streaming) {
+      return;
+    }
+    if (status == null) {
+      _log(
+        'No STATUS reply (firmware older than 20/10/2026?): the IMU is not '
+        'restarted automatically.',
+      );
+      await _sendInitDoneIfPending();
+      return;
+    }
+    if (status.recording) {
+      _log('IMU still recording after the reconnection (${status.summary}).');
+      await _sendInitDoneIfPending();
+      return;
+    }
+
+    final configCommand = _lastConfigCommand;
+    if (configCommand == null) {
+      _log(
+        'IMU not recording after the reconnection (${status.summary}), but '
+        'there is no CONFIG to send again.',
+      );
+      return;
+    }
+
+    _log(
+      'IMU not recording after the reconnection (${status.summary}): it was '
+      'switched off and on. Sending CONFIG and START again.',
+    );
+    _restartingAfterReboot = true;
+    // New acquisition: packet counter and sensor time start again from 0.
+    _lastPacketCounter = null;
+    _expectedNextTicks = null;
+    _setSequenceState(WearableBleSequenceState.configSent);
+
+    try {
+      await _writeCommand(configCommand);
+      _log('CONFIG command sent: $configCommand');
+      _setSequenceState(WearableBleSequenceState.waitingConfigDone);
+      _startTimeout(
+        timeout: _configDoneTimeout,
+        expectedPayload: 'CONFIG_DONE',
+        timeoutMessage: 'Timeout waiting for CONFIG_DONE after 10 seconds.',
+      );
+    } catch (error) {
+      _restartingAfterReboot = false;
+      _setSequenceState(WearableBleSequenceState.error);
+      _log('CONFIG write error: $error');
+    }
+  }
+
+  /// Asks the IMU whether it is recording. Null if it does not answer within
+  /// [_statusReplyTimeout].
+  Future<WearableImuStatus?> _queryImuStatus() async {
+    final completer = Completer<WearableImuStatus>();
+    _statusReplyCompleter = completer;
+
+    try {
+      await _writeCommand(WearableImuStatus.command);
+      return await completer.future.timeout(_statusReplyTimeout);
+    } on TimeoutException {
+      return null;
+    } catch (error) {
+      _log('STATUS write error: $error');
+      return null;
+    } finally {
+      if (identical(_statusReplyCompleter, completer)) {
+        _statusReplyCompleter = null;
+      }
+    }
   }
 
   Future<void> _sendCalibrationStart() async {
@@ -701,6 +1010,61 @@ class WearableConfigurationBleService {
     _sequenceTimer?.cancel();
     _sequenceTimer = null;
     _setSequenceState(WearableBleSequenceState.calibrationDone);
+    if (_magCalibrationEnabled) {
+      unawaited(_sendMagCalibrationStart());
+      return;
+    }
+    unawaited(_sendStart());
+  }
+
+  /// Magnetometer calibration: the person rotates
+  /// the IMU for [WearableMagCalibrationResult.duration]. Whatever the result
+  /// (or no reply) the acquisition then starts: after a
+  /// failure the IMU keeps its previous offset and a warning stays visible.
+  Future<void> _sendMagCalibrationStart() async {
+    if (_isDisposed) {
+      return;
+    }
+
+    _magCalibrationStartedAt = null;
+    _setSequenceState(WearableBleSequenceState.magCalibrationStartSent);
+
+    try {
+      await _writeCommand(WearableMagCalibrationResult.command);
+      _magCalibrationStartedAt = DateTime.now();
+      _log(
+        '${WearableMagCalibrationResult.command} command sent: rotate the IMU '
+        'slowly in all directions for '
+        '${WearableMagCalibrationResult.duration.inSeconds} s.',
+      );
+      _setSequenceState(WearableBleSequenceState.waitingMagCalibrationDone);
+      _sequenceTimer?.cancel();
+      _sequenceTimer = Timer(_magCalibrationDoneTimeout, () {
+        _sequenceTimer = null;
+        if (_isDisposed ||
+            _sequenceState !=
+                WearableBleSequenceState.waitingMagCalibrationDone) {
+          return;
+        }
+        _magCalibrationWarning =
+            'Magnetometer calibration: no reply from the IMU. The magnetometer offset was not updated.';
+        _log(_magCalibrationWarning!);
+        _setSequenceState(WearableBleSequenceState.magCalibrationDone);
+        unawaited(_sendStart());
+      });
+    } catch (error) {
+      _setSequenceState(WearableBleSequenceState.error);
+      _log('${WearableMagCalibrationResult.command} write error: $error');
+    }
+  }
+
+  void _handleMagCalibrationResult(WearableMagCalibrationResult result) {
+    _sequenceTimer?.cancel();
+    _sequenceTimer = null;
+    _lastMagCalibration = result;
+    _magCalibrationWarning = result.success ? null : result.summary;
+    _log(result.summary);
+    _setSequenceState(WearableBleSequenceState.magCalibrationDone);
     unawaited(_sendStart());
   }
 
@@ -714,15 +1078,62 @@ class WearableConfigurationBleService {
 
     try {
       final timestamp = await _currentLocalTimestamp();
+      if (_holdSafetyNet) {
+        await _sendInitBusy();
+      }
       final command = 'START:$timestamp';
       await _writeCommand(command);
       _log('START command sent: $command');
       _setSequenceState(WearableBleSequenceState.startSent);
       _setSequenceState(WearableBleSequenceState.streaming);
       _log('Streaming mode active.');
+      // Restart after a reboot while the initialization was already finished.
+      await _sendInitDoneIfPending();
     } catch (error) {
       _setSequenceState(WearableBleSequenceState.error);
       _log('START write error: $error');
+    }
+  }
+
+  static const String _initBusyCommand = 'INIT_BUSY';
+  static const String _initDoneCommand = 'INIT_DONE';
+
+  /// Before START during a multi-device initialization: the
+  /// IMU must not disconnect by itself until INIT_DONE.
+  Future<void> _sendInitBusy() async {
+    try {
+      await _writeCommand(_initBusyCommand);
+      _log('INIT_BUSY sent: the IMU keeps its link until the other devices '
+          'are configured.');
+    } catch (error) {
+      _log('INIT_BUSY write error: $error');
+    }
+  }
+
+  /// The multi-device initialization is finished: from now on
+  /// the IMU may disconnect by itself if its link loses data, and it is
+  /// reconnected right away. If the IMU is disconnected now, INIT_DONE is
+  /// sent after the reconnection.
+  Future<void> notifyInitializationDone() async {
+    if (!_holdSafetyNet && !_initDonePending) {
+      return;
+    }
+    _holdSafetyNet = false;
+    _initDonePending = true;
+    await _sendInitDoneIfPending();
+  }
+
+  Future<void> _sendInitDoneIfPending() async {
+    if (!_initDonePending || _isDisposed || !_linkConnected) {
+      return;
+    }
+    try {
+      await _writeCommand(_initDoneCommand);
+      _initDonePending = false;
+      _log('INIT_DONE sent: the IMU may now disconnect by itself if its link '
+          'loses data.');
+    } catch (error) {
+      _log('INIT_DONE write error: $error (sent again after the reconnection)');
     }
   }
 
@@ -850,17 +1261,22 @@ class WearableConfigurationBleService {
   }
 
   String _formatAgmSample(WearableAgmSample sample) {
-    return 'AGM | '
-        't=${sample.timestampMs} ms | '
+    return [
+      'IMU',
+      't=${sample.timestampMs} ms',
+      if (sample.hasAccelerometer)
         'acc=(${sample.accX.toStringAsFixed(3)}, '
-        '${sample.accY.toStringAsFixed(3)}, '
-        '${sample.accZ.toStringAsFixed(3)}) g | '
+            '${sample.accY.toStringAsFixed(3)}, '
+            '${sample.accZ.toStringAsFixed(3)}) g',
+      if (sample.hasGyroscope)
         'gyr=(${sample.gyrX.toStringAsFixed(2)}, '
-        '${sample.gyrY.toStringAsFixed(2)}, '
-        '${sample.gyrZ.toStringAsFixed(2)}) dps | '
+            '${sample.gyrY.toStringAsFixed(2)}, '
+            '${sample.gyrZ.toStringAsFixed(2)}) dps',
+      if (sample.hasMagnetometer)
         'mag=(${sample.magX.toStringAsFixed(2)}, '
-        '${sample.magY.toStringAsFixed(2)}, '
-        '${sample.magZ.toStringAsFixed(2)})';
+            '${sample.magY.toStringAsFixed(2)}, '
+            '${sample.magZ.toStringAsFixed(2)}) uT',
+    ].join(' | ');
   }
 
   String? _tryDecodeText(List<int> value) {
@@ -887,6 +1303,10 @@ class WearableConfigurationBleService {
 
   void _setSequenceState(WearableBleSequenceState state) {
     _sequenceState = state;
+    if (state == WearableBleSequenceState.streaming) {
+      // START sent: data are expected from now (data watchdog).
+      _noDataWatchdogArmedAt = DateTime.now();
+    }
     if (_shouldStopPeriodicTimestampForState(state)) {
       _stopPeriodicTimestampTimer();
     }
@@ -934,13 +1354,13 @@ class WearableAgmReceivedBatch {
     required List<WearableAgmSample> samples,
   }) : samples = List.unmodifiable(samples) {
     if (this.samples.isEmpty ||
-        this.samples.length > WearableAg2PacketParser.maxSamplesPerPacket) {
+        this.samples.length > WearableImdPacketParser.maxSamplesPerPacket) {
       throw ArgumentError.value(
         samples.length,
         'samples.length',
         'IMU batches must contain between 1 and '
-            '${WearableAg2PacketParser.maxSamplesPerPacket} samples '
-            '(5 for AGM, up to 19 for AG2).',
+            '${WearableImdPacketParser.maxSamplesPerPacket} samples '
+            '(5 for AGM, up to 19 for AG2, up to 38 for IMD).',
       );
     }
   }
@@ -956,9 +1376,13 @@ class WearableSdsReceivedStatus {
     required this.receivedAt,
     required this.batteryPercent,
     required this.flushFailureRate,
+    this.link,
   });
 
   final DateTime receivedAt;
   final int batteryPercent;
   final int flushFailureRate;
+
+  /// BLE link parameters.
+  final WearableLinkStatus? link;
 }

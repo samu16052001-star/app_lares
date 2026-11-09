@@ -21,8 +21,12 @@ import 'package:app_lares/services/pm10_parser.dart';
 import 'package:app_lares/services/respiratory_device_name_store.dart';
 import 'package:app_lares/services/unified_acquisition_csv_logger.dart';
 import 'package:app_lares/services/wearable_acquisition_csv_logger.dart';
+import 'package:app_lares/stopwatch/stopwatch_bar.dart';
+import 'package:app_lares/stopwatch/stopwatch_controller.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:app_lares/wearable_configuration_service.dart';
+import 'package:app_lares/wearable_mag_calibration.dart';
+import 'package:app_lares/wearable_reception_monitor.dart';
 import 'package:app_lares/widgets/polar_h10_live_section.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -35,6 +39,9 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   FlutterBluePlus.setOperationQueueMode(OperationQueueMode.perDevice);
   final recoverySnapshot = await AcquisitionRecoveryStore.load();
+  // Stopwatch of the bottom bar: state saved like on
+  // time.sesnext.uk, so it survives the app being closed.
+  await StopwatchController.instance.load();
   runApp(LaresApp(recoverySnapshot: recoverySnapshot));
 }
 
@@ -51,6 +58,9 @@ class LaresApp extends StatefulWidget {
 }
 
 class _LaresAppState extends State<LaresApp> with WidgetsBindingObserver {
+  /// Bottom bar with the stopwatch button on every page.
+  final StopwatchNavigation _stopwatchNavigation = StopwatchNavigation();
+
   @override
   void initState() {
     super.initState();
@@ -92,6 +102,12 @@ class _LaresAppState extends State<LaresApp> with WidgetsBindingObserver {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         useMaterial3: true,
+      ),
+      navigatorKey: _stopwatchNavigation.navigatorKey,
+      navigatorObservers: [_stopwatchNavigation.observer],
+      builder: (context, child) => StopwatchShell(
+        navigation: _stopwatchNavigation,
+        child: child ?? const SizedBox.shrink(),
       ),
       home: widget.recoverySnapshot == null
           ? const AccessCodePage()
@@ -572,6 +588,9 @@ class WearableDeviceConfiguration {
     required this.accG,
     required this.gyrDPS,
     required this.calibrationEnabled,
+    this.accEnabled = true,
+    this.gyrEnabled = true,
+    this.magCalibrationEnabled = false,
   });
 
   final int odr;
@@ -579,6 +598,25 @@ class WearableDeviceConfiguration {
   final int accG;
   final int gyrDPS;
   final bool calibrationEnabled;
+
+  /// Magnetometer calibration.
+  final bool magCalibrationEnabled;
+
+  final bool accEnabled;
+  final bool gyrEnabled;
+
+  /// accG sent in CONFIG: 0 = accelerometer off.
+  int get commandAccG => accEnabled ? accG : 0;
+
+  /// gyrDPS sent in CONFIG: 0 = gyroscope off.
+  int get commandGyrDPS => gyrEnabled ? gyrDPS : 0;
+
+  /// Sensors requested ([WearableSensorMask] bits).
+  int get sensorMask => WearableSensorMask.fromConfiguration(
+        mag: mag,
+        accG: commandAccG,
+        gyrDPS: commandGyrDPS,
+      );
 }
 
 String _summarizeEnvironmentalConfiguration(BleConfiguration configuration) {
@@ -602,10 +640,13 @@ String _summarizeWearableConfiguration(
   WearableDeviceConfiguration configuration,
 ) {
   return 'odr=${configuration.odr}; '
+      'acc=${configuration.accEnabled ? 'on' : 'off'}; '
+      'gyr=${configuration.gyrEnabled ? 'on' : 'off'}; '
       'mag=${configuration.mag}; '
       'accG=${configuration.accG}; '
       'gyrDPS=${configuration.gyrDPS}; '
-      'calibrationEnabled=${configuration.calibrationEnabled}';
+      'calibrationEnabled=${configuration.calibrationEnabled}; '
+      'magCalibrationEnabled=${configuration.magCalibrationEnabled}';
 }
 
 String _summarizePolarH10Configuration(
@@ -742,7 +783,7 @@ class _BleDisconnectionAlertDialog extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'The app will automatically attempt to reconnect every 10 seconds. You can also move closer to the phone and tap Reconnect to retry immediately.',
+              'The app keeps trying to reconnect automatically. An IMU that was switched off and on is configured and started again by itself. You can also move closer to the phone and tap Reconnect to retry immediately.',
             ),
             const SizedBox(height: 16),
             ConstrainedBox(
@@ -1008,7 +1049,9 @@ class _BleAutoReconnectCoordinator {
     this.onStateChanged,
   });
 
-  static const Duration retryDelay = Duration(seconds: 10);
+  // Short pause between attempts (was 10 s): an IMU switched off and on
+  // during the acquisition is reconnected as soon as it advertises again.
+  static const Duration retryDelay = Duration(seconds: 2);
 
   final Future<void> Function() runAutomaticCycle;
   final bool Function() hasPendingWork;
@@ -1383,6 +1426,21 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
   List<_ConnectedDeviceSession> get sessions => List.unmodifiable(_sessions);
 
+  /// What the person must do with the device being configured (IMU
+  /// calibrations), shown on the initialization page; null otherwise.
+  String? get initializationInstruction {
+    for (final session in _sessions) {
+      if (!session.isInitializing) {
+        continue;
+      }
+      final instruction = session.wearableService?.calibrationInstruction;
+      if (instruction != null) {
+        return '${session.displayName}: $instruction';
+      }
+    }
+    return null;
+  }
+
   List<_ConnectedDeviceSession> get disconnectedSessionsDuringAcquisition {
     return _sessions
         .where(
@@ -1608,7 +1666,21 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
       _acquisitionStarted = true;
       _startedAt = DateTime.now();
+      // INIT_DONE to every IMU: from now on an IMU whose link
+      // loses data may disconnect by itself, and it is reconnected right
+      // away. A disconnected IMU gets it after its reconnection.
+      for (final session in _sessions) {
+        final service = session.wearableService;
+        if (service != null) {
+          unawaited(service.notifyInitializationDone());
+        }
+      }
       await _activateAndroidBackgroundSupport();
+      // IMUs that disconnected while the other devices were being configured
+      // (_isRecordingWearableDuringInitialization) are reconnected now.
+      if (disconnectedSessionsDuringAcquisition.isNotEmpty) {
+        _bleAutoReconnectCoordinator.start();
+      }
       notifyListeners();
     } catch (error) {
       await stopAll();
@@ -2144,7 +2216,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
             return;
           }
 
-          if (_acquisitionStarted) {
+          if (_acquisitionStarted ||
+              _isRecordingWearableDuringInitialization(session)) {
             _markSessionDisconnectedDuringAcquisition(session);
           } else if (session.type ==
                   KnownDeviceType.environmentalMonitorV2 &&
@@ -2164,6 +2237,18 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         notifyListeners();
       },
     );
+  }
+
+  /// An IMU already configured and started while the app is still
+  /// configuring the other devices. If it disconnects, it is kept and
+  /// reconnected as soon as the acquisition starts (before, it was removed
+  /// from the acquisition).
+  bool _isRecordingWearableDuringInitialization(
+    _ConnectedDeviceSession session,
+  ) {
+    return _initializationStarted &&
+        session.type == KnownDeviceType.respiratoryMonitor &&
+        session.isInitialized;
   }
 
   void _markSessionDisconnectedDuringAcquisition(
@@ -2251,9 +2336,13 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     await service.startConfigurationSequence(
       odr: configuration.odr,
       mag: configuration.mag,
-      accG: configuration.accG,
-      gyrDPS: configuration.gyrDPS,
+      accG: configuration.commandAccG,
+      gyrDPS: configuration.commandGyrDPS,
       calibrationEnabled: configuration.calibrationEnabled,
+      magCalibrationEnabled: configuration.magCalibrationEnabled,
+      // INIT_BUSY before START: the IMU does not disconnect by
+      // itself while the other devices are being configured.
+      holdSafetyNetUntilInitDone: true,
     );
 
     final state = service.sequenceState == WearableBleSequenceState.streaming
@@ -2898,7 +2987,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     );
     for (final definition in _wearableMetricDefinitions) {
       final series = session.wearableMetricSeries[definition.metric];
-      if (series == null) {
+      if (series == null ||
+          !_wearableMetricInSample(definition.metric, sample)) {
         continue;
       }
 
@@ -2938,6 +3028,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       _WearableMetric.gyroscopeX => sample.gyrX,
       _WearableMetric.gyroscopeY => sample.gyrY,
       _WearableMetric.gyroscopeZ => sample.gyrZ,
+      _WearableMetric.magnetometerX => sample.magX,
+      _WearableMetric.magnetometerY => sample.magY,
+      _WearableMetric.magnetometerZ => sample.magZ,
     };
   }
 }
@@ -2968,6 +3061,11 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
   bool _sortBySignalStrength = false;
   String? _statusMessage;
 
+  static const Duration _minGapBetweenConnections = Duration(seconds: 3);
+  DateTime? _lastConnectionAt;
+  bool _connectionInProgress = false;
+  Timer? _connectionCooldownTimer;
+
   @override
   void initState() {
     super.initState();
@@ -2978,6 +3076,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
   @override
   void dispose() {
+    _connectionCooldownTimer?.cancel();
     _sessionManager.removeListener(_handleSessionManagerChanged);
     _scanSubscription?.cancel();
     _isScanningSubscription?.cancel();
@@ -3180,6 +3279,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       _statusMessage = null;
     });
 
+    var connectionSlotTaken = false;
     try {
       if (deviceType == KnownDeviceType.polarH10) {
         if (_sessionManager.sessions.any(
@@ -3212,10 +3312,16 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         return;
       }
 
+      if (!await _waitForConnectionSlot(displayName)) {
+        return;
+      }
+      connectionSlotTaken = true;
       await device.connect(
         license: License.nonprofit,
         timeout: const Duration(seconds: 12),
       );
+      _lastConnectionAt = DateTime.now();
+      _startConnectionCooldownTimer();
 
       if (!mounted) {
         return;
@@ -3254,11 +3360,98 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         _statusMessage = 'Could not connect to $displayName: $error';
       });
     } finally {
+      if (connectionSlotTaken) {
+        _connectionInProgress = false;
+      }
       if (mounted) {
         setState(() {
           _connectingDeviceIds.remove(id);
         });
       }
+    }
+  }
+
+  Duration get _connectionCooldownRemaining {
+    final lastConnectionAt = _lastConnectionAt;
+    if (lastConnectionAt == null) {
+      return Duration.zero;
+    }
+
+    final remaining = _minGapBetweenConnections -
+        DateTime.now().difference(lastConnectionAt);
+    return remaining > Duration.zero ? remaining : Duration.zero;
+  }
+
+  /// True while a device is connecting (or disconnecting) or the last
+  /// connection is less than [_minGapBetweenConnections] old: the Connect
+  /// buttons are disabled.
+  bool get _isConnectBlocked {
+    return _connectingDeviceIds.isNotEmpty ||
+        _connectionInProgress ||
+        _connectionCooldownRemaining > Duration.zero;
+  }
+
+  String? get _connectionWaitMessage {
+    if (_connectingDeviceIds.isNotEmpty || _connectionInProgress) {
+      return 'Please wait until the connection is complete.';
+    }
+
+    final remaining = _connectionCooldownRemaining;
+    if (remaining <= Duration.zero) {
+      return null;
+    }
+
+    final seconds = (remaining.inMilliseconds / 1000).ceil();
+    return 'Please wait $seconds s before connecting another device.';
+  }
+
+  /// Refreshes the countdown every 0.5 s until the Connect buttons are
+  /// enabled again.
+  void _startConnectionCooldownTimer() {
+    _connectionCooldownTimer?.cancel();
+    _connectionCooldownTimer = Timer.periodic(
+      const Duration(milliseconds: 500),
+      (timer) {
+        if (!mounted) {
+          timer.cancel();
+          return;
+        }
+        if (_connectionCooldownRemaining <= Duration.zero) {
+          timer.cancel();
+        }
+        setState(() {});
+      },
+    );
+  }
+
+  /// Waits until no other device is connecting and at least
+  /// [_minGapBetweenConnections] has passed since the last connection, then
+  /// takes the connection slot. False if the page was closed meanwhile.
+  Future<bool> _waitForConnectionSlot(String displayName) async {
+    var announced = false;
+    while (true) {
+      if (!mounted) {
+        return false;
+      }
+
+      final lastConnectionAt = _lastConnectionAt;
+      final remaining = lastConnectionAt == null
+          ? Duration.zero
+          : _minGapBetweenConnections -
+              DateTime.now().difference(lastConnectionAt);
+      if (!_connectionInProgress && remaining <= Duration.zero) {
+        _connectionInProgress = true;
+        return true;
+      }
+
+      if (!announced) {
+        announced = true;
+        setState(() {
+          _statusMessage =
+              'Waiting a few seconds before connecting $displayName...';
+        });
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 200));
     }
   }
 
@@ -3549,6 +3742,16 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
                 style: TextStyle(color: _statusMessageColor(context)),
               ),
             ],
+            if (_connectionWaitMessage != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _connectionWaitMessage!,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
             const SizedBox(height: 16),
             Expanded(
               child: devices.isEmpty && connectedSessions.isEmpty
@@ -3626,6 +3829,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
                             isBusy: _isSavingNames || _connectingDeviceIds.contains(
                               _deviceId(result.device),
                             ),
+                            isBlocked: _isConnectBlocked,
                             onPressed: () => unawaited(_toggleConnection(result)),
                           ),
                           const Divider(height: 1),
@@ -3664,6 +3868,7 @@ class _BluetoothScanResultTile extends StatelessWidget {
     required this.deviceType,
     required this.isConnected,
     required this.isBusy,
+    required this.isBlocked,
     required this.onPressed,
   });
 
@@ -3673,6 +3878,9 @@ class _BluetoothScanResultTile extends StatelessWidget {
   final KnownDeviceType deviceType;
   final bool isConnected;
   final bool isBusy;
+  // Another device is connecting or has just connected: Connect is disabled
+  // (see _BluetoothScanningPageState._isConnectBlocked).
+  final bool isBlocked;
   final VoidCallback onPressed;
 
   @override
@@ -3689,7 +3897,9 @@ class _BluetoothScanResultTile extends StatelessWidget {
       ),
       isThreeLine: true,
       trailing: FilledButton(
-        onPressed: isUnsupported || isBusy ? null : onPressed,
+        onPressed: isUnsupported || isBusy || (isBlocked && !isConnected)
+            ? null
+            : onPressed,
         child: Text(
           isBusy
               ? 'Wait'
@@ -3891,13 +4101,34 @@ class _MultiDeviceAcquisitionInitializationPageState
     extends State<_MultiDeviceAcquisitionInitializationPage> {
   bool _isInitializing = true;
   String? _errorMessage;
+  // Calibration instructions with a countdown.
+  Timer? _instructionRefreshTimer;
 
   @override
   void initState() {
     super.initState();
+    widget.manager.addListener(_handleManagerChanged);
+    _instructionRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted && _isInitializing) {
+        setState(() {});
+      }
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _startInitialization();
     });
+  }
+
+  @override
+  void dispose() {
+    widget.manager.removeListener(_handleManagerChanged);
+    _instructionRefreshTimer?.cancel();
+    super.dispose();
+  }
+
+  void _handleManagerChanged() {
+    if (mounted && _isInitializing) {
+      setState(() {});
+    }
   }
 
   Future<void> _startInitialization() async {
@@ -3931,6 +4162,29 @@ class _MultiDeviceAcquisitionInitializationPageState
     }
   }
 
+  Widget _buildInitializationProgress(BuildContext context) {
+    final instruction = widget.manager.initializationInstruction;
+    if (instruction == null) {
+      return const CircularProgressIndicator();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const CircularProgressIndicator(),
+          const SizedBox(height: 24),
+          Text(
+            instruction,
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return PopScope(
@@ -3941,7 +4195,7 @@ class _MultiDeviceAcquisitionInitializationPageState
         ),
         body: Center(
           child: _isInitializing
-              ? const CircularProgressIndicator()
+              ? _buildInitializationProgress(context)
               : Padding(
                   padding: const EdgeInsets.all(24),
                   child: Column(
@@ -3988,11 +4242,21 @@ class _MultiDeviceAcquisitionPageState
   Timer? _bleAlertBeepTimer;
   BuildContext? _bleAlertDialogContext;
   bool _bleAlertDialogOpen = false;
+  // Keeps the IMU "samples received" indicators current even when no data
+  // arrive.
+  Timer? _receptionRefreshTimer;
+  final _ImuNoDataAlert _noDataAlert = _ImuNoDataAlert();
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _receptionRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) {
+        setState(() {});
+        _checkImuNoData();
+      }
+    });
     widget.manager.addListener(_handleManagerChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _syncBleDisconnectionAlertDialog();
@@ -4008,8 +4272,34 @@ class _MultiDeviceAcquisitionPageState
     WidgetsBinding.instance.removeObserver(this);
     widget.manager.removeListener(_handleManagerChanged);
     widget.manager.cancelAutomaticBleReconnect();
+    _receptionRefreshTimer?.cancel();
+    _noDataAlert.clear();
     _stopBleAlertAlarm();
     super.dispose();
+  }
+
+  /// Data watchdog: IMUs still connected but silent.
+  void _checkImuNoData() {
+    if (widget.manager.isStopping) {
+      _noDataAlert.clear();
+      return;
+    }
+
+    final now = DateTime.now();
+    final disconnected =
+        widget.manager.disconnectedSessionsDuringAcquisition.toSet();
+    _noDataAlert.update(
+      silentDevices: [
+        for (final session in widget.manager.sessions)
+          if (session.type == KnownDeviceType.respiratoryMonitor &&
+              !disconnected.contains(session) &&
+              session.wearableService?.noDataFor(now) != null)
+            session.displayName,
+      ],
+      now: now,
+      canRepeatVibration: _ActiveAcquisitionRuntime.isForegroundVisible &&
+          _bleAlertBeepTimer == null,
+    );
   }
 
   @override
@@ -4150,8 +4440,8 @@ class _MultiDeviceAcquisitionPageState
       return;
     }
 
-    unawaited(AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue());
-    unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
+    // Vibration only, no sound.
+    unawaited(AndroidAcquisitionForegroundService.vibrateBleDisconnectionAlert());
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
 
@@ -4540,14 +4830,21 @@ class _MultiDeviceAcquisitionPageState
     BuildContext context,
     _ConnectedDeviceSession session,
   ) {
+    final sensorMask = session.wearableService?.configuredSensorMask ??
+        session.wearableConfiguration?.sensorMask;
     return Column(
       children: [
         _WearableStatusBoxes(
           batteryPercent: session.latestBatteryPercent,
           flushFailureRate: session.latestFlushFailureRate,
+          receptionMonitor: session.wearableService?.receptionMonitor,
+          calibrationInstruction:
+              session.wearableService?.calibrationInstruction,
+          magCalibrationWarning: session.wearableService?.magCalibrationWarning,
+          noDataThreshold: session.wearableService?.noDataAlertThreshold,
         ),
         const SizedBox(height: 12),
-        for (final definition in _wearableMetricDefinitions) ...[
+        for (final definition in _wearableMetricDefinitionsFor(sensorMask)) ...[
           _WearableMetricChartCard(
             definition: definition,
             series: session.wearableMetricSeries[definition.metric]!,
@@ -4705,14 +5002,91 @@ class _MultiDeviceAcquisitionPageState
   }
 }
 
+class _ImuNoDataAlert {
+  static const Duration _repeatEvery = Duration(seconds: 5);
+
+  final Set<String> _silentDevices = {};
+  DateTime? _lastCueAt;
+
+  /// [silentDevices]: names of the IMUs without data beyond their threshold.
+  void update({
+    required Iterable<String> silentDevices,
+    required DateTime now,
+    required bool canRepeatVibration,
+  }) {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    final names = silentDevices.toSet();
+    if (names.isEmpty) {
+      clear();
+      return;
+    }
+
+    final added = names.difference(_silentDevices);
+    final changed = added.isNotEmpty || names.length != _silentDevices.length;
+    _silentDevices
+      ..clear()
+      ..addAll(names);
+    if (changed) {
+      final sorted = names.toList()..sort();
+      unawaited(
+        AndroidAcquisitionForegroundService.showImuNoDataAlert(
+          text: '${sorted.join(', ')}: no data. Check that the IMU is on '
+              'and close to the phone.',
+          alert: added.isNotEmpty,
+        ),
+      );
+    }
+    if (added.isNotEmpty) {
+      // The notification itself vibrates.
+      _lastCueAt = now;
+      return;
+    }
+
+    final lastCueAt = _lastCueAt;
+    if (canRepeatVibration &&
+        (lastCueAt == null || now.difference(lastCueAt) >= _repeatEvery)) {
+      _lastCueAt = now;
+      unawaited(
+        AndroidAcquisitionForegroundService.vibrateBleDisconnectionAlert(),
+      );
+    }
+  }
+
+  void clear() {
+    if (_silentDevices.isEmpty) {
+      return;
+    }
+    _silentDevices.clear();
+    _lastCueAt = null;
+    unawaited(AndroidAcquisitionForegroundService.clearImuNoDataAlert());
+  }
+}
+
 class _WearableStatusBoxes extends StatelessWidget {
   const _WearableStatusBoxes({
     required this.batteryPercent,
     required this.flushFailureRate,
+    this.receptionMonitor,
+    this.calibrationInstruction,
+    this.magCalibrationWarning,
+    this.noDataThreshold,
   });
 
   final int? batteryPercent;
   final int? flushFailureRate;
+  final WearableReceptionMonitor? receptionMonitor;
+
+  /// What to do with the IMU during a calibration.
+  final String? calibrationInstruction;
+
+  /// Failed magnetometer calibration (the IMU keeps its previous offset).
+  final String? magCalibrationWarning;
+
+  /// Silence after which the indicator shows "No IMU data" (data watchdog).
+  final Duration? noDataThreshold;
 
   @override
   Widget build(BuildContext context) {
@@ -4723,23 +5097,55 @@ class _WearableStatusBoxes extends StatelessWidget {
         ? 'Flush failure rate: N/A'
         : 'Flush failure rate: $flushFailureRate';
 
-    return Row(
+    final reception = _describeReception(
+      receptionMonitor,
+      DateTime.now(),
+      noDataThreshold: noDataThreshold,
+    );
+
+    return Column(
       children: [
-        Expanded(
-          child: _WearableStatusBox(
-            icon: Icons.battery_std,
-            text: batteryText,
+        Row(
+          children: [
+            Expanded(
+              child: _WearableStatusBox(
+                icon: Icons.battery_std,
+                text: batteryText,
+                iconColor: colorScheme.primary,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _WearableStatusBox(
+                icon: Icons.warning_amber_rounded,
+                text: flushFailureRateText,
+                iconColor: colorScheme.tertiary,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        _WearableStatusBox(
+          icon: reception.icon,
+          text: reception.text,
+          iconColor: reception.color(colorScheme),
+        ),
+        if (calibrationInstruction != null) ...[
+          const SizedBox(height: 12),
+          _WearableStatusBox(
+            icon: Icons.screen_rotation_alt,
+            text: calibrationInstruction!,
             iconColor: colorScheme.primary,
           ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: _WearableStatusBox(
-            icon: Icons.warning_amber_rounded,
-            text: flushFailureRateText,
-            iconColor: colorScheme.tertiary,
+        ],
+        if (magCalibrationWarning != null) ...[
+          const SizedBox(height: 12),
+          _WearableStatusBox(
+            icon: Icons.explore_off,
+            text: magCalibrationWarning!,
+            iconColor: colorScheme.error,
           ),
-        ),
+        ],
       ],
     );
   }
@@ -4905,12 +5311,16 @@ class _WearableDeviceConfigurationPageState
   static const List<int> _odrValues = [12, 26, 52, 104, 208, 416];
   static const List<int> _accGValues = [2, 4, 8, 16];
   static const List<int> _gyrDPSValues = [125, 250, 500, 1000, 2000];
+  static const int _maxMagnetometerOdr = 104;
 
   int odr = 104;
   int mag = 0;
   int accG = 8;
   int gyrDPS = 500;
+  bool accEnabled = true;
+  bool gyrEnabled = true;
   bool calibrationEnabled = false;
+  bool magCalibrationEnabled = false;
   bool _isSendingConfig = false;
   bool _configurationSequenceStarted = false;
   bool _wearableAcquisitionStopped = false;
@@ -4933,7 +5343,11 @@ class _WearableDeviceConfigurationPageState
       mag = initialConfiguration.mag;
       accG = initialConfiguration.accG;
       gyrDPS = initialConfiguration.gyrDPS;
+      accEnabled = initialConfiguration.accEnabled;
+      gyrEnabled = initialConfiguration.gyrEnabled;
       calibrationEnabled = initialConfiguration.calibrationEnabled;
+      magCalibrationEnabled = initialConfiguration.magCalibrationEnabled &&
+          initialConfiguration.mag == 1;
     }
 
     if (_isConfigurationOnly) {
@@ -4993,7 +5407,57 @@ class _WearableDeviceConfigurationPageState
   void _setMagnetometer(bool enabled) {
     setState(() {
       mag = enabled ? 1 : 0;
+      if (!enabled) {
+        magCalibrationEnabled = false;
+      }
     });
+  }
+
+  void _setMagCalibration(bool enabled) {
+    setState(() {
+      magCalibrationEnabled = enabled;
+    });
+  }
+
+  void _setAccelerometer(bool enabled) {
+    setState(() {
+      accEnabled = enabled;
+    });
+  }
+
+  void _setGyroscope(bool enabled) {
+    setState(() {
+      gyrEnabled = enabled;
+    });
+  }
+
+  void _setOdr(int value) {
+    setState(() {
+      odr = value;
+      // The magnetometer goes through the LSM6DSO sensor hub: max 104 Hz.
+      if (!_magnetometerAllowed) {
+        mag = 0;
+        magCalibrationEnabled = false;
+      }
+    });
+  }
+
+  bool get _magnetometerAllowed => odr <= _maxMagnetometerOdr;
+
+  /// At least one sensor must be on.
+  bool get _hasEnabledSensor => accEnabled || gyrEnabled || mag == 1;
+
+  WearableDeviceConfiguration get _currentConfiguration {
+    return WearableDeviceConfiguration(
+      odr: odr,
+      mag: mag,
+      accG: accG,
+      gyrDPS: gyrDPS,
+      calibrationEnabled: calibrationEnabled,
+      accEnabled: accEnabled,
+      gyrEnabled: gyrEnabled,
+      magCalibrationEnabled: magCalibrationEnabled && mag == 1,
+    );
   }
 
   void _setCalibration(bool enabled) {
@@ -5008,6 +5472,7 @@ class _WearableDeviceConfigurationPageState
     if (service == null ||
         csvLogger == null ||
         !service.isReadyToContinue ||
+        !_hasEnabledSensor ||
         _isSendingConfig ||
         _configurationSequenceStarted) {
       return;
@@ -5020,12 +5485,14 @@ class _WearableDeviceConfigurationPageState
 
     try {
       await _startWearableCsvLogging();
+      final configuration = _currentConfiguration;
       await service.startConfigurationSequence(
-        odr: odr,
-        mag: mag,
-        accG: accG,
-        gyrDPS: gyrDPS,
-        calibrationEnabled: calibrationEnabled,
+        odr: configuration.odr,
+        mag: configuration.mag,
+        accG: configuration.commandAccG,
+        gyrDPS: configuration.commandGyrDPS,
+        calibrationEnabled: configuration.calibrationEnabled,
+        magCalibrationEnabled: configuration.magCalibrationEnabled,
       );
       await _activateAndroidBackgroundSupport();
       if (!mounted) {
@@ -5095,15 +5562,7 @@ class _WearableDeviceConfigurationPageState
       deviceNames: [_displayName],
       deviceTypes: [KnownDeviceType.respiratoryMonitor.name],
       configurationSummaries: [
-        _summarizeWearableConfiguration(
-          WearableDeviceConfiguration(
-            odr: odr,
-            mag: mag,
-            accG: accG,
-            gyrDPS: gyrDPS,
-            calibrationEnabled: calibrationEnabled,
-          ),
-        ),
+        _summarizeWearableConfiguration(_currentConfiguration),
       ],
       startedAt: DateTime.now(),
       logicalRoute: 'acquisition',
@@ -5114,15 +5573,10 @@ class _WearableDeviceConfigurationPageState
   }
 
   void _confirmConfiguration() {
-    widget.onConfigurationConfirmed?.call(
-      WearableDeviceConfiguration(
-        odr: odr,
-        mag: mag,
-        accG: accG,
-        gyrDPS: gyrDPS,
-        calibrationEnabled: calibrationEnabled,
-      ),
-    );
+    if (!_hasEnabledSensor) {
+      return;
+    }
+    widget.onConfigurationConfirmed?.call(_currentConfiguration);
     Navigator.of(context).pop();
   }
 
@@ -5177,11 +5631,12 @@ class _WearableDeviceConfigurationPageState
   @override
   Widget build(BuildContext context) {
     final service = _service;
-    final canContinue = _isConfigurationOnly ||
-        (service != null &&
-            service.isReadyToContinue &&
-            !_isSendingConfig &&
-            !_configurationSequenceStarted);
+    final canContinue = _hasEnabledSensor &&
+        (_isConfigurationOnly ||
+            (service != null &&
+                service.isReadyToContinue &&
+                !_isSendingConfig &&
+                !_configurationSequenceStarted));
     final buttonText = _isConfigurationOnly
         ? 'Confirm Configuration'
         : _isSendingConfig
@@ -5202,31 +5657,73 @@ class _WearableDeviceConfigurationPageState
                   label: 'Output Data Rate (Hz)',
                   value: odr,
                   values: _odrValues,
-                  onChanged: (value) {
-                    setState(() {
-                      odr = value;
-                    });
-                  },
+                  onChanged: _setOdr,
                 ),
                 const SizedBox(height: 12),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
-                  title: const Text('Magnetometer'),
-                  value: mag == 1,
-                  onChanged: _setMagnetometer,
+                  title: const Text('Accelerometer'),
+                  value: accEnabled,
+                  onChanged: _setAccelerometer,
                 ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Gyroscope'),
+                  value: gyrEnabled,
+                  onChanged: _setGyroscope,
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Magnetometer'),
+                  subtitle: _magnetometerAllowed
+                      ? null
+                      : const Text(
+                          'Available only up to $_maxMagnetometerOdr Hz',
+                        ),
+                  value: mag == 1,
+                  onChanged: _magnetometerAllowed ? _setMagnetometer : null,
+                ),
+                if (!_hasEnabledSensor)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      'Turn on at least one sensor.',
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  ),
                 const SizedBox(height: 12),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('Calibration'),
+                  subtitle: const Text(
+                    'Accelerometer and gyroscope: keep the IMU still, flat '
+                    'and face up.',
+                  ),
                   value: calibrationEnabled,
                   onChanged: _setCalibration,
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Magnetometer calibration'),
+                  subtitle: Text(
+                    mag == 1
+                        ? 'Rotate the IMU slowly in all directions for '
+                            '${WearableMagCalibrationResult.duration.inSeconds} '
+                            's. The result stays saved in the IMU: needed '
+                            'only once in a while.'
+                        : 'Turn on the magnetometer first.',
+                  ),
+                  value: magCalibrationEnabled && mag == 1,
+                  onChanged: mag == 1 ? _setMagCalibration : null,
                 ),
                 const SizedBox(height: 12),
                 _buildDropdownSetting(
                   label: 'Accelerometer Full Scale Range (g)',
                   value: accG,
                   values: _accGValues,
+                  enabled: accEnabled,
                   onChanged: (value) {
                     setState(() {
                       accG = value;
@@ -5238,6 +5735,7 @@ class _WearableDeviceConfigurationPageState
                   label: 'Gyroscope Full Scale Range (dps)',
                   value: gyrDPS,
                   values: _gyrDPSValues,
+                  enabled: gyrEnabled,
                   onChanged: (value) {
                     setState(() {
                       gyrDPS = value;
@@ -5272,6 +5770,7 @@ class _WearableDeviceConfigurationPageState
     required int value,
     required List<int> values,
     required ValueChanged<int> onChanged,
+    bool enabled = true,
   }) {
     return DropdownButtonFormField<int>(
       initialValue: value,
@@ -5286,13 +5785,16 @@ class _WearableDeviceConfigurationPageState
             child: Text(option.toString()),
           ),
       ],
-      onChanged: (selectedValue) {
-        if (selectedValue == null) {
-          return;
-        }
+      // null disables the field (sensor turned off).
+      onChanged: enabled
+          ? (selectedValue) {
+              if (selectedValue == null) {
+                return;
+              }
 
-        onChanged(selectedValue);
-      },
+              onChanged(selectedValue);
+            }
+          : null,
     );
   }
 }
@@ -5356,11 +5858,20 @@ class _WearableBleCommunicationLogPageState
   String? _bleReconnectFailureMessage;
   late final _BleAutoReconnectCoordinator _bleAutoReconnectCoordinator;
   bool _isStoppingAcquisition = false;
+  // Keeps the "samples received" indicator current even when no data arrive.
+  Timer? _receptionRefreshTimer;
+  final _ImuNoDataAlert _noDataAlert = _ImuNoDataAlert();
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _receptionRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) {
+        setState(() {});
+        _checkImuNoData();
+      }
+    });
     _bleAutoReconnectCoordinator = _BleAutoReconnectCoordinator(
       runAutomaticCycle: _runWearableAutomaticBleReconnectCycle,
       hasPendingWork: _hasWearableAutomaticBleReconnectWork,
@@ -5383,10 +5894,26 @@ class _WearableBleCommunicationLogPageState
     unawaited(_sdsStatusSubscription?.cancel());
     unawaited(_connectionSubscription?.cancel());
     _uiRefreshTimer?.cancel();
+    _receptionRefreshTimer?.cancel();
+    _noDataAlert.clear();
     _bleAutoReconnectCoordinator.cancel(notify: false);
     _stopWearableBleAlertAlarm();
     _bleAlertRevision.dispose();
     super.dispose();
+  }
+
+  /// Data watchdog: the IMU is still connected but silent.
+  void _checkImuNoData() {
+    final now = DateTime.now();
+    final silent = !_bleDisconnectedDuringAcquisition &&
+        !_isStoppingAcquisition &&
+        widget.service.noDataFor(now) != null;
+    _noDataAlert.update(
+      silentDevices: silent ? [widget.displayName] : const <String>[],
+      now: now,
+      canRepeatVibration: _ActiveAcquisitionRuntime.isForegroundVisible &&
+          _bleAlertBeepTimer == null,
+    );
   }
 
   @override
@@ -5422,7 +5949,8 @@ class _WearableBleCommunicationLogPageState
     final cutoff = event.receivedAt.subtract(_visibleChartWindow);
     for (final definition in _wearableMetricDefinitions) {
       final series = _metricSeries[definition.metric];
-      if (series == null) {
+      if (series == null ||
+          !_wearableMetricInSample(definition.metric, sample)) {
         continue;
       }
 
@@ -5689,8 +6217,8 @@ class _WearableBleCommunicationLogPageState
       return;
     }
 
-    unawaited(AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue());
-    unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
+    // Vibration only, no sound.
+    unawaited(AndroidAcquisitionForegroundService.vibrateBleDisconnectionAlert());
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
 
@@ -5718,6 +6246,9 @@ class _WearableBleCommunicationLogPageState
       _WearableMetric.gyroscopeX => sample.gyrX,
       _WearableMetric.gyroscopeY => sample.gyrY,
       _WearableMetric.gyroscopeZ => sample.gyrZ,
+      _WearableMetric.magnetometerX => sample.magX,
+      _WearableMetric.magnetometerY => sample.magY,
+      _WearableMetric.magnetometerZ => sample.magZ,
     };
   }
 
@@ -5886,16 +6417,18 @@ class _WearableBleCommunicationLogPageState
   }
 
   Widget _buildWearableDashboard() {
+    final definitions =
+        _wearableMetricDefinitionsFor(widget.service.configuredSensorMask);
     return ListView.separated(
       padding: const EdgeInsets.all(16),
-      itemCount: _wearableMetricDefinitions.length + 1,
+      itemCount: definitions.length + 1,
       separatorBuilder: (_, _) => const SizedBox(height: 12),
       itemBuilder: (context, index) {
         if (index == 0) {
           return _buildStatusBoxes(context);
         }
 
-        final definition = _wearableMetricDefinitions[index - 1];
+        final definition = definitions[index - 1];
         return _WearableMetricChartCard(
           definition: definition,
           series: _metricSeries[definition.metric]!,
@@ -5908,72 +6441,13 @@ class _WearableBleCommunicationLogPageState
   }
 
   Widget _buildStatusBoxes(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    final batteryText = _latestBatteryPercent == null
-        ? 'Battery: N/A'
-        : 'Battery: $_latestBatteryPercent%';
-    final flushFailureRateText = _latestFlushFailureRate == null
-        ? 'Flush failure rate: N/A'
-        : 'Flush failure rate: $_latestFlushFailureRate';
-
-    return Row(
-      children: [
-        Expanded(
-          child: _buildStatusBox(
-            context: context,
-            icon: Icons.battery_std,
-            text: batteryText,
-            iconColor: colorScheme.primary,
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: _buildStatusBox(
-            context: context,
-            icon: Icons.warning_amber_rounded,
-            text: flushFailureRateText,
-            iconColor: colorScheme.tertiary,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildStatusBox({
-    required BuildContext context,
-    required IconData icon,
-    required String text,
-    required Color iconColor,
-  }) {
-    final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
-
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.65),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: colorScheme.outlineVariant),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        child: Row(
-          children: [
-            Icon(
-              icon,
-              color: iconColor,
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                text,
-                style: theme.textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
+    return _WearableStatusBoxes(
+      batteryPercent: _latestBatteryPercent,
+      flushFailureRate: _latestFlushFailureRate,
+      receptionMonitor: widget.service.receptionMonitor,
+      calibrationInstruction: widget.service.calibrationInstruction,
+      magCalibrationWarning: widget.service.magCalibrationWarning,
+      noDataThreshold: widget.service.noDataAlertThreshold,
     );
   }
 
@@ -6058,6 +6532,119 @@ enum _WearableMetric {
   gyroscopeX,
   gyroscopeY,
   gyroscopeZ,
+  magnetometerX,
+  magnetometerY,
+  magnetometerZ,
+}
+
+/// Sensor ([WearableSensorMask] bit) a chart needs.
+int _wearableMetricSensor(_WearableMetric metric) {
+  return switch (metric) {
+    _WearableMetric.accelerometerX ||
+    _WearableMetric.accelerometerY ||
+    _WearableMetric.accelerometerZ ||
+    _WearableMetric.accelerometerMagnitude =>
+      WearableSensorMask.accelerometer,
+    _WearableMetric.gyroscopeX ||
+    _WearableMetric.gyroscopeY ||
+    _WearableMetric.gyroscopeZ =>
+      WearableSensorMask.gyroscope,
+    _WearableMetric.magnetometerX ||
+    _WearableMetric.magnetometerY ||
+    _WearableMetric.magnetometerZ =>
+      WearableSensorMask.magnetometer,
+  };
+}
+
+/// True if the sample carries the sensor of this chart (absent sensors are
+/// sent as 0 and must not be plotted).
+bool _wearableMetricInSample(_WearableMetric metric, WearableAgmSample sample) {
+  return (sample.sensorMask & _wearableMetricSensor(metric)) != 0;
+}
+
+/// Charts to show for the sensors requested in the configuration (null =
+/// unknown: accelerometer and gyroscope, as before).
+List<_WearableMetricDefinition> _wearableMetricDefinitionsFor(int? sensorMask) {
+  final mask = sensorMask ?? WearableSensorMask.accelerometerGyroscope;
+  return [
+    for (final definition in _wearableMetricDefinitions)
+      if ((mask & _wearableMetricSensor(definition.metric)) != 0) definition,
+  ];
+}
+
+enum _ReceptionLevel { good, warning, bad, unknown }
+
+/// Text, icon and color of the "samples received" indicator.
+class _ReceptionDescription {
+  const _ReceptionDescription(this.text, this.level);
+
+  final String text;
+  final _ReceptionLevel level;
+
+  IconData get icon {
+    return switch (level) {
+      _ReceptionLevel.good => Icons.check_circle,
+      _ReceptionLevel.warning => Icons.error_outline,
+      _ReceptionLevel.bad => Icons.cancel,
+      _ReceptionLevel.unknown => Icons.help_outline,
+    };
+  }
+
+  Color color(ColorScheme colorScheme) {
+    return switch (level) {
+      _ReceptionLevel.good => Colors.green.shade600,
+      _ReceptionLevel.warning => Colors.orange.shade700,
+      _ReceptionLevel.bad => colorScheme.error,
+      _ReceptionLevel.unknown => colorScheme.outline,
+    };
+  }
+}
+
+/// Green >= 99%, orange >= 95%, red below or when nothing arrived for
+/// [noDataThreshold] (2 s at 104 Hz, data watchdog; 3 s if not given).
+_ReceptionDescription _describeReception(
+  WearableReceptionMonitor? monitor,
+  DateTime now, {
+  Duration? noDataThreshold,
+}) {
+  if (monitor == null) {
+    return const _ReceptionDescription(
+      'Samples received (10 s): N/A',
+      _ReceptionLevel.unknown,
+    );
+  }
+
+  final silence = monitor.timeSinceLastPacket(now);
+  if (silence == null) {
+    return const _ReceptionDescription(
+      'Samples received (10 s): waiting for data',
+      _ReceptionLevel.unknown,
+    );
+  }
+  if (silence >= (noDataThreshold ?? const Duration(seconds: 3))) {
+    return _ReceptionDescription(
+      'No IMU data for ${silence.inSeconds} s',
+      _ReceptionLevel.bad,
+    );
+  }
+
+  final percent = monitor.receivedPercent(now);
+  if (percent == null) {
+    return const _ReceptionDescription(
+      'Samples received (10 s): N/A',
+      _ReceptionLevel.unknown,
+    );
+  }
+
+  final level = percent >= 99.0
+      ? _ReceptionLevel.good
+      : percent >= 95.0
+          ? _ReceptionLevel.warning
+          : _ReceptionLevel.bad;
+  return _ReceptionDescription(
+    'Samples received (10 s): ${percent.toStringAsFixed(1)}%',
+    level,
+  );
 }
 
 const List<_WearableMetricDefinition> _wearableMetricDefinitions = [
@@ -6105,6 +6692,27 @@ const List<_WearableMetricDefinition> _wearableMetricDefinitions = [
     label: 'Gyroscope Z',
     unit: 'dps',
     decimals: 2,
+  ),
+  _WearableMetricDefinition(
+    metric: _WearableMetric.magnetometerX,
+    label: 'Magnetometer X',
+    unit: 'uT',
+    decimals: 2,
+    showZeroLine: true,
+  ),
+  _WearableMetricDefinition(
+    metric: _WearableMetric.magnetometerY,
+    label: 'Magnetometer Y',
+    unit: 'uT',
+    decimals: 2,
+    showZeroLine: true,
+  ),
+  _WearableMetricDefinition(
+    metric: _WearableMetric.magnetometerZ,
+    label: 'Magnetometer Z',
+    unit: 'uT',
+    decimals: 2,
+    showZeroLine: true,
   ),
 ];
 
@@ -7587,8 +8195,8 @@ class _AcquisitionInitializationPageState
       return;
     }
 
-    unawaited(AndroidAcquisitionForegroundService.playBleDisconnectionAlarmCue());
-    unawaited(SystemSound.play(SystemSoundType.alert).catchError((_) {}));
+    // Vibration only, no sound.
+    unawaited(AndroidAcquisitionForegroundService.vibrateBleDisconnectionAlert());
     unawaited(HapticFeedback.vibrate().catchError((_) {}));
   }
 

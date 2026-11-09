@@ -39,5 +39,38 @@ void main() {
       expect(WearableAgmPacketParser.hasValidLength(endBytes), isFalse);
       expect(WearableAg2PacketParser.startsWithAg2Header(endBytes), isFalse);
     });
+
+    test('13-byte END has no counters', () {
+      final packet = WearableEndPacketParser.parse(endBytes);
+      expect(packet.bleNotifyFailures, isNull);
+      expect(packet.bleQueueDrops, isNull);
+      expect(packet.sdQueueDrops, isNull);
+    });
+
+    test('19-byte has the loss counters', () {
+      // ble_emit_end(): 5905 samples, recording 2, 3 failed notifications,
+      // 0 BLE queue drops, 1 SD queue drop.
+      const extendedBytes = [
+        0x45, 0x4E, 0x44, //
+        0x11, 0x17, 0x00, 0x00, //
+        0xF4, 0x97, 0x32, 0x00, //
+        0x02, 0x00, //
+        0x03, 0x00, //
+        0x00, 0x00, //
+        0x01, 0x00, //
+      ];
+
+      final packet = WearableEndPacketParser.parse(extendedBytes);
+      expect(packet.totalSamples, 5905);
+      expect(packet.sdFileNumber, 2);
+      expect(packet.bleNotifyFailures, 3);
+      expect(packet.bleQueueDrops, 0);
+      expect(packet.sdQueueDrops, 1);
+      expect(WearableAgmPacketParser.hasValidLength(extendedBytes), isFalse);
+      expect(
+        () => WearableEndPacketParser.parse(extendedBytes.sublist(0, 18)),
+        throwsFormatException,
+      );
+    });
   });
 }

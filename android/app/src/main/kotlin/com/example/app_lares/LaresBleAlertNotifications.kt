@@ -8,21 +8,22 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.AudioAttributes
-import android.media.AudioManager
-import android.media.RingtoneManager
-import android.media.ToneGenerator
 import android.os.Build
-import android.os.Handler
-import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 
+// Disconnection alert of a BLE device: notification + vibration, no sound.
 object LaresBleAlertNotifications {
-    private const val CHANNEL_ID = "lares_ble_alerts_v2"
+    private const val CHANNEL_ID = "lares_ble_alerts_v3"
+    private val LEGACY_CHANNEL_IDS = listOf("lares_ble_alerts", "lares_ble_alerts_v2")
     private const val CHANNEL_NAME = "BLE alerts"
     private const val NOTIFICATION_ID = 4206
     private const val NOTIFICATION_TITLE = "BLE device disconnected"
+    // IMU connected but silent.
+    private const val NO_DATA_NOTIFICATION_ID = 4207
+    private const val NO_DATA_TITLE = "No IMU data"
+    // Blue of the LaRes logo.
+    private const val NOTIFICATION_COLOR = 0xFF013988.toInt()
     private val VIBRATION_PATTERN = longArrayOf(0, 350, 180, 350)
 
     fun show(context: Context, deviceName: String) {
@@ -51,20 +52,35 @@ object LaresBleAlertNotifications {
         }
     }
 
-    fun playAlarmCue(context: Context) {
+    // IMU still connected but sending no data.
+    fun showNoData(context: Context, text: String, alert: Boolean) {
         try {
-            val toneGenerator = ToneGenerator(AudioManager.STREAM_ALARM, 100)
-            toneGenerator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 900)
-            Handler(Looper.getMainLooper()).postDelayed({
-                try {
-                    toneGenerator.release()
-                } catch (_: Exception) {
-                }
-            }, 1000)
-        } catch (_: Exception) {
-            // Audio is best effort.
-        }
+            if (!canPostNotifications(context)) {
+                return
+            }
 
+            createChannel(context)
+            val notification = buildAlertNotification(context, NO_DATA_TITLE, text, !alert)
+            val notificationManager =
+                context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.notify(NO_DATA_NOTIFICATION_ID, notification)
+        } catch (_: Exception) {
+            // Acquisition must continue even if the alert notification fails.
+        }
+    }
+
+    fun clearNoData(context: Context) {
+        try {
+            val notificationManager =
+                context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.cancel(NO_DATA_NOTIFICATION_ID)
+        } catch (_: Exception) {
+            // Best effort only.
+        }
+    }
+
+    // Repeated while a device stays disconnected: vibration only, no sound.
+    fun vibrateAlertCue(context: Context) {
         try {
             val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -80,7 +96,20 @@ object LaresBleAlertNotifications {
         }
     }
 
-    private fun buildNotification(context: Context, deviceName: String): Notification {
+    private fun buildNotification(context: Context, deviceName: String): Notification =
+        buildAlertNotification(
+            context,
+            NOTIFICATION_TITLE,
+            "$deviceName disconnected. Tap to return to the acquisition screen.",
+            false
+        )
+
+    private fun buildAlertNotification(
+        context: Context,
+        title: String,
+        text: String,
+        onlyAlertOnce: Boolean
+    ): Notification {
         val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
             ?: Intent(context, MainActivity::class.java)
         launchIntent.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -91,7 +120,6 @@ object LaresBleAlertNotifications {
             launchIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or immutablePendingIntentFlag()
         )
-        val text = "$deviceName disconnected. Tap to return to the acquisition screen."
 
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(context, CHANNEL_ID)
@@ -101,16 +129,18 @@ object LaresBleAlertNotifications {
 
         builder
             .setPriority(Notification.PRIORITY_HIGH)
-            .setDefaults(Notification.DEFAULT_SOUND or Notification.DEFAULT_VIBRATE)
+            .setDefaults(Notification.DEFAULT_VIBRATE)
             .setVibrate(VIBRATION_PATTERN)
 
         return builder
-            .setSmallIcon(context.applicationInfo.icon)
-            .setContentTitle(NOTIFICATION_TITLE)
+            .setSmallIcon(R.drawable.ic_stat_lares)
+            .setColor(NOTIFICATION_COLOR)
+            .setContentTitle(title)
             .setContentText(text)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
             .setCategory(Notification.CATEGORY_ALARM)
+            .setOnlyAlertOnce(onlyAlertOnce)
             .build()
     }
 
@@ -127,17 +157,15 @@ object LaresBleAlertNotifications {
             description = NOTIFICATION_TITLE
             enableVibration(true)
             vibrationPattern = VIBRATION_PATTERN
-            setSound(
-                RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ALARM)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build()
-            )
+            // No sound: heads-up notification and vibration only.
+            setSound(null, null)
         }
 
         val notificationManager =
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        for (legacyId in LEGACY_CHANNEL_IDS) {
+            notificationManager.deleteNotificationChannel(legacyId)
+        }
         notificationManager.createNotificationChannel(channel)
     }
 
