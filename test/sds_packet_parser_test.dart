@@ -36,6 +36,63 @@ void main() {
     expect(WearableAgmPacketParser.hasValidLength(bytes), isFalse);
   });
 
+  test('20-byte SDS has no SD state', () {
+    final bytes = [
+      0x53, 0x44, 0x53, 64, 0x00, 0x00, //
+      0x27, 0x00, 0x00, 0x00, 0xF4, 0x01, //
+      0x02, 0x02, 0xFB, 0x00, 0xFB, 0x00, //
+      0x00, 0x00, //
+    ];
+    expect(WearableSdsPacketParser.parse(bytes).sdHealth, isNull);
+  });
+
+  test('23-byte SDS (firmware 12/11) has the SD state', () {
+    // SD write stuck for 12 s, flush failure rate 2.50%.
+    const bytes = [
+      0x53, 0x44, 0x53, 80, 0xFA, 0x00, //
+      0x27, 0x00, 0x00, 0x00, 0xF4, 0x01, //
+      0x02, 0x02, 0xFB, 0x00, 0xFB, 0x00, //
+      0x00, 0x00, //
+      0x01, 0x0C, 0x00, //
+    ];
+
+    final status = WearableSdsPacketParser.parse(bytes);
+    expect(status.flushFailureRate, 250);
+    expect(status.link!.txDataLength, 251);
+    final sd = status.sdHealth!;
+    expect(sd.state, WearableSdState.writeStalled);
+    expect(sd.seconds, 12);
+    expect(sd.isSaving, isFalse);
+    expect(sd.description, 'SD stuck for 12 s');
+    expect(sd.state.label, 'SD stuck');
+    // Not taken for an AGM data packet (checked before SDS).
+    expect(WearableAgmPacketParser.hasValidLength(bytes), isFalse);
+  });
+
+  test('SD states and longer packets', () {
+    List<int> packet(int state, {int extra = 0}) => [
+          0x53, 0x44, 0x53, 50, 0, 0, //
+          0x27, 0, 0, 0, 0xF4, 0x01, 2, 2, 0xFB, 0, 0xFB, 0, 0, 0, //
+          state, 0x17, 0, //
+          for (var i = 0; i < extra; i += 1) 0,
+        ];
+    WearableSdHealth sdOf(int code) =>
+        WearableSdsPacketParser.parse(packet(code)).sdHealth!;
+
+    expect(sdOf(0).isSaving, isTrue);
+    expect(sdOf(2).state, WearableSdState.noFile);
+    expect(sdOf(2).description, 'SD not saving (no file) for 23 s');
+    expect(sdOf(3).description, 'No SD card');
+    expect(sdOf(3).state, WearableSdState.noCard);
+    expect(sdOf(4).state, WearableSdState.writeError);
+    expect(sdOf(9).state, WearableSdState.unknown);
+    // Fields added by a later firmware are ignored.
+    expect(
+      WearableSdsPacketParser.parse(packet(1, extra: 4)).sdHealth!.state,
+      WearableSdState.writeStalled,
+    );
+  });
+
   test('SDS with another length is rejected', () {
     expect(
       () => WearableSdsPacketParser.parse(const [0x53, 0x44, 0x53, 50, 0, 0, 0]),

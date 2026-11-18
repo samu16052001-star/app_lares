@@ -84,6 +84,38 @@ class AndroidAcquisitionForegroundService {
     }
   }
 
+  /// "SD card not saving" notification (IMU SD card stuck, failing or
+  /// without a file): silent, vibrates when [alert] is true.
+  static Future<void> showImuSdAlert({
+    required String text,
+    required bool alert,
+  }) async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      await _channel.invokeMethod<void>(
+        'showImuSdAlert',
+        <String, Object?>{'text': text, 'alert': alert},
+      );
+    } catch (_) {
+      // Alert notification failures must never interrupt acquisition.
+    }
+  }
+
+  static Future<void> clearImuSdAlert() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    try {
+      await _channel.invokeMethod<void>('clearImuSdAlert');
+    } catch (_) {
+      // Best effort cleanup only.
+    }
+  }
+
   /// Keeps the screen on while the stopwatch runs, like the
   /// wake lock of time.sesnext.uk.
   static Future<void> setKeepScreenOn(bool on) async {

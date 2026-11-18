@@ -65,6 +65,16 @@ class MainActivity : FlutterActivity() {
                     LaresBleAlertNotifications.clearNoData(this)
                     result.success(null)
                 }
+                "showImuSdAlert" -> {
+                    val text = call.argument<String>("text") ?: "SD card not saving"
+                    val alert = call.argument<Boolean>("alert") ?: true
+                    LaresBleAlertNotifications.showSd(this, text, alert)
+                    result.success(null)
+                }
+                "clearImuSdAlert" -> {
+                    LaresBleAlertNotifications.clearSd(this)
+                    result.success(null)
+                }
                 "vibrateBleDisconnectionAlert" -> {
                     LaresBleAlertNotifications.vibrateAlertCue(this)
                     result.success(null)

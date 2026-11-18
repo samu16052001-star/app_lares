@@ -7,26 +7,27 @@ import 'package:app_lares/environmental_v2_ble_service.dart';
 import 'package:app_lares/environmental_v2_configuration.dart';
 import 'package:app_lares/environmental_v2_configuration_page.dart';
 import 'package:app_lares/environmental_v2_message_parser.dart';
+import 'package:app_lares/imu_time_alignment.dart';
 import 'package:app_lares/polar_h10/polar_h10_configuration.dart';
 import 'package:app_lares/polar_h10/polar_h10_configuration_page.dart';
 import 'package:app_lares/polar_h10/polar_h10_event.dart';
 import 'package:app_lares/polar_h10/polar_h10_models.dart';
 import 'package:app_lares/polar_h10/polar_h10_platform_service.dart';
 import 'package:app_lares/services/acquisition_recovery_store.dart';
-import 'package:app_lares/services/acquisition_csv_logger.dart';
+import 'package:app_lares/services/acquisition_event_log.dart';
 import 'package:app_lares/services/android_acquisition_foreground_service.dart';
 import 'package:app_lares/services/gps_location_service.dart';
 import 'package:app_lares/services/mqtt_service.dart';
-import 'package:app_lares/services/pm10_parser.dart';
 import 'package:app_lares/services/respiratory_device_name_store.dart';
 import 'package:app_lares/services/unified_acquisition_csv_logger.dart';
-import 'package:app_lares/services/wearable_acquisition_csv_logger.dart';
 import 'package:app_lares/stopwatch/stopwatch_bar.dart';
 import 'package:app_lares/stopwatch/stopwatch_controller.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:app_lares/wearable_configuration_service.dart';
 import 'package:app_lares/wearable_mag_calibration.dart';
 import 'package:app_lares/wearable_reception_monitor.dart';
+import 'package:app_lares/wearable_sd_problems.dart';
+import 'package:app_lares/wearable_sds_packet_parser.dart';
 import 'package:app_lares/widgets/polar_h10_live_section.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -729,76 +730,87 @@ class _BleDisconnectionAlertItem {
     required this.id,
     required this.deviceName,
     required this.status,
-    required this.onReconnect,
-    this.reconnectEnabled = true,
     this.failureMessage,
   });
 
   final String id;
   final String deviceName;
   final _BleReconnectStatus status;
-  final VoidCallback onReconnect;
-  final bool reconnectEnabled;
   final String? failureMessage;
-
-  bool get isReconnecting => status == _BleReconnectStatus.reconnecting;
-
-  bool get canReconnect => reconnectEnabled && !isReconnecting;
 }
 
-class _BleDisconnectionAlertDialog extends StatelessWidget {
-  const _BleDisconnectionAlertDialog({
+/// Disconnection alert of the multi-device acquisition page: a panel inside
+/// the page instead of a dialog over it, so the rest of the app stays usable
+/// while a device is disconnected.
+class _BleDisconnectionAlertPanel extends StatelessWidget {
+  const _BleDisconnectionAlertPanel({
     required this.items,
-    required this.onClose,
+    required this.onStopRetrying,
   });
 
   final List<_BleDisconnectionAlertItem> items;
-  final VoidCallback onClose;
+
+  /// Closes the alert and stops the automatic reconnection of [items].
+  final VoidCallback onStopRetrying;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
 
-    return AlertDialog(
-      titlePadding: const EdgeInsets.fromLTRB(24, 18, 8, 0),
-      title: Row(
-        children: [
-          Expanded(
-            child: Text(
-              'BLE device disconnected',
-              style: theme.textTheme.titleLarge,
-            ),
-          ),
-          IconButton(
-            tooltip: 'Close',
-            icon: const Icon(Icons.close),
-            onPressed: onClose,
-          ),
-        ],
-      ),
-      content: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 460),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'The app keeps trying to reconnect automatically. An IMU that was switched off and on is configured and started again by itself. You can also move closer to the phone and tap Reconnect to retry immediately.',
-            ),
-            const SizedBox(height: 16),
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 340),
-              child: ListView.separated(
-                shrinkWrap: true,
-                itemCount: items.length,
-                separatorBuilder: (_, _) => const Divider(height: 20),
-                itemBuilder: (context, index) {
-                  final item = items[index];
-                  return _BleDisconnectionAlertDeviceRow(item: item);
-                },
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colorScheme.surface,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: colorScheme.error, width: 1.5),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      items.length == 1
+                          ? 'BLE device disconnected'
+                          : 'BLE devices disconnected',
+                      style: theme.textTheme.titleMedium,
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: onStopRetrying,
+                    child: const Text('Stop retrying'),
+                  ),
+                ],
               ),
-            ),
-          ],
+              Text(
+                'The app keeps trying to reconnect by itself.',
+                style: theme.textTheme.bodySmall,
+              ),
+              const SizedBox(height: 8),
+              ConstrainedBox(
+                // With many devices the rows scroll: the cards of the
+                // devices below must stay visible.
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.sizeOf(context).height * 0.25,
+                ),
+                child: SingleChildScrollView(
+                  child: Column(
+                    children: [
+                      for (var index = 0; index < items.length; index++) ...[
+                        if (index > 0) const Divider(height: 20),
+                        _BleDisconnectionAlertDeviceRow(item: items[index]),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -856,11 +868,6 @@ class _BleDisconnectionAlertDeviceRow extends StatelessWidget {
               ],
             ],
           ),
-        ),
-        const SizedBox(width: 12),
-        FilledButton(
-          onPressed: item.canReconnect ? item.onReconnect : null,
-          child: const Text('Reconnect'),
         ),
       ],
     );
@@ -1065,8 +1072,6 @@ class _BleAutoReconnectCoordinator {
 
   bool get isActive => _active;
 
-  bool get isOperationInProgress => _operationInProgress;
-
   void start() {
     if (_active || !_canRun) {
       return;
@@ -1075,28 +1080,6 @@ class _BleAutoReconnectCoordinator {
     _active = true;
     _generation += 1;
     unawaited(_startOperation(_generation, runAutomaticCycle));
-  }
-
-  Future<void> requestImmediate({
-    Future<void> Function()? operation,
-  }) {
-    if (!_canRun) {
-      return Future<void>.value();
-    }
-
-    if (!_active) {
-      _active = true;
-      _generation += 1;
-    }
-
-    _retryTimer?.cancel();
-    _retryTimer = null;
-    if (_operationInProgress) {
-      _notify();
-      return Future<void>.value();
-    }
-
-    return _startOperation(_generation, operation ?? runAutomaticCycle);
   }
 
   void cancel({bool notify = true}) {
@@ -1138,6 +1121,16 @@ class _BleAutoReconnectCoordinator {
     }
 
     if (!_isCurrent(generation)) {
+      // Cancelled and started again while this operation was still running
+      // ("Stop retrying" and then "Retry"): the new run could not start
+      // then, so it starts now.
+      if (_active) {
+        if (_canRun) {
+          unawaited(_startOperation(_generation, runAutomaticCycle));
+        } else {
+          _finish(_generation);
+        }
+      }
       return;
     }
 
@@ -1241,6 +1234,10 @@ class _ConnectedDeviceSession {
   bool isConnected = true;
   bool isInitializing = false;
   bool isInitialized = false;
+
+  /// 1 at the first initialization of this device; more when its link
+  /// dropped during it and only this device is initialized again.
+  int initializationAttempt = 1;
   bool environmentalV2ConfigurationApplied = false;
   bool environmentalV2NotificationsRequested = false;
   bool environmentalV2NotificationsStarted = false;
@@ -1262,6 +1259,18 @@ class _ConnectedDeviceSession {
   DateTime? latestWearableSampleReceivedAt;
   int? latestBatteryPercent;
   int? latestFlushFailureRate;
+  WearableSdHealth? latestSdHealth;
+
+  /// Last time-alignment state written in the event log.
+  ImuTimeAlignmentState? loggedTimeAlignmentState;
+
+  /// SD problems of this acquisition (from the SDS packets), kept also
+  /// after the SD saves again: card, notification and completed page.
+  final SdProblemHistory sdProblems = SdProblemHistory();
+
+  /// When the app started listening to the Polar SDK for this acquisition:
+  /// samples received before belong to an earlier acquisition.
+  DateTime? polarListeningSince;
   PolarH10Status polarStatus = PolarH10Status.disconnected;
   PolarH10HrSample? latestPolarHrSample;
   int? latestPolarBatteryPercent;
@@ -1373,6 +1382,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       canContinue: _canContinueAutomaticBleReconnect,
       onStateChanged: notifyListeners,
     );
+    logEvent('SCAN_PAGE_OPENED');
   }
 
   static const _openRemoteAssetIdByEnvironmentalDeviceName = <String, String>{
@@ -1400,7 +1410,15 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   };
 
   final List<_ConnectedDeviceSession> _sessions = [];
-  final UnifiedAcquisitionCsvLogger csvLogger = UnifiedAcquisitionCsvLogger();
+  /// Connection and acquisition events of every device, written to
+  /// Acquisition_events_*.csv next to the data file.
+  final AcquisitionEventLog eventLog = AcquisitionEventLog();
+  late final UnifiedAcquisitionCsvLogger csvLogger =
+      UnifiedAcquisitionCsvLogger(eventLog: eventLog);
+
+  /// Shown on the initialization page while a disconnected device is being
+  /// connected again (see reconnectSessionLink).
+  String? _initReconnectMessage;
   final GpsLocationService gpsLocationService = GpsLocationService();
   final OpenRemoteMqttService mqttService = OpenRemoteMqttService(
     includeConnectionDiagnostics: true,
@@ -1429,13 +1447,22 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   /// What the person must do with the device being configured (IMU
   /// calibrations), shown on the initialization page; null otherwise.
   String? get initializationInstruction {
+    final reconnectMessage = _initReconnectMessage;
+    if (reconnectMessage != null) {
+      return reconnectMessage;
+    }
     for (final session in _sessions) {
       if (!session.isInitializing) {
         continue;
       }
       final instruction = session.wearableService?.calibrationInstruction;
       if (instruction != null) {
-        return '${session.displayName}: $instruction';
+        // Initialization repeated after a lost link: said, so the person
+        // knows why the calibration is asked again.
+        final attempt = session.initializationAttempt > 1
+            ? ' (attempt ${session.initializationAttempt}/$_deviceInitAttempts)'
+            : '';
+        return '${session.displayName}$attempt: $instruction';
       }
     }
     return null;
@@ -1457,16 +1484,15 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
   bool get hasConnectedDevices => connectedCount > 0;
 
-  bool get allConnectedDevicesConfigured {
-    final connectedSessions = _sessions.where((session) => session.isConnected);
-    return connectedSessions.isNotEmpty &&
-        connectedSessions.every((session) => session.isConfigured);
+  /// Every device of the list configured. Devices left disconnected (for
+  /// example by a failed initialization) count too: the initialization
+  /// connects them again.
+  bool get allDevicesConfigured {
+    return _sessions.isNotEmpty &&
+        _sessions.every((session) => session.isConfigured);
   }
 
   bool get isStopping => _isStopping;
-
-  bool get isBleReconnectOperationInProgress =>
-      _bleAutoReconnectCoordinator.isOperationInProgress;
 
   bool get isAndroidBackgroundServiceActive => _foregroundServiceStarted;
 
@@ -1516,6 +1542,145 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     ];
   }
 
+  /// The IMUs that had SD problems in this acquisition, for the completed
+  /// page.
+  List<_ImuSdProblems> get sdProblemsByImu {
+    return [
+      for (final session in _sessions)
+        if (session.sdProblems.isNotEmpty)
+          _ImuSdProblems(
+            deviceName: session.displayName,
+            history: session.sdProblems,
+          ),
+    ];
+  }
+
+  static const int _linkReconnectAttempts = 3;
+
+  /// Connects again a device whose link is down, keeping its configuration:
+  /// used by the initialization (device disconnected during it, or by a
+  /// failed attempt, after which the app disconnects every device) and by
+  /// the "Reconnect" button of the scan page. Up to [_linkReconnectAttempts]
+  /// attempts, 1.5 s apart; the last error is thrown if none works. The
+  /// Polar H10 is connected by the Polar SDK in its own initialization.
+  Future<void> reconnectSessionLink(_ConnectedDeviceSession session) async {
+    if (session.isPolarManaged) {
+      session.isConnected = true;
+      notifyListeners();
+      return;
+    }
+
+    logEvent(
+      'RECONNECT_STARTED',
+      session: session,
+      details: 'phase: $_eventPhase',
+    );
+    Object? lastError;
+    for (var attempt = 1; attempt <= _linkReconnectAttempts; attempt += 1) {
+      if (_initializationStarted) {
+        _initReconnectMessage = 'Reconnecting ${session.displayName} '
+            '($attempt/$_linkReconnectAttempts)...';
+      }
+      notifyListeners();
+      try {
+        final device = await _BleReconnectHelper.reconnect(
+          currentDevice: session.bleDevice,
+          deviceId: session.deviceId,
+          deviceName: session.deviceName,
+          requireUnambiguousEnvironmentalV2NameFallback:
+              session.type == KnownDeviceType.environmentalMonitorV2,
+        );
+        if (!identical(device, session.device) ||
+            session.connectionSubscription == null) {
+          await session.cancelConnectionSubscription();
+          session.device = device;
+          _attachConnectionListener(session);
+        }
+        session.isConnected = true;
+        logEvent(
+          'RECONNECTED',
+          session: session,
+          details: 'attempt $attempt, MTU ${device.mtuNow}',
+        );
+        return;
+      } catch (error) {
+        lastError = error;
+        logEvent(
+          'RECONNECT_FAILED',
+          session: session,
+          details: 'attempt $attempt/$_linkReconnectAttempts: $error',
+        );
+        if (attempt < _linkReconnectAttempts) {
+          await Future<void>.delayed(const Duration(milliseconds: 1500));
+        }
+      } finally {
+        _initReconnectMessage = null;
+        notifyListeners();
+      }
+    }
+    throw StateError(
+      '${session.displayName} is disconnected and could not be reconnected: '
+      '$lastError',
+    );
+  }
+
+  /// Adds a line to the event log (Acquisition_events_*.csv).
+  void logEvent(
+    String event, {
+    _ConnectedDeviceSession? session,
+    String? deviceName,
+    KnownDeviceType? deviceType,
+    String details = '',
+  }) {
+    eventLog.add(
+      event,
+      deviceName: session?.displayName ?? deviceName ?? '',
+      deviceType: (session?.type ?? deviceType)?.label ?? '',
+      details: details,
+    );
+  }
+
+  String get _eventPhase {
+    if (_isStopping) {
+      return 'stopping';
+    }
+    if (_acquisitionStarted) {
+      return 'acquisition';
+    }
+    if (_initializationStarted) {
+      return 'initialization';
+    }
+    return 'before initialization';
+  }
+
+  /// Link state seen by flutter_blue_plus (not the Polar H10, which is
+  /// connected by the Polar SDK: see POLAR_STATUS).
+  void _logLinkState(
+    _ConnectedDeviceSession session,
+    BluetoothConnectionState state,
+  ) {
+    if (state == BluetoothConnectionState.disconnected) {
+      final reason = session.bleDevice.disconnectReason;
+      final code = reason?.code;
+      final description = reason?.description;
+      final reasonText = code == null
+          ? ''
+          : ', reason $code${description == null ? '' : ' $description'}';
+      logEvent(
+        'LINK_DISCONNECTED',
+        session: session,
+        details: 'phase: $_eventPhase$reasonText',
+      );
+      return;
+    }
+
+    logEvent(
+      'LINK_${state.name.toUpperCase()}',
+      session: session,
+      details: 'phase: $_eventPhase, MTU ${session.bleDevice.mtuNow}',
+    );
+  }
+
   void addConnectedSession(_ConnectedDeviceSession session) {
     if (_sessions.any((existing) => existing.deviceId == session.deviceId)) {
       return;
@@ -1532,6 +1697,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   Future<void> disconnectAndRemove(_ConnectedDeviceSession session) async {
+    logEvent(
+      'DEVICE_REMOVED',
+      session: session,
+      details: 'Disconnected by the user',
+    );
     _invalidateOpenRemoteLocationAuthorization();
     await session.cancelConnectionSubscription();
     await session.cancelLiveSubscriptions();
@@ -1596,6 +1766,23 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     _initializationStarted = true;
     _invalidateOpenRemoteLocationAuthorization();
+    logEvent(
+      'INITIALIZATION_STARTED',
+      details: [for (final session in _sessions) session.displayName].join(', '),
+    );
+    // A new attempt starts from scratch (a failed one can leave devices
+    // initialized or marked as disconnected).
+    for (final session in _sessions) {
+      session
+        ..isInitializing = false
+        ..isInitialized = false
+        ..disconnectedDuringAcquisition = false
+        ..reconnectStatus = _BleReconnectStatus.disconnected
+        ..reconnectFailureMessage = null
+        ..errorMessage = null
+        ..latestSdHealth = null;
+      session.sdProblems.clear();
+    }
     await csvLogger.start();
     await gpsLocationService.start();
     _openRemoteLocationSubscription ??= gpsLocationService.livePositions.listen(
@@ -1627,45 +1814,20 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       });
     }
 
+    _ConnectedDeviceSession? currentSession;
     try {
       for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
-        if (!session.isConnected) {
-          throw StateError('${session.displayName} is disconnected.');
-        }
+        currentSession = session;
         if (!session.isConfigured) {
           throw StateError('${session.displayName} is not configured.');
         }
-
-        session
-          ..isInitializing = true
-          ..errorMessage = null;
-        notifyListeners();
-
-        switch (session.type) {
-          case KnownDeviceType.environmentalMonitor:
-            await _initializeEnvironmental(session);
-            break;
-          case KnownDeviceType.environmentalMonitorV2:
-            await _initializeEnvironmentalV2(session);
-            break;
-          case KnownDeviceType.respiratoryMonitor:
-            await _initializeWearable(session);
-            break;
-          case KnownDeviceType.polarH10:
-            await _initializePolarH10(session);
-            break;
-          case KnownDeviceType.unsupported:
-            throw StateError('${session.displayName} is unsupported.');
-        }
-
-        session
-          ..isInitializing = false
-          ..isInitialized = true;
-        notifyListeners();
+        await _initializeSession(session);
       }
+      currentSession = null;
 
       _acquisitionStarted = true;
       _startedAt = DateTime.now();
+      logEvent('ACQUISITION_STARTED', details: 'INIT_DONE sent to the IMUs');
       // INIT_DONE to every IMU: from now on an IMU whose link
       // loses data may disconnect by itself, and it is reconnected right
       // away. A disconnected IMU gets it after its reconnection.
@@ -1683,10 +1845,117 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       }
       notifyListeners();
     } catch (error) {
+      logEvent(
+        'INITIALIZATION_FAILED',
+        session: currentSession,
+        details: error.toString(),
+      );
       await stopAll();
       _initializationStarted = false;
       rethrow;
     }
+  }
+
+  static const int _deviceInitAttempts = 3;
+
+  /// Initializes one device. If its link drops during its own
+  /// initialization, the device is connected again and only its
+  /// initialization is repeated (up to [_deviceInitAttempts] attempts in
+  /// all): before, the whole initialization failed and every device had to
+  /// be configured and calibrated again. Not for the Polar H10, whose link
+  /// is managed by the Polar SDK.
+  Future<void> _initializeSession(_ConnectedDeviceSession session) async {
+    for (var attempt = 1; ; attempt += 1) {
+      // Disconnected during the initialization, or by a failed attempt
+      // (the app then stops and disconnects every device): connected
+      // again here instead of stopping the initialization.
+      if (!session.isConnected) {
+        await reconnectSessionLink(session);
+      }
+
+      session
+        ..isInitializing = true
+        ..initializationAttempt = attempt
+        ..errorMessage = null;
+      notifyListeners();
+      logEvent(
+        'DEVICE_INIT_STARTED',
+        session: session,
+        details: attempt == 1 ? '' : 'attempt $attempt/$_deviceInitAttempts',
+      );
+
+      try {
+        await _runDeviceInitialization(session);
+      } catch (error) {
+        if (!session.isPolarManaged && session.isConnected) {
+          // A command can fail a moment before the disconnection is
+          // reported.
+          await Future<void>.delayed(const Duration(milliseconds: 500));
+        }
+        final linkLost = !session.isPolarManaged &&
+            (!session.isConnected || session.bleDevice.isDisconnected);
+        if (!linkLost || attempt >= _deviceInitAttempts || _isStopping) {
+          rethrow;
+        }
+
+        logEvent(
+          'DEVICE_INIT_RETRY',
+          session: session,
+          details: 'link lost during its initialization '
+              '(attempt $attempt/$_deviceInitAttempts): $error',
+        );
+        await _discardSessionInitialization(session);
+        session.isConnected = false;
+        continue;
+      }
+
+      session
+        ..isInitializing = false
+        ..isInitialized = true;
+      logEvent('DEVICE_INIT_DONE', session: session);
+      notifyListeners();
+      return;
+    }
+  }
+
+  Future<void> _runDeviceInitialization(_ConnectedDeviceSession session) {
+    switch (session.type) {
+      case KnownDeviceType.environmentalMonitor:
+        return _initializeEnvironmental(session);
+      case KnownDeviceType.environmentalMonitorV2:
+        return _initializeEnvironmentalV2(session);
+      case KnownDeviceType.respiratoryMonitor:
+        return _initializeWearable(session);
+      case KnownDeviceType.polarH10:
+        return _initializePolarH10(session);
+      case KnownDeviceType.unsupported:
+        throw StateError('${session.displayName} is unsupported.');
+    }
+  }
+
+  /// Drops what an interrupted initialization left in a session (services
+  /// and their subscriptions) before the device is initialized again.
+  Future<void> _discardSessionInitialization(
+    _ConnectedDeviceSession session,
+  ) async {
+    await session.cancelLiveSubscriptions();
+    try {
+      await session.environmentalService?.dispose();
+    } catch (_) {}
+    try {
+      await session.environmentalV2Service?.dispose();
+    } catch (_) {}
+    try {
+      await session.wearableService?.dispose();
+    } catch (_) {}
+    session
+      ..environmentalService = null
+      ..environmentalV2Service = null
+      ..wearableService = null
+      ..isInitializing = false
+      ..latestSdHealth = null;
+    session.sdProblems.clear();
+    notifyListeners();
   }
 
   Future<void> connectOpenRemote() async {
@@ -1762,25 +2031,27 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> reconnectDisconnectedSession(
-    _ConnectedDeviceSession session,
-  ) async {
-    if (!_canAttemptBleReconnect(session)) {
-      return;
-    }
-
-    await _bleAutoReconnectCoordinator.requestImmediate(
-      operation: () => _reconnectDisconnectedSessionOnce(session),
-    );
-  }
-
+  /// "Stop retrying" of the disconnection alert: these devices are no
+  /// longer reconnected automatically, until [resumeAutomaticBleReconnect]
+  /// or their next disconnection.
   void dismissAutomaticBleReconnectForSessions(
     Iterable<_ConnectedDeviceSession> sessions,
   ) {
     for (final session in sessions) {
       _dismissedBleAutoReconnectAlertKeys.add(_bleAutoReconnectAlertKey(session));
+      logEvent('AUTO_RECONNECT_STOPPED', session: session);
     }
     _bleAutoReconnectCoordinator.cancel();
+  }
+
+  /// "Retry" of a device whose automatic reconnection was stopped.
+  void resumeAutomaticBleReconnect(_ConnectedDeviceSession session) {
+    _dismissedBleAutoReconnectAlertKeys.remove(
+      _bleAutoReconnectAlertKey(session),
+    );
+    logEvent('AUTO_RECONNECT_RESUMED', session: session);
+    _bleAutoReconnectCoordinator.start();
+    notifyListeners();
   }
 
   void cancelAutomaticBleReconnect() {
@@ -1813,6 +2084,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       ..reconnectStatus = _BleReconnectStatus.reconnecting
       ..reconnectFailureMessage = null;
     notifyListeners();
+    logEvent('RECONNECT_STARTED', session: session);
 
     if (session.isPolarManaged) {
       try {
@@ -1826,15 +2098,21 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           ..disconnectedDuringAcquisition = false
           ..reconnectStatus = _BleReconnectStatus.reconnected
           ..reconnectFailureMessage = null;
+        logEvent('RECONNECTED', session: session);
         if (disconnectedSessionsDuringAcquisition.isEmpty) {
           unawaited(AndroidAcquisitionForegroundService.clearBleDisconnectionAlert());
         }
         notifyListeners();
-      } catch (_) {
+      } catch (error) {
         if (!_canContinueAutomaticBleReconnect() ||
             !_sessions.contains(session)) {
           return;
         }
+        logEvent(
+          'RECONNECT_FAILED',
+          session: session,
+          details: error.toString(),
+        );
         session
           ..isConnected = false
           ..disconnectedDuringAcquisition = true
@@ -1916,11 +2194,21 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         ..disconnectedDuringAcquisition = false
         ..reconnectStatus = _BleReconnectStatus.reconnected
         ..reconnectFailureMessage = null;
+      logEvent(
+        'RECONNECTED',
+        session: session,
+        details: 'MTU ${reconnectedDevice.mtuNow}',
+      );
       if (disconnectedSessionsDuringAcquisition.isEmpty) {
         unawaited(AndroidAcquisitionForegroundService.clearBleDisconnectionAlert());
       }
       notifyListeners();
-    } catch (_) {
+    } catch (error) {
+      logEvent(
+        'RECONNECT_FAILED',
+        session: session,
+        details: error.toString(),
+      );
       if (session.type == KnownDeviceType.environmentalMonitorV2) {
         session.environmentalV2NotificationsStarted = false;
       }
@@ -2000,7 +2288,12 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     _bleAutoReconnectCoordinator.cancel();
+    logEvent('STOP_REQUESTED', details: 'phase: $_eventPhase');
     _isStopping = true;
+    final stoppedAt = DateTime.now();
+    for (final session in _sessions) {
+      session.sdProblems.closeAtStop(stoppedAt);
+    }
     _invalidateOpenRemoteLocationAuthorization();
     notifyListeners();
 
@@ -2070,6 +2363,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       await mqttService.dispose();
     } catch (_) {}
     await gpsLocationService.stop();
+    logEvent('STOPPED');
     await csvLogger.stop();
     await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
     await AndroidAcquisitionForegroundService.stop();
@@ -2091,7 +2385,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     try {
       await service.stopAcquisition();
-    } catch (_) {
+      logEvent('IMU_STOPPED', session: session);
+    } catch (error) {
+      logEvent('IMU_STOP_FAILED', session: session, details: error.toString());
       try {
         await service.dispose();
       } catch (_) {}
@@ -2194,8 +2490,16 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    // The first value is the current state (already logged as CONNECTED or
+    // RECONNECTED): only the changes go to the event log.
+    BluetoothConnectionState? lastLinkState;
     session.connectionSubscription = session.bleDevice.connectionState.listen(
       (state) {
+        final previousLinkState = lastLinkState;
+        lastLinkState = state;
+        if (previousLinkState != null && previousLinkState != state) {
+          _logLinkState(session, state);
+        }
         final isConnected = state != BluetoothConnectionState.disconnected;
         if (isConnected &&
             _acquisitionStarted &&
@@ -2226,6 +2530,14 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
             // Keep a configured V2 session until the live page can use the
             // normal acquisition reconnect flow. Notifications are not
             // started here.
+          } else if (_initializationStarted) {
+            // Kept in the list (before, it was removed and the
+            // initialization stopped): a device not initialized yet is
+            // connected again at its turn, one already initialized right
+            // after the initialization, with the IMUs.
+            if (session.isInitialized) {
+              _markSessionDisconnectedDuringAcquisition(session);
+            }
           } else {
             unawaited(session.cancelConnectionSubscription());
             _sessions.removeWhere(
@@ -2313,6 +2625,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     final service = WearableConfigurationBleService(
       session.bleDevice,
       onStateChanged: notifyListeners,
+      // Magnetometer missing or found after a retry, restart after a
+      // firmware fatal error.
+      onImuEvent: (event, details) {
+        logEvent(event, session: session, details: details);
+      },
     );
     session.wearableService = service;
     session.agmBatchesSubscription = service.agmBatchesStream.listen(
@@ -2324,6 +2641,19 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       (event) {
         session.latestBatteryPercent = event.batteryPercent;
         session.latestFlushFailureRate = event.flushFailureRate;
+        final sdHealth = event.sdHealth;
+        if (sdHealth != null &&
+            sdHealth.state != session.latestSdHealth?.state) {
+          logEvent(
+            'IMU_SD_STATE',
+            session: session,
+            details: sdHealth.description,
+          );
+        }
+        session.latestSdHealth = sdHealth;
+        if (sdHealth != null) {
+          session.sdProblems.update(sdHealth, event.receivedAt);
+        }
         notifyListeners();
       },
     );
@@ -2345,16 +2675,57 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       holdSafetyNetUntilInitDone: true,
     );
 
-    final state = service.sequenceState == WearableBleSequenceState.streaming
-        ? WearableBleSequenceState.streaming
-        : await service.sequenceStateStream.firstWhere((state) {
-            return state == WearableBleSequenceState.streaming ||
-                state == WearableBleSequenceState.timeout ||
-                state == WearableBleSequenceState.error ||
-                state == WearableBleSequenceState.stopped;
-          });
+    final state = await _waitForWearableStart(session, service);
+    if (state == null) {
+      throw StateError(
+        '${session.displayName} lost its BLE link during its initialization.',
+      );
+    }
     if (state != WearableBleSequenceState.streaming) {
       throw StateError('${session.displayName} did not enter streaming mode.');
+    }
+  }
+
+  /// Waits for the end of the IMU start sequence (configuration,
+  /// calibrations, START) and returns its last state, or null if the link
+  /// drops meanwhile: the wait then ends at once instead of at the timeout
+  /// of the reply the app is waiting for (up to 32 s).
+  Future<WearableBleSequenceState?> _waitForWearableStart(
+    _ConnectedDeviceSession session,
+    WearableConfigurationBleService service,
+  ) async {
+    if (service.sequenceState == WearableBleSequenceState.streaming) {
+      return WearableBleSequenceState.streaming;
+    }
+
+    final result = Completer<WearableBleSequenceState?>();
+    void finish(WearableBleSequenceState? state) {
+      if (!result.isCompleted) {
+        result.complete(state);
+      }
+    }
+
+    final stateSubscription = service.sequenceStateStream.listen(
+      (state) {
+        if (state == WearableBleSequenceState.streaming ||
+            state == WearableBleSequenceState.timeout ||
+            state == WearableBleSequenceState.error ||
+            state == WearableBleSequenceState.stopped) {
+          finish(state);
+        }
+      },
+      onDone: () => finish(WearableBleSequenceState.stopped),
+    );
+    final linkSubscription = session.bleDevice.connectionState.listen((state) {
+      if (state == BluetoothConnectionState.disconnected) {
+        finish(null);
+      }
+    });
+    try {
+      return await result.future;
+    } finally {
+      await stateSubscription.cancel();
+      await linkSubscription.cancel();
     }
   }
 
@@ -2368,6 +2739,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       ..polarStatus = PolarH10Status.preparing
       ..polarStreamsStarted = false;
     await session.polarEventsSubscription?.cancel();
+    session.polarListeningSince = DateTime.now();
     session.polarEventsSubscription =
         PolarH10PlatformService.instance.events.listen(
       (event) {
@@ -2398,6 +2770,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       }
 
       try {
+        logEvent('POLAR_STREAMS_REQUESTED', session: session);
         await PolarH10PlatformService.instance.startStreams(
           identity: session.polarIdentity,
           configuration: configuration,
@@ -2406,7 +2779,13 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           ..polarStreamsStarted = true
           ..polarStatus = _polarStreamingStatus(configuration)
           ..isConnected = true;
+        logEvent('POLAR_STREAMS_STARTED', session: session);
       } catch (error) {
+        logEvent(
+          'POLAR_STREAMS_FAILED',
+          session: session,
+          details: error.toString(),
+        );
         session
           ..polarStatus = PolarH10Status.error
           ..errorMessage = error.toString()
@@ -2539,12 +2918,33 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         _handlePolarH10ConnectionState(session, connectionEvent);
         break;
       case final PolarH10HrSampleEvent hrEvent:
+        if (_isOldPolarData(session, hrEvent.sample.receivedAt, 'HR', 1)) {
+          break;
+        }
         _handlePolarH10HrSample(session, hrEvent.sample);
         break;
       case final PolarH10EcgSamplesEvent ecgEvent:
+        if (ecgEvent.samples.isNotEmpty &&
+            _isOldPolarData(
+              session,
+              ecgEvent.samples.first.receivedAt,
+              'ECG',
+              ecgEvent.samples.length,
+            )) {
+          break;
+        }
         _handlePolarH10EcgSamples(session, ecgEvent.samples);
         break;
       case final PolarH10AccelerometerSamplesEvent accelerometerEvent:
+        if (accelerometerEvent.samples.isNotEmpty &&
+            _isOldPolarData(
+              session,
+              accelerometerEvent.samples.first.receivedAt,
+              'ACC',
+              accelerometerEvent.samples.length,
+            )) {
+          break;
+        }
         _handlePolarH10AccelerometerSamples(
           session,
           accelerometerEvent.samples,
@@ -2561,10 +2961,44 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
   }
 
+  /// Polar samples received before this acquisition started listening (a
+  /// packet of the previous acquisition left in the channel between the
+  /// Android side and the app, delivered to the new listener): they are not
+  /// written to the CSV.
+  bool _isOldPolarData(
+    _ConnectedDeviceSession session,
+    DateTime receivedAt,
+    String kind,
+    int sampleCount,
+  ) {
+    final listeningSince = session.polarListeningSince;
+    if (listeningSince == null || !receivedAt.isBefore(listeningSince)) {
+      return false;
+    }
+
+    logEvent(
+      'POLAR_OLD_DATA_DROPPED',
+      session: session,
+      details: '$kind, $sampleCount samples received at '
+          '${AcquisitionEventLog.formatTimestamp(receivedAt)}',
+    );
+    return true;
+  }
+
   void _handlePolarH10ConnectionState(
     _ConnectedDeviceSession session,
     PolarH10ConnectionStateEvent event,
   ) {
+    final message = event.message;
+    if (event.status != session.polarStatus || message != null) {
+      logEvent(
+        'POLAR_STATUS',
+        session: session,
+        details: message == null
+            ? event.status.label
+            : '${event.status.label}: $message',
+      );
+    }
     session.polarStatus = event.status;
     if (event.deviceId != null && event.deviceId!.isNotEmpty) {
       session.polarDeviceId = event.deviceId;
@@ -2724,6 +3158,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     PolarH10ErrorEvent event,
   ) {
+    logEvent(
+      'POLAR_ERROR',
+      session: session,
+      details: '${event.code}: ${event.message}',
+    );
     session
       ..polarStatus = PolarH10Status.error
       ..errorMessage = event.message
@@ -3007,8 +3446,22 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         deviceName: session.displayName,
         gpsCoordinates: gpsCoordinates,
         samples: event.samples,
+        phoneTimes: event.phoneTimes,
       ),
     );
+
+    // Time alignment: every change of state goes to the event log, with the
+    // real sampling frequency.
+    final alignment = session.wearableService?.timeAlignment;
+    if (alignment != null &&
+        alignment.state != session.loggedTimeAlignmentState) {
+      session.loggedTimeAlignmentState = alignment.state;
+      logEvent(
+        'IMU_TIME_ALIGNMENT',
+        session: session,
+        details: alignment.eventDetails,
+      );
+    }
     notifyListeners();
   }
 
@@ -3252,11 +3705,71 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     final session = _sessionForDeviceId(id);
 
     if (session != null) {
+      if (!session.isConnected && !session.isPolarManaged) {
+        await _reconnectSession(session);
+        return;
+      }
       await _disconnectFromSession(session);
       return;
     }
 
     await _connectToDevice(result);
+  }
+
+  bool _sessionIsConnected(String id) {
+    final session = _sessionForDeviceId(id);
+    return session != null &&
+        (session.isConnected || session.isPolarManaged);
+  }
+
+  bool _sessionNeedsReconnect(String id) {
+    final session = _sessionForDeviceId(id);
+    return session != null &&
+        !session.isConnected &&
+        !session.isPolarManaged;
+  }
+
+  /// A device still in the list but not connected (for example after a
+  /// failed initialization, which disconnects every device): connected
+  /// again keeping its configuration.
+  Future<void> _reconnectSession(_ConnectedDeviceSession session) async {
+    final id = session.deviceId;
+    final displayName = session.displayName;
+    if (!await _waitForConnectionSlot(displayName)) {
+      return;
+    }
+
+    setState(() {
+      _connectingDeviceIds.add(id);
+      _statusMessage = 'Reconnecting $displayName...';
+    });
+    try {
+      await _stopScanBeforeConnecting();
+      await _sessionManager.reconnectSessionLink(session);
+      _lastConnectionAt = DateTime.now();
+      _startConnectionCooldownTimer();
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'Connected to $displayName.';
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _statusMessage = 'Could not reconnect $displayName: $error';
+        });
+      }
+    } finally {
+      _connectionInProgress = false;
+      if (mounted) {
+        setState(() {
+          _connectingDeviceIds.remove(id);
+        });
+        if (!_isScanning) {
+          unawaited(_startScan(clearResults: false));
+        }
+      }
+    }
   }
 
   Future<void> _connectToDevice(ScanResult result) async {
@@ -3274,6 +3787,12 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       return;
     }
 
+    _sessionManager.logEvent(
+      'CONNECT_REQUESTED',
+      deviceName: displayName,
+      deviceType: deviceType,
+      details: 'id $id, RSSI ${result.rssi} dBm',
+    );
     setState(() {
       _connectingDeviceIds.add(id);
       _statusMessage = null;
@@ -3303,6 +3822,12 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
             polarRssi: result.rssi,
           )..isConnected = true,
         );
+        _sessionManager.logEvent(
+          'POLAR_SELECTED',
+          deviceName: displayName,
+          deviceType: deviceType,
+          details: 'Connected later by the Polar SDK, during the initialization',
+        );
         setState(() {
           _statusMessage = 'Connected to $displayName.';
         });
@@ -3312,15 +3837,29 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         return;
       }
 
+      final slotRequestedAt = DateTime.now();
       if (!await _waitForConnectionSlot(displayName)) {
         return;
       }
       connectionSlotTaken = true;
-      await device.connect(
-        license: License.nonprofit,
-        timeout: const Duration(seconds: 12),
+      final waitedMs =
+          DateTime.now().difference(slotRequestedAt).inMilliseconds;
+      _sessionManager.logEvent(
+        'CONNECTING',
+        deviceName: displayName,
+        deviceType: deviceType,
+        details: waitedMs >= 200
+            ? 'after waiting $waitedMs ms for the previous connection'
+            : '',
       );
+      await _connectWithRetries(device, displayName, deviceType);
       _lastConnectionAt = DateTime.now();
+      _sessionManager.logEvent(
+        'CONNECTED',
+        deviceName: displayName,
+        deviceType: deviceType,
+        details: 'MTU ${device.mtuNow}',
+      );
       _startConnectionCooldownTimer();
 
       if (!mounted) {
@@ -3352,6 +3891,12 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         unawaited(_startScan(clearResults: false));
       }
     } catch (error) {
+      _sessionManager.logEvent(
+        'CONNECT_FAILED',
+        deviceName: displayName,
+        deviceType: deviceType,
+        details: error.toString(),
+      );
       if (!mounted) {
         return;
       }
@@ -3359,6 +3904,9 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
       setState(() {
         _statusMessage = 'Could not connect to $displayName: $error';
       });
+      if (!_isScanning) {
+        unawaited(_startScan(clearResults: false));
+      }
     } finally {
       if (connectionSlotTaken) {
         _connectionInProgress = false;
@@ -3369,6 +3917,63 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
         });
       }
     }
+  }
+
+  /// Android often refuses a connection at once (error 133), above all
+  /// while the page is scanning: the scan is stopped first and the
+  /// connection is tried up to [_connectAttempts] times.
+  static const int _connectAttempts = 3;
+  static const Duration _connectRetryDelay = Duration(milliseconds: 1500);
+
+  Future<void> _connectWithRetries(
+    BluetoothDevice device,
+    String displayName,
+    KnownDeviceType deviceType,
+  ) async {
+    await _stopScanBeforeConnecting();
+    for (var attempt = 1; ; attempt += 1) {
+      try {
+        await device.connect(
+          license: License.nonprofit,
+          timeout: const Duration(seconds: 12),
+        );
+        return;
+      } on FlutterBluePlusException catch (error) {
+        final canceled = error.platform == ErrorPlatform.fbp &&
+            error.code == FbpErrorCode.connectionCanceled.index;
+        if (canceled || attempt >= _connectAttempts || !mounted) {
+          rethrow;
+        }
+        _sessionManager.logEvent(
+          'CONNECT_RETRY',
+          deviceName: displayName,
+          deviceType: deviceType,
+          details: 'attempt ${attempt + 1}/$_connectAttempts after: $error',
+        );
+        setState(() {
+          _statusMessage = 'Could not connect to $displayName, retrying '
+              '(${attempt + 1}/$_connectAttempts)...';
+        });
+        await Future<void>.delayed(_connectRetryDelay);
+        if (!mounted) {
+          rethrow;
+        }
+      }
+    }
+  }
+
+  /// Stops the scan of the page before a connection; it starts again after
+  /// the connection (see _connectToDevice).
+  Future<void> _stopScanBeforeConnecting() async {
+    if (!FlutterBluePlus.isScanningNow) {
+      return;
+    }
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (_) {}
+    // Short pause: some phones refuse a connection started right after the
+    // scan.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
   }
 
   Duration get _connectionCooldownRemaining {
@@ -3513,6 +4118,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
 
   Future<void> _continueToDeviceConfiguration() async {
     if (!_sessionManager.hasConnectedDevices ||
+        _connectingDeviceIds.isNotEmpty ||
         !_hasValidRespiratoryNames ||
         _isSavingNames) {
       return;
@@ -3823,9 +4429,12 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
                             displayName: _displayDeviceName(result),
                             deviceId: _deviceId(result.device),
                             deviceType: _deviceType(result),
-                            isConnected:
-                                _sessionForDeviceId(_deviceId(result.device)) !=
-                                    null,
+                            isConnected: _sessionIsConnected(
+                              _deviceId(result.device),
+                            ),
+                            needsReconnect: _sessionNeedsReconnect(
+                              _deviceId(result.device),
+                            ),
                             isBusy: _isSavingNames || _connectingDeviceIds.contains(
                               _deviceId(result.device),
                             ),
@@ -3844,7 +4453,12 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
                 width: double.infinity,
                 height: 52,
                 child: FilledButton(
+                  // Off while any device is still connecting (not only the
+                  // IMUs, which also wait for their name field): a device
+                  // whose connection fails after Continue would be left out
+                  // with the error shown on this page only.
                   onPressed: _sessionManager.hasConnectedDevices &&
+                          _connectingDeviceIds.isEmpty &&
                           _hasValidRespiratoryNames &&
                           !_isSavingNames
                       ? _continueToDeviceConfiguration
@@ -3867,6 +4481,7 @@ class _BluetoothScanResultTile extends StatelessWidget {
     required this.deviceId,
     required this.deviceType,
     required this.isConnected,
+    required this.needsReconnect,
     required this.isBusy,
     required this.isBlocked,
     required this.onPressed,
@@ -3877,6 +4492,10 @@ class _BluetoothScanResultTile extends StatelessWidget {
   final String deviceId;
   final KnownDeviceType deviceType;
   final bool isConnected;
+
+  /// Still in the list but not connected (for example after a failed
+  /// initialization): "Reconnect".
+  final bool needsReconnect;
   final bool isBusy;
   // Another device is connecting or has just connected: Connect is disabled
   // (see _BluetoothScanningPageState._isConnectBlocked).
@@ -3903,9 +4522,11 @@ class _BluetoothScanResultTile extends StatelessWidget {
         child: Text(
           isBusy
               ? 'Wait'
-              : isConnected
-                  ? 'Disconnect'
-                  : 'Connect',
+              : needsReconnect
+                  ? 'Reconnect'
+                  : isConnected
+                      ? 'Disconnect'
+                      : 'Connect',
         ),
       ),
     );
@@ -3955,7 +4576,6 @@ class _MultiDeviceConfigurationPageState
         await Navigator.of(context).push(
           MaterialPageRoute<void>(
             builder: (_) => DeviceConfigurationPage(
-              device: session.bleDevice,
               initialConfiguration: session.environmentalConfiguration,
               onConfigurationConfirmed: (configuration) {
                 widget.manager.configureEnvironmental(session, configuration);
@@ -3983,9 +4603,6 @@ class _MultiDeviceConfigurationPageState
         await Navigator.of(context).push(
           MaterialPageRoute<void>(
             builder: (_) => WearableDeviceConfigurationPage(
-              device: session.bleDevice,
-              deviceName: session.deviceName,
-              customName: session.customName,
               initialConfiguration: session.wearableConfiguration,
               onConfigurationConfirmed: (configuration) {
                 widget.manager.configureWearable(session, configuration);
@@ -4013,7 +4630,7 @@ class _MultiDeviceConfigurationPageState
   }
 
   void _openAcquisitionInitialization() {
-    if (!widget.manager.allConnectedDevicesConfigured) {
+    if (!widget.manager.allDevicesConfigured) {
       return;
     }
 
@@ -4050,8 +4667,17 @@ class _MultiDeviceConfigurationPageState
                       return Card(
                         child: ListTile(
                           title: Text(session.displayName),
-                          subtitle: Text(session.type.label),
-                          leading: const Icon(Icons.bluetooth_connected),
+                          subtitle: Text(
+                            session.isConnected || session.isPolarManaged
+                                ? session.type.label
+                                : '${session.type.label} - Disconnected, '
+                                    'reconnected at the start',
+                          ),
+                          leading: Icon(
+                            session.isConnected || session.isPolarManaged
+                                ? Icons.bluetooth_connected
+                                : Icons.bluetooth_disabled,
+                          ),
                           trailing: session.isConfigured
                               ? Icon(
                                   Icons.check_circle,
@@ -4072,7 +4698,7 @@ class _MultiDeviceConfigurationPageState
               width: double.infinity,
               height: 52,
               child: FilledButton(
-                onPressed: widget.manager.allConnectedDevicesConfigured
+                onPressed: widget.manager.allDevicesConfigured
                     ? _openAcquisitionInitialization
                     : null,
                 child: const Text('Continue'),
@@ -4209,8 +4835,19 @@ class _MultiDeviceAcquisitionInitializationPageState
                           color: Theme.of(context).colorScheme.error,
                         ),
                       ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Retry starts the initialization again and reconnects '
+                        'the disconnected devices.',
+                        textAlign: TextAlign.center,
+                      ),
                       const SizedBox(height: 16),
                       FilledButton(
+                        onPressed: () => unawaited(_startInitialization()),
+                        child: const Text('Retry'),
+                      ),
+                      const SizedBox(height: 8),
+                      OutlinedButton(
                         onPressed: () => Navigator.of(context).pop(),
                         child: const Text('Back'),
                       ),
@@ -4238,18 +4875,26 @@ class _MultiDeviceAcquisitionPage extends StatefulWidget {
 class _MultiDeviceAcquisitionPageState
     extends State<_MultiDeviceAcquisitionPage> with WidgetsBindingObserver {
   bool _stopConfirmationOpen = false;
+  // Disconnections whose alert was closed with "Stop retrying".
   final Set<String> _dismissedBleAlertKeys = {};
   Timer? _bleAlertBeepTimer;
-  BuildContext? _bleAlertDialogContext;
-  bool _bleAlertDialogOpen = false;
   // Keeps the IMU "samples received" indicators current even when no data
   // arrive.
   Timer? _receptionRefreshTimer;
   final _ImuNoDataAlert _noDataAlert = _ImuNoDataAlert();
+  final _ImuSdAlert _sdAlert = _ImuSdAlert();
+  // Device cards left open by the user. The list builds only
+  // the visible cards: a card that scrolled off the screen was destroyed and
+  // came back closed (shorter), so the list jumped. Now a card that comes
+  // back is rebuilt open if it was open.
+  final Set<String> _expandedDeviceIds = {};
 
   @override
   void initState() {
     super.initState();
+    if (widget.manager.sessions.length == 1) {
+      _expandedDeviceIds.add(widget.manager.sessions.first.deviceId);
+    }
     WidgetsBinding.instance.addObserver(this);
     _receptionRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) {
@@ -4259,7 +4904,7 @@ class _MultiDeviceAcquisitionPageState
     });
     widget.manager.addListener(_handleManagerChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _syncBleDisconnectionAlertDialog();
+      _syncBleDisconnectionAlert();
       unawaited(widget.manager.startPolarStreamsForAcquisition());
       unawaited(
         widget.manager.startEnvironmentalV2NotificationsForAcquisition(),
@@ -4274,6 +4919,7 @@ class _MultiDeviceAcquisitionPageState
     widget.manager.cancelAutomaticBleReconnect();
     _receptionRefreshTimer?.cancel();
     _noDataAlert.clear();
+    _sdAlert.clear();
     _stopBleAlertAlarm();
     super.dispose();
   }
@@ -4282,8 +4928,16 @@ class _MultiDeviceAcquisitionPageState
   void _checkImuNoData() {
     if (widget.manager.isStopping) {
       _noDataAlert.clear();
+      _sdAlert.clear();
       return;
     }
+
+    // SD problems of the IMUs: the notification stays until the stop.
+    _sdAlert.update(
+      widget.manager.sessions.where(
+        (session) => session.type == KnownDeviceType.respiratoryMonitor,
+      ),
+    );
 
     final now = DateTime.now();
     final disconnected =
@@ -4306,7 +4960,7 @@ class _MultiDeviceAcquisitionPageState
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        _syncBleDisconnectionAlertDialog();
+        _syncBleDisconnectionAlert();
       });
       return;
     }
@@ -4320,71 +4974,44 @@ class _MultiDeviceAcquisitionPageState
     }
 
     setState(() {});
-    _syncBleDisconnectionAlertDialog();
+    _syncBleDisconnectionAlert();
   }
 
-  void _syncBleDisconnectionAlertDialog() {
+  /// The disconnection alert is a panel of this page, not a dialog over it:
+  /// the app stays usable while a device is disconnected.
+  bool get _isBleAlertVisible {
+    return Platform.isAndroid &&
+        !widget.manager.isStopping &&
+        _visibleBleAlertSessions.isNotEmpty;
+  }
+
+  /// Vibration of the disconnection alert: every 5 s while the panel is on
+  /// the screen.
+  void _syncBleDisconnectionAlert() {
     if (!mounted || !Platform.isAndroid) {
       return;
     }
 
-    final disconnectedSessions =
-        widget.manager.disconnectedSessionsDuringAcquisition;
-    if (_bleAlertDialogOpen) {
-      if (disconnectedSessions.isEmpty || _visibleBleAlertSessions.isEmpty) {
-        _closeBleAlertDialog(dismissCurrentDevices: false);
-      }
+    if (!_isBleAlertVisible || !_ActiveAcquisitionRuntime.isForegroundVisible) {
+      _stopBleAlertAlarm();
       return;
     }
 
-    if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
-      return;
+    if (_bleAlertBeepTimer == null) {
+      _startBleAlertAlarm();
     }
-
-    final visibleSessions = _visibleBleAlertSessions;
-    if (visibleSessions.isEmpty) {
-      return;
-    }
-
-    _showBleAlertDialog();
   }
 
-  void _showBleAlertDialog() {
-    if (_bleAlertDialogOpen || !mounted) {
-      return;
+  Widget _buildBleDisconnectionAlert() {
+    if (!_isBleAlertVisible) {
+      return const SizedBox.shrink();
     }
 
-    _bleAlertDialogOpen = true;
-    _startBleAlertAlarm();
-    unawaited(
-      showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (dialogContext) {
-          _bleAlertDialogContext = dialogContext;
-          return AnimatedBuilder(
-            animation: widget.manager,
-            builder: (context, _) {
-              final items = _visibleBleAlertSessions
-                  .map(_bleAlertItemForSession)
-                  .toList(growable: false);
-              return _BleDisconnectionAlertDialog(
-                items: items,
-                onClose: () {
-                  _closeBleAlertDialog(dismissCurrentDevices: true);
-                },
-              );
-            },
-          );
-        },
-      ).whenComplete(() {
-        _bleAlertDialogOpen = false;
-        _bleAlertDialogContext = null;
-        _stopBleAlertAlarm();
-        if (mounted) {
-          setState(() {});
-        }
-      }),
+    return _BleDisconnectionAlertPanel(
+      items: _visibleBleAlertSessions
+          .map(_bleAlertItemForSession)
+          .toList(growable: false),
+      onStopRetrying: _stopRetryingBleReconnect,
     );
   }
 
@@ -4395,31 +5022,30 @@ class _MultiDeviceAcquisitionPageState
       id: session.deviceId,
       deviceName: session.displayName,
       status: session.reconnectStatus,
-      reconnectEnabled:
-          !widget.manager.isBleReconnectOperationInProgress &&
-              !widget.manager.isStopping,
       failureMessage: session.reconnectFailureMessage,
-      onReconnect: () {
-        unawaited(widget.manager.reconnectDisconnectedSession(session));
-      },
     );
   }
 
-  void _closeBleAlertDialog({required bool dismissCurrentDevices}) {
-    if (dismissCurrentDevices) {
-      final visibleSessions = _visibleBleAlertSessions;
+  /// "Stop retrying": closes the alert of the devices shown in it (panel
+  /// and vibration) and stops reconnecting them automatically. "Retry" in
+  /// the card of the device starts again.
+  void _stopRetryingBleReconnect() {
+    final visibleSessions = _visibleBleAlertSessions;
+    setState(() {
       for (final session in visibleSessions) {
         _dismissedBleAlertKeys.add(_bleAlertKey(session));
       }
-      widget.manager.dismissAutomaticBleReconnectForSessions(visibleSessions);
-    }
+    });
+    widget.manager.dismissAutomaticBleReconnectForSessions(visibleSessions);
+    _syncBleDisconnectionAlert();
+  }
 
-    _stopBleAlertAlarm();
-    final dialogContext = _bleAlertDialogContext;
-    _bleAlertDialogContext = null;
-    if (dialogContext != null) {
-      Navigator.of(dialogContext).pop();
-    }
+  void _resumeBleReconnect(_ConnectedDeviceSession session) {
+    setState(() {
+      _dismissedBleAlertKeys.remove(_bleAlertKey(session));
+    });
+    widget.manager.resumeAutomaticBleReconnect(session);
+    _syncBleDisconnectionAlert();
   }
 
   void _startBleAlertAlarm() {
@@ -4488,6 +5114,7 @@ class _MultiDeviceAcquisitionPageState
         MaterialPageRoute<void>(
           builder: (_) => _MultiDeviceAcquisitionCompletedPage(
             csvLogger: widget.manager.csvLogger,
+            sdProblems: widget.manager.sdProblemsByImu,
           ),
         ),
       );
@@ -4515,16 +5142,19 @@ class _MultiDeviceAcquisitionPageState
           children: [
             _buildConnectedCounter(context),
             _buildBackgroundStatus(context),
+            _buildBleDisconnectionAlert(),
             Expanded(
               child: ListView.separated(
                 padding: const EdgeInsets.all(16),
                 itemCount: widget.manager.sessions.length,
                 separatorBuilder: (_, _) => const SizedBox(height: 12),
                 itemBuilder: (context, index) {
+                  final session = widget.manager.sessions[index];
                   return _buildDeviceSection(
                     context,
-                    widget.manager.sessions[index],
-                    initiallyExpanded: widget.manager.sessions.length == 1,
+                    session,
+                    initiallyExpanded:
+                        _expandedDeviceIds.contains(session.deviceId),
                   );
                 },
               ),
@@ -4616,15 +5246,27 @@ class _MultiDeviceAcquisitionPageState
     final disconnected = !session.isConnected;
 
     return Card(
+      // One key per device: the open/closed state follows the device even if
+      // the list changes.
+      key: ValueKey<String>('acquisition-device-${session.deviceId}'),
       child: ExpansionTile(
         initiallyExpanded: initiallyExpanded,
+        onExpansionChanged: (expanded) {
+          if (expanded) {
+            _expandedDeviceIds.add(session.deviceId);
+          } else {
+            _expandedDeviceIds.remove(session.deviceId);
+          }
+        },
         leading: Icon(
           disconnected ? Icons.bluetooth_disabled : Icons.bluetooth_connected,
           color: disconnected ? colorScheme.error : colorScheme.primary,
         ),
         title: Text(session.displayName),
-        subtitle: Text(
-          disconnected ? '${session.type.label} - Disconnected' : session.type.label,
+        subtitle: _buildDeviceSubtitle(
+          context,
+          session,
+          disconnected: disconnected,
         ),
         childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
         children: [
@@ -4646,11 +5288,42 @@ class _MultiDeviceAcquisitionPageState
     );
   }
 
+  /// Type and connection state. For an IMU with SD problems: "IMU - SD not
+  /// saving" (red, while it lasts) or "IMU - SD problem earlier" (orange),
+  /// visible also with the card closed.
+  Widget _buildDeviceSubtitle(
+    BuildContext context,
+    _ConnectedDeviceSession session, {
+    required bool disconnected,
+  }) {
+    final problems = session.sdProblems;
+    final sdOngoing = problems.ongoing != null;
+    final parts = [
+      // Short type name, to leave room for the SD text.
+      problems.isEmpty ? session.type.label : 'IMU',
+      if (disconnected) 'Disconnected',
+      if (problems.isNotEmpty) sdOngoing ? 'SD not saving' : 'SD problem earlier',
+    ];
+
+    return Text(
+      parts.join(' - '),
+      style: problems.isEmpty
+          ? null
+          : TextStyle(
+              color: sdOngoing
+                  ? Theme.of(context).colorScheme.error
+                  : Colors.orange.shade800,
+            ),
+    );
+  }
+
   Widget _buildDisconnectedBanner(
     BuildContext context,
     _ConnectedDeviceSession session,
   ) {
     final colorScheme = Theme.of(context).colorScheme;
+    // Automatic reconnection stopped with "Stop retrying".
+    final retryStopped = _dismissedBleAlertKeys.contains(_bleAlertKey(session));
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
@@ -4667,10 +5340,20 @@ class _MultiDeviceAcquisitionPageState
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  session.reconnectFailureMessage ?? session.reconnectStatus.label,
+                  retryStopped
+                      ? 'Disconnected. Automatic reconnection stopped.'
+                      : session.reconnectFailureMessage ??
+                          session.reconnectStatus.label,
                   style: TextStyle(color: colorScheme.onErrorContainer),
                 ),
               ),
+              if (retryStopped)
+                TextButton(
+                  onPressed: widget.manager.isStopping
+                      ? null
+                      : () => _resumeBleReconnect(session),
+                  child: const Text('Retry'),
+                ),
             ],
           ),
         ),
@@ -4837,10 +5520,20 @@ class _MultiDeviceAcquisitionPageState
         _WearableStatusBoxes(
           batteryPercent: session.latestBatteryPercent,
           flushFailureRate: session.latestFlushFailureRate,
+          sdHealth: session.latestSdHealth,
+          sdProblems: session.sdProblems,
+          onSdProblemsTap: () => _showSdProblemsDialog(context, [
+            _ImuSdProblems(
+              deviceName: session.displayName,
+              history: session.sdProblems,
+            ),
+          ]),
           receptionMonitor: session.wearableService?.receptionMonitor,
+          timeAlignment: session.wearableService?.timeAlignment,
           calibrationInstruction:
               session.wearableService?.calibrationInstruction,
           magCalibrationWarning: session.wearableService?.magCalibrationWarning,
+          magnetometerWarning: session.wearableService?.magnetometerWarning,
           noDataThreshold: session.wearableService?.noDataAlertThreshold,
         ),
         const SizedBox(height: 12),
@@ -5065,25 +5758,180 @@ class _ImuNoDataAlert {
   }
 }
 
+/// The SD problems of one IMU with its name, for the completed page and the
+/// details popup.
+class _ImuSdProblems {
+  const _ImuSdProblems({required this.deviceName, required this.history});
+
+  final String deviceName;
+  final SdProblemHistory history;
+}
+
+/// Popup with every period in which the SD of the given IMUs did not save.
+void _showSdProblemsDialog(BuildContext context, List<_ImuSdProblems> imus) {
+  final now = DateTime.now();
+  unawaited(
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        final textTheme = Theme.of(dialogContext).textTheme;
+        return AlertDialog(
+          scrollable: true,
+          title: const Text('SD card problems'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final imu in imus) ...[
+                Text(
+                  '${imu.deviceName}: ${imu.history.summaryAt(now)}',
+                  style: textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                for (final period in imu.history.periods)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Text(period.detailsAt(now)),
+                  ),
+                const SizedBox(height: 12),
+              ],
+              const Text(
+                'In these periods the SD files are incomplete: use the app '
+                'data.',
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Stuck: a write did not finish within 2 s. Write errors: the '
+                'writes failed.',
+                style: textTheme.bodySmall,
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        );
+      },
+    ),
+  );
+}
+
+/// "SD card problem" notification: the last SD problem of every IMU that had
+/// one, until the stop (also after the SD saves again). It vibrates when a
+/// new problem starts.
+class _ImuSdAlert {
+  final Map<String, String> _texts = {};
+  int _problemCount = 0;
+
+  void update(Iterable<_ConnectedDeviceSession> imus) {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    final texts = <String, String>{};
+    var problemCount = 0;
+    var ongoing = false;
+    for (final session in imus) {
+      final periods = session.sdProblems.periods;
+      if (periods.isEmpty) {
+        continue;
+      }
+      problemCount += periods.length;
+      final last = periods.last;
+      ongoing = ongoing || last.isOngoing;
+      texts[session.displayName] = periods.length == 1
+          ? last.notificationText
+          : '${last.notificationText} (${periods.length} periods)';
+    }
+    if (texts.isEmpty) {
+      clear();
+      return;
+    }
+
+    final added = problemCount > _problemCount;
+    final changed = added ||
+        texts.length != _texts.length ||
+        texts.entries.any((entry) => _texts[entry.key] != entry.value);
+    _problemCount = problemCount;
+    _texts
+      ..clear()
+      ..addAll(texts);
+    if (!changed) {
+      return;
+    }
+
+    final names = texts.keys.toList()..sort();
+    final details = [
+      for (final name in names) '$name: ${texts[name]}',
+    ].join('; ');
+    unawaited(
+      AndroidAcquisitionForegroundService.showImuSdAlert(
+        text: ongoing
+            ? '$details. Until the SD saves again, the data are only in the app.'
+            : '$details. The data of those periods are in the app.',
+        alert: added,
+      ),
+    );
+  }
+
+  void clear() {
+    if (_texts.isEmpty) {
+      return;
+    }
+    _texts.clear();
+    _problemCount = 0;
+    unawaited(AndroidAcquisitionForegroundService.clearImuSdAlert());
+  }
+}
+
 class _WearableStatusBoxes extends StatelessWidget {
   const _WearableStatusBoxes({
     required this.batteryPercent,
     required this.flushFailureRate,
+    this.sdHealth,
+    this.sdProblems,
+    this.onSdProblemsTap,
     this.receptionMonitor,
+    this.timeAlignment,
     this.calibrationInstruction,
     this.magCalibrationWarning,
+    this.magnetometerWarning,
     this.noDataThreshold,
   });
 
   final int? batteryPercent;
+
+  /// SD writes that failed in the last window, x100 (250 = 2.50%).
   final int? flushFailureRate;
+
+  /// SD card state (IMUs with the 23-byte SDS packet); null with older
+  /// firmware.
+  final WearableSdHealth? sdHealth;
+
+  /// SD problems of the acquisition (multi-device page): shown instead of
+  /// [sdHealth], also after the SD saves again.
+  final SdProblemHistory? sdProblems;
+
+  /// Opens the list of the periods of [sdProblems].
+  final VoidCallback? onSdProblemsTap;
   final WearableReceptionMonitor? receptionMonitor;
+
+  /// Time alignment of the samples on the phone clock (null = not an IMU).
+  final ImuTimeAlignment? timeAlignment;
 
   /// What to do with the IMU during a calibration.
   final String? calibrationInstruction;
 
   /// Failed magnetometer calibration (the IMU keeps its previous offset).
   final String? magCalibrationWarning;
+
+  /// Magnetometer requested but not found by the IMU (data without it).
+  final String? magnetometerWarning;
 
   /// Silence after which the indicator shows "No IMU data" (data watchdog).
   final Duration? noDataThreshold;
@@ -5093,9 +5941,14 @@ class _WearableStatusBoxes extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
     final batteryText =
         batteryPercent == null ? 'Battery: N/A' : 'Battery: $batteryPercent%';
-    final flushFailureRateText = flushFailureRate == null
+    final rate = flushFailureRate;
+    final flushFailureRateText = rate == null
         ? 'Flush failure rate: N/A'
-        : 'Flush failure rate: $flushFailureRate';
+        : 'Flush failure rate: ${(rate / 100).toStringAsFixed(2)}%';
+    final sd = sdHealth;
+    final problems = sdProblems;
+    final sdOngoing = problems?.ongoing;
+    final now = DateTime.now();
 
     final reception = _describeReception(
       receptionMonitor,
@@ -5130,12 +5983,61 @@ class _WearableStatusBoxes extends StatelessWidget {
           text: reception.text,
           iconColor: reception.color(colorScheme),
         ),
+        if (timeAlignment != null) ...[
+          const SizedBox(height: 12),
+          _WearableStatusBox(
+            icon: Icons.schedule,
+            text: timeAlignment!.description,
+            iconColor: _timeAlignmentColor(timeAlignment!.state, colorScheme),
+          ),
+        ],
+        if (problems != null) ...[
+          // The SD is not saving now.
+          if (sdOngoing != null) ...[
+            const SizedBox(height: 12),
+            _WearableStatusBox(
+              icon: Icons.sd_card_alert,
+              text: '${sdOngoing.ongoingTextAt(now)}. '
+                  'Data are saved only in the app.',
+              iconColor: colorScheme.error,
+            ),
+          ],
+          // Periods already over: one box for all of them, tap for the list.
+          if (problems.periods.length > (sdOngoing == null ? 0 : 1)) ...[
+            const SizedBox(height: 12),
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: onSdProblemsTap,
+              child: _WearableStatusBox(
+                icon: Icons.sd_card_alert,
+                text: 'SD problems: ${problems.summaryAt(now)}. '
+                    'Tap for details.',
+                iconColor: Colors.orange.shade800,
+              ),
+            ),
+          ],
+        ] else if (sd != null && !sd.isSaving) ...[
+          const SizedBox(height: 12),
+          _WearableStatusBox(
+            icon: Icons.sd_card_alert,
+            text: '${sd.description}: data are saved only in the app',
+            iconColor: colorScheme.error,
+          ),
+        ],
         if (calibrationInstruction != null) ...[
           const SizedBox(height: 12),
           _WearableStatusBox(
             icon: Icons.screen_rotation_alt,
             text: calibrationInstruction!,
             iconColor: colorScheme.primary,
+          ),
+        ],
+        if (magnetometerWarning != null) ...[
+          const SizedBox(height: 12),
+          _WearableStatusBox(
+            icon: Icons.explore_off,
+            text: magnetometerWarning!,
+            iconColor: colorScheme.error,
           ),
         ],
         if (magCalibrationWarning != null) ...[
@@ -5197,9 +6099,13 @@ class _WearableStatusBox extends StatelessWidget {
 class _MultiDeviceAcquisitionCompletedPage extends StatelessWidget {
   const _MultiDeviceAcquisitionCompletedPage({
     required this.csvLogger,
+    this.sdProblems = const [],
   });
 
   final UnifiedAcquisitionCsvLogger csvLogger;
+
+  /// IMUs whose SD did not save for some time during the acquisition.
+  final List<_ImuSdProblems> sdProblems;
 
   Future<void> _downloadData(BuildContext context) async {
     try {
@@ -5220,6 +6126,50 @@ class _MultiDeviceAcquisitionCompletedPage extends StatelessWidget {
         const SnackBar(content: Text('Could not save CSV file')),
       );
     }
+  }
+
+  /// SD problems of the acquisition, one line per IMU: for those periods the
+  /// SD files are incomplete and the app data are the reference. A tap opens
+  /// the list of the periods.
+  Widget _buildSdSummary(BuildContext context) {
+    final theme = Theme.of(context);
+    final now = DateTime.now();
+
+    return Material(
+      color: theme.colorScheme.errorContainer,
+      borderRadius: BorderRadius.circular(8),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () => _showSdProblemsDialog(context, sdProblems),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'SD card problems',
+                      style: theme.textTheme.titleMedium,
+                    ),
+                  ),
+                  const Icon(Icons.chevron_right),
+                ],
+              ),
+              const SizedBox(height: 8),
+              for (final imu in sdProblems)
+                Text('${imu.deviceName}: ${imu.history.summaryAt(now)}'),
+              const SizedBox(height: 8),
+              const Text(
+                'In these periods the SD files are incomplete: use the app '
+                'data. Tap for the details.',
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   void _goHome(BuildContext context) {
@@ -5253,6 +6203,10 @@ class _MultiDeviceAcquisitionCompletedPage extends StatelessWidget {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
+                    if (sdProblems.isNotEmpty) ...[
+                      _buildSdSummary(context),
+                      const SizedBox(height: 24),
+                    ],
                     FilledButton.icon(
                       icon: const Icon(Icons.download),
                       label: const Text('Download data'),
@@ -5275,24 +6229,17 @@ class _MultiDeviceAcquisitionCompletedPage extends StatelessWidget {
   }
 }
 
+/// IMU settings of one device of the multi-device acquisition: it only
+/// collects the configuration and hands it back, nothing is sent here.
 class WearableDeviceConfigurationPage extends StatefulWidget {
   const WearableDeviceConfigurationPage({
     super.key,
-    required this.device,
-    required this.deviceName,
-    this.customName,
     this.initialConfiguration,
-    this.onConfigurationConfirmed,
-    this.onDisconnected,
+    required this.onConfigurationConfirmed,
   });
 
-  final BluetoothDevice device;
-  // Keep the BLE name separate for the legacy acquisition reconnect flow.
-  final String deviceName;
-  final String? customName;
   final WearableDeviceConfiguration? initialConfiguration;
-  final ValueChanged<WearableDeviceConfiguration>? onConfigurationConfirmed;
-  final VoidCallback? onDisconnected;
+  final ValueChanged<WearableDeviceConfiguration> onConfigurationConfirmed;
 
   @override
   State<WearableDeviceConfigurationPage> createState() =>
@@ -5301,13 +6248,6 @@ class WearableDeviceConfigurationPage extends StatefulWidget {
 
 class _WearableDeviceConfigurationPageState
     extends State<WearableDeviceConfigurationPage> {
-  WearableConfigurationBleService? _service;
-  WearableAcquisitionCsvLogger? _csvLogger;
-  GpsLocationService? _gpsLocationService;
-  String? _customName;
-
-  String get _displayName => _customName ?? widget.deviceName;
-
   static const List<int> _odrValues = [12, 26, 52, 104, 208, 416];
   static const List<int> _accGValues = [2, 4, 8, 16];
   static const List<int> _gyrDPSValues = [125, 250, 500, 1000, 2000];
@@ -5321,22 +6261,10 @@ class _WearableDeviceConfigurationPageState
   bool gyrEnabled = true;
   bool calibrationEnabled = false;
   bool magCalibrationEnabled = false;
-  bool _isSendingConfig = false;
-  bool _configurationSequenceStarted = false;
-  bool _wearableAcquisitionStopped = false;
-  bool _isDisposing = false;
-  bool _disconnectionNotified = false;
-  String? _backgroundStatusMessage;
-  StreamSubscription<WearableAgmReceivedBatch>? _agmBatchesSubscription;
-
-  bool get _isConfigurationOnly {
-    return widget.onConfigurationConfirmed != null;
-  }
 
   @override
   void initState() {
     super.initState();
-    _customName = widget.customName;
     final initialConfiguration = widget.initialConfiguration;
     if (initialConfiguration != null) {
       odr = initialConfiguration.odr;
@@ -5348,59 +6276,6 @@ class _WearableDeviceConfigurationPageState
       calibrationEnabled = initialConfiguration.calibrationEnabled;
       magCalibrationEnabled = initialConfiguration.magCalibrationEnabled &&
           initialConfiguration.mag == 1;
-    }
-
-    if (_isConfigurationOnly) {
-      return;
-    }
-
-    final service = WearableConfigurationBleService(
-      widget.device,
-      onStateChanged: () {
-        if (!mounted || _isDisposing) {
-          return;
-        }
-
-        setState(() {});
-      },
-    );
-    _service = service;
-    _csvLogger = WearableAcquisitionCsvLogger();
-    _gpsLocationService = GpsLocationService();
-    unawaited(service.initialize());
-  }
-
-  @override
-  void dispose() {
-    if (!_isConfigurationOnly) {
-      _isDisposing = true;
-      if (!_configurationSequenceStarted || _wearableAcquisitionStopped) {
-        _notifyDisconnected();
-        unawaited(_cleanupAndDisconnect());
-      }
-    }
-    super.dispose();
-  }
-
-  void _notifyDisconnected() {
-    if (_disconnectionNotified) {
-      return;
-    }
-
-    _disconnectionNotified = true;
-    widget.onDisconnected?.call();
-  }
-
-  Future<void> _cleanupAndDisconnect() async {
-    await _stopWearableCsvLogging();
-    await _service?.dispose();
-
-    try {
-      await widget.device.disconnect();
-    } catch (_) {
-      // The device may already be disconnected when the route is disposed.
-    } finally {
-      _notifyDisconnected();
     }
   }
 
@@ -5466,183 +6341,16 @@ class _WearableDeviceConfigurationPageState
     });
   }
 
-  Future<void> _startConfigurationSequenceAndOpenLog() async {
-    final service = _service;
-    final csvLogger = _csvLogger;
-    if (service == null ||
-        csvLogger == null ||
-        !service.isReadyToContinue ||
-        !_hasEnabledSensor ||
-        _isSendingConfig ||
-        _configurationSequenceStarted) {
-      return;
-    }
-
-    setState(() {
-      _isSendingConfig = true;
-      _configurationSequenceStarted = true;
-    });
-
-    try {
-      await _startWearableCsvLogging();
-      final configuration = _currentConfiguration;
-      await service.startConfigurationSequence(
-        odr: configuration.odr,
-        mag: configuration.mag,
-        accG: configuration.commandAccG,
-        gyrDPS: configuration.commandGyrDPS,
-        calibrationEnabled: configuration.calibrationEnabled,
-        magCalibrationEnabled: configuration.magCalibrationEnabled,
-      );
-      await _activateAndroidBackgroundSupport();
-      if (!mounted) {
-        return;
-      }
-
-      await Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => WearableBleCommunicationLogPage(
-            service: service,
-            csvLogger: csvLogger,
-            deviceName: widget.deviceName,
-            customName: _customName,
-            stopWearableCsvLogging: _stopWearableCsvLogging,
-            onAcquisitionStopped: _handleWearableAcquisitionStopped,
-            backgroundStatusMessage: _backgroundStatusMessage,
-          ),
-        ),
-      );
-    } catch (error) {
-      await _stopWearableCsvLogging();
-      await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
-      await AndroidAcquisitionForegroundService.stop();
-      _configurationSequenceStarted = false;
-      if (!mounted) {
-        return;
-      }
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not start acquisition: $error')),
-      );
-      setState(() {});
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isSendingConfig = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _activateAndroidBackgroundSupport() async {
-    if (!Platform.isAndroid) {
-      return;
-    }
-
-    final notificationStatus = await Permission.notification.request();
-    if (!notificationStatus.isGranted) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        'Android background acquisition may be unreliable without the persistent notification.',
-      );
-    }
-
-    try {
-      await AndroidAcquisitionForegroundService.start();
-    } catch (error) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        'Android background acquisition may be unreliable: $error',
-      );
-    }
-
-    await _ActiveAcquisitionRuntime.markActive();
-    await AcquisitionRecoveryStore.saveActive(
-      acquisitionType: KnownDeviceType.respiratoryMonitor.name,
-      deviceNames: [_displayName],
-      deviceTypes: [KnownDeviceType.respiratoryMonitor.name],
-      configurationSummaries: [
-        _summarizeWearableConfiguration(_currentConfiguration),
-      ],
-      startedAt: DateTime.now(),
-      logicalRoute: 'acquisition',
-      status: 'running',
-      csvFileName: _csvLogger?.fileName,
-      csvFilePath: _csvLogger?.file?.path,
-    );
-  }
-
   void _confirmConfiguration() {
     if (!_hasEnabledSensor) {
       return;
     }
-    widget.onConfigurationConfirmed?.call(_currentConfiguration);
+    widget.onConfigurationConfirmed(_currentConfiguration);
     Navigator.of(context).pop();
-  }
-
-  void _handleWearableAcquisitionStopped() {
-    _wearableAcquisitionStopped = true;
-    _notifyDisconnected();
-  }
-
-  Future<void> _startWearableCsvLogging() async {
-    final csvLogger = _csvLogger;
-    final gpsLocationService = _gpsLocationService;
-    final service = _service;
-    if (csvLogger == null || gpsLocationService == null || service == null) {
-      return;
-    }
-
-    // The standalone wearable path must resolve the same persisted IMU name
-    // before subscribing to AGM data, while retaining widget.deviceName for BLE.
-    _customName ??= await RespiratoryDeviceNameStore.load(
-      widget.device.remoteId.toString(),
-    );
-    await csvLogger.start();
-    await gpsLocationService.start();
-    final gpsStatusMessage = gpsLocationService.statusMessage;
-    if (gpsStatusMessage != null) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        gpsStatusMessage,
-      );
-    }
-    await _agmBatchesSubscription?.cancel();
-    _agmBatchesSubscription = service.agmBatchesStream.listen((event) {
-      final gpsCoordinates = gpsLocationService.currentCoordinates;
-      unawaited(
-        csvLogger.appendAgmBatch(
-          receivedAt: event.receivedAt,
-          deviceName: _displayName,
-          gpsCoordinates: gpsCoordinates,
-          samples: event.samples,
-        ),
-      );
-    });
-  }
-
-  Future<void> _stopWearableCsvLogging() async {
-    await _agmBatchesSubscription?.cancel();
-    _agmBatchesSubscription = null;
-    await _gpsLocationService?.stop();
-    await _csvLogger?.stop();
   }
 
   @override
   Widget build(BuildContext context) {
-    final service = _service;
-    final canContinue = _hasEnabledSensor &&
-        (_isConfigurationOnly ||
-            (service != null &&
-                service.isReadyToContinue &&
-                !_isSendingConfig &&
-                !_configurationSequenceStarted));
-    final buttonText = _isConfigurationOnly
-        ? 'Confirm Configuration'
-        : _isSendingConfig
-            ? 'Sending...'
-            : 'Continue';
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('Device Configuration'),
@@ -5751,12 +6459,8 @@ class _WearableDeviceConfigurationPageState
               width: double.infinity,
               height: 52,
               child: FilledButton(
-                onPressed: canContinue
-                    ? _isConfigurationOnly
-                        ? _confirmConfiguration
-                        : _startConfigurationSequenceAndOpenLog
-                    : null,
-                child: Text(buttonText),
+                onPressed: _hasEnabledSensor ? _confirmConfiguration : null,
+                child: const Text('Confirm Configuration'),
               ),
             ),
           ),
@@ -5796,731 +6500,6 @@ class _WearableDeviceConfigurationPageState
             }
           : null,
     );
-  }
-}
-
-class WearableBleCommunicationLogPage extends StatefulWidget {
-  const WearableBleCommunicationLogPage({
-    super.key,
-    required this.service,
-    required this.csvLogger,
-    required this.deviceName,
-    this.customName,
-    required this.stopWearableCsvLogging,
-    required this.onAcquisitionStopped,
-    this.backgroundStatusMessage,
-  });
-
-  final WearableConfigurationBleService service;
-  final WearableAcquisitionCsvLogger csvLogger;
-  // Original BLE name used by _BleReconnectHelper.
-  final String deviceName;
-  final String? customName;
-
-  String get displayName => customName ?? deviceName;
-
-  final Future<void> Function() stopWearableCsvLogging;
-  final VoidCallback onAcquisitionStopped;
-  final String? backgroundStatusMessage;
-
-  @override
-  State<WearableBleCommunicationLogPage> createState() =>
-      _WearableBleCommunicationLogPageState();
-}
-
-class _WearableBleCommunicationLogPageState
-    extends State<WearableBleCommunicationLogPage> with WidgetsBindingObserver {
-  bool _stopConfirmationOpen = false;
-  static const Duration _visibleChartWindow = Duration(seconds: 2);
-  static const Duration _uiRefreshInterval = Duration(milliseconds: 500);
-
-  final Map<_WearableMetric, _WearableMetricSeries> _metricSeries = {
-    for (final definition in _wearableMetricDefinitions)
-      definition.metric: _WearableMetricSeries(),
-  };
-
-  StreamSubscription<WearableAgmReceivedBatch>? _agmBatchesSubscription;
-  StreamSubscription<WearableSdsReceivedStatus>? _sdsStatusSubscription;
-  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
-  final Set<String> _dismissedBleAlertKeys = {};
-  final ValueNotifier<int> _bleAlertRevision = ValueNotifier<int>(0);
-  Timer? _uiRefreshTimer;
-  Timer? _bleAlertBeepTimer;
-  BuildContext? _bleAlertDialogContext;
-  DateTime? _lastUiRefreshAt;
-  DateTime? _latestSampleReceivedAt;
-  int? _latestBatteryPercent;
-  int? _latestFlushFailureRate;
-  bool _bleDisconnectedDuringAcquisition = false;
-  bool _bleAlertDialogOpen = false;
-  int _bleDisconnectionAlertVersion = 0;
-  _BleReconnectStatus _bleReconnectStatus = _BleReconnectStatus.disconnected;
-  String? _bleReconnectFailureMessage;
-  late final _BleAutoReconnectCoordinator _bleAutoReconnectCoordinator;
-  bool _isStoppingAcquisition = false;
-  // Keeps the "samples received" indicator current even when no data arrive.
-  Timer? _receptionRefreshTimer;
-  final _ImuNoDataAlert _noDataAlert = _ImuNoDataAlert();
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _receptionRefreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) {
-        setState(() {});
-        _checkImuNoData();
-      }
-    });
-    _bleAutoReconnectCoordinator = _BleAutoReconnectCoordinator(
-      runAutomaticCycle: _runWearableAutomaticBleReconnectCycle,
-      hasPendingWork: _hasWearableAutomaticBleReconnectWork,
-      canContinue: _canContinueWearableAutomaticBleReconnect,
-      onStateChanged: _handleWearableAutoReconnectStateChanged,
-    );
-    _agmBatchesSubscription = widget.service.agmBatchesStream.listen(
-      _handleAgmBatch,
-    );
-    _sdsStatusSubscription = widget.service.sdsStatusStream.listen(
-      _handleSdsStatus,
-    );
-    _attachWearableConnectionListener();
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    unawaited(_agmBatchesSubscription?.cancel());
-    unawaited(_sdsStatusSubscription?.cancel());
-    unawaited(_connectionSubscription?.cancel());
-    _uiRefreshTimer?.cancel();
-    _receptionRefreshTimer?.cancel();
-    _noDataAlert.clear();
-    _bleAutoReconnectCoordinator.cancel(notify: false);
-    _stopWearableBleAlertAlarm();
-    _bleAlertRevision.dispose();
-    super.dispose();
-  }
-
-  /// Data watchdog: the IMU is still connected but silent.
-  void _checkImuNoData() {
-    final now = DateTime.now();
-    final silent = !_bleDisconnectedDuringAcquisition &&
-        !_isStoppingAcquisition &&
-        widget.service.noDataFor(now) != null;
-    _noDataAlert.update(
-      silentDevices: silent ? [widget.displayName] : const <String>[],
-      now: now,
-      canRepeatVibration: _ActiveAcquisitionRuntime.isForegroundVisible &&
-          _bleAlertBeepTimer == null,
-    );
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _syncWearableBleDisconnectionAlertDialog();
-      });
-      return;
-    }
-
-    _stopWearableBleAlertAlarm();
-  }
-
-  void _attachWearableConnectionListener() {
-    unawaited(_connectionSubscription?.cancel());
-    _connectionSubscription = widget.service.connectionState.listen((state) {
-      if (_isStoppingAcquisition ||
-          widget.service.isStopping ||
-          widget.service.isStopped ||
-          state != BluetoothConnectionState.disconnected) {
-        return;
-      }
-
-      _markWearableBleDisconnected();
-    });
-  }
-
-  void _handleAgmBatch(WearableAgmReceivedBatch event) {
-    final sample = event.firstSample;
-    _latestSampleReceivedAt = event.receivedAt;
-
-    final cutoff = event.receivedAt.subtract(_visibleChartWindow);
-    for (final definition in _wearableMetricDefinitions) {
-      final series = _metricSeries[definition.metric];
-      if (series == null ||
-          !_wearableMetricInSample(definition.metric, sample)) {
-        continue;
-      }
-
-      series
-        ..addSample(
-          receivedAt: event.receivedAt,
-          value: _valueForMetric(definition.metric, sample),
-        )
-        ..pruneBefore(cutoff);
-    }
-
-    _requestThrottledUiRefresh();
-  }
-
-  void _handleSdsStatus(WearableSdsReceivedStatus event) {
-    _latestBatteryPercent = event.batteryPercent;
-    _latestFlushFailureRate = event.flushFailureRate;
-    _requestThrottledUiRefresh();
-  }
-
-  void _markWearableBleDisconnected() {
-    if (_isStoppingAcquisition || widget.service.isStopping) {
-      return;
-    }
-
-    if (_bleDisconnectedDuringAcquisition &&
-        _bleReconnectStatus != _BleReconnectStatus.reconnected) {
-      return;
-    }
-
-    if (mounted) {
-      setState(() {
-        _bleDisconnectedDuringAcquisition = true;
-        _bleDisconnectionAlertVersion += 1;
-        _bleReconnectStatus = _BleReconnectStatus.disconnected;
-        _bleReconnectFailureMessage = null;
-      });
-    } else {
-      _bleDisconnectedDuringAcquisition = true;
-      _bleDisconnectionAlertVersion += 1;
-      _bleReconnectStatus = _BleReconnectStatus.disconnected;
-      _bleReconnectFailureMessage = null;
-    }
-    _notifyWearableBleAlertChanged();
-
-    unawaited(
-      AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
-        widget.displayName,
-      ),
-    );
-    _bleAutoReconnectCoordinator.start();
-
-    if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
-      return;
-    }
-
-    _syncWearableBleDisconnectionAlertDialog();
-  }
-
-  Future<void> _reconnectWearableAfterDisconnection() async {
-    if (!_canAttemptWearableBleReconnect()) {
-      return;
-    }
-
-    await _bleAutoReconnectCoordinator.requestImmediate(
-      operation: _runWearableBleReconnectAttempt,
-    );
-  }
-
-  Future<void> _runWearableAutomaticBleReconnectCycle() async {
-    if (!_canAttemptWearableBleReconnect()) {
-      return;
-    }
-
-    await _runWearableBleReconnectAttempt();
-  }
-
-  Future<void> _runWearableBleReconnectAttempt() async {
-    if (!_canAttemptWearableBleReconnect()) {
-      return;
-    }
-
-    setState(() {
-      _bleReconnectStatus = _BleReconnectStatus.reconnecting;
-      _bleReconnectFailureMessage = null;
-    });
-    _notifyWearableBleAlertChanged();
-
-    try {
-      final currentDevice = widget.service.device;
-      final reconnectedDevice = await _BleReconnectHelper.reconnect(
-        currentDevice: currentDevice,
-        deviceId: currentDevice.remoteId.toString(),
-        deviceName: widget.deviceName,
-      );
-      if (!_canContinueWearableAutomaticBleReconnect()) {
-        return;
-      }
-      await widget.service.resumeNotificationsAfterReconnect(
-        reconnectedDevice: reconnectedDevice,
-      );
-      _attachWearableConnectionListener();
-
-      if (!_canContinueWearableAutomaticBleReconnect()) {
-        return;
-      }
-
-      setState(() {
-        _bleDisconnectedDuringAcquisition = false;
-        _bleReconnectStatus = _BleReconnectStatus.reconnected;
-        _bleReconnectFailureMessage = null;
-      });
-      _notifyWearableBleAlertChanged();
-      unawaited(AndroidAcquisitionForegroundService.clearBleDisconnectionAlert());
-      _closeWearableBleAlertDialog(dismissCurrentDevice: false);
-    } catch (_) {
-      try {
-        await widget.service.device.disconnect();
-      } catch (_) {}
-
-      if (!_canContinueWearableAutomaticBleReconnect()) {
-        return;
-      }
-
-      setState(() {
-        _bleDisconnectedDuringAcquisition = true;
-        _bleReconnectStatus = _BleReconnectStatus.failed;
-        _bleReconnectFailureMessage =
-            'Could not reconnect to ${widget.displayName}. Move closer and try again.';
-      });
-      _notifyWearableBleAlertChanged();
-    }
-  }
-
-  bool _hasWearableAutomaticBleReconnectWork() {
-    return _bleDisconnectedDuringAcquisition &&
-        !_dismissedBleAlertKeys.contains(_wearableBleAlertKey);
-  }
-
-  bool _canContinueWearableAutomaticBleReconnect() {
-    return mounted &&
-        !_isStoppingAcquisition &&
-        !widget.service.isStopping &&
-        !widget.service.isStopped;
-  }
-
-  bool _canAttemptWearableBleReconnect() {
-    return _canContinueWearableAutomaticBleReconnect() &&
-        _bleDisconnectedDuringAcquisition &&
-        !_dismissedBleAlertKeys.contains(_wearableBleAlertKey) &&
-        _bleReconnectStatus != _BleReconnectStatus.reconnecting &&
-        _bleReconnectStatus != _BleReconnectStatus.reconnected;
-  }
-
-  void _handleWearableAutoReconnectStateChanged() {
-    _notifyWearableBleAlertChanged();
-    if (mounted) {
-      setState(() {});
-    }
-  }
-
-  void _syncWearableBleDisconnectionAlertDialog() {
-    if (!mounted || !Platform.isAndroid) {
-      return;
-    }
-
-    if (_bleAlertDialogOpen) {
-      if (!_bleDisconnectedDuringAcquisition) {
-        _closeWearableBleAlertDialog(dismissCurrentDevice: false);
-      }
-      return;
-    }
-
-    if (!_ActiveAcquisitionRuntime.isForegroundVisible ||
-        !_bleDisconnectedDuringAcquisition ||
-        _dismissedBleAlertKeys.contains(_wearableBleAlertKey)) {
-      return;
-    }
-
-    _showWearableBleAlertDialog();
-  }
-
-  void _showWearableBleAlertDialog() {
-    if (_bleAlertDialogOpen || !mounted) {
-      return;
-    }
-
-    _bleAlertDialogOpen = true;
-    _startWearableBleAlertAlarm();
-    unawaited(
-      showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (dialogContext) {
-          _bleAlertDialogContext = dialogContext;
-          return ValueListenableBuilder<int>(
-            valueListenable: _bleAlertRevision,
-            builder: (_, _, _) {
-              return _BleDisconnectionAlertDialog(
-                items: [_wearableBleAlertItem],
-                onClose: () {
-                  _closeWearableBleAlertDialog(dismissCurrentDevice: true);
-                },
-              );
-            },
-          );
-        },
-      ).whenComplete(() {
-        _bleAlertDialogOpen = false;
-        _bleAlertDialogContext = null;
-        _stopWearableBleAlertAlarm();
-        if (mounted) {
-          setState(() {});
-        }
-      }),
-    );
-  }
-
-  _BleDisconnectionAlertItem get _wearableBleAlertItem {
-    return _BleDisconnectionAlertItem(
-      id: widget.service.device.remoteId.toString(),
-      deviceName: widget.displayName,
-      status: _bleReconnectStatus,
-      reconnectEnabled: !_bleAutoReconnectCoordinator.isOperationInProgress &&
-          !_isStoppingAcquisition &&
-          !widget.service.isStopping &&
-          !widget.service.isStopped,
-      failureMessage: _bleReconnectFailureMessage,
-      onReconnect: () {
-        unawaited(_reconnectWearableAfterDisconnection());
-      },
-    );
-  }
-
-  void _closeWearableBleAlertDialog({required bool dismissCurrentDevice}) {
-    if (dismissCurrentDevice && _bleDisconnectedDuringAcquisition) {
-      _dismissedBleAlertKeys.add(_wearableBleAlertKey);
-      _bleAutoReconnectCoordinator.cancel();
-    }
-
-    _stopWearableBleAlertAlarm();
-    final dialogContext = _bleAlertDialogContext;
-    _bleAlertDialogContext = null;
-    if (dialogContext != null) {
-      Navigator.of(dialogContext).pop();
-    }
-  }
-
-  void _startWearableBleAlertAlarm() {
-    _stopWearableBleAlertAlarm();
-    _playWearableBleAlertCue();
-    _bleAlertBeepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      _playWearableBleAlertCue();
-    });
-  }
-
-  void _stopWearableBleAlertAlarm() {
-    _bleAlertBeepTimer?.cancel();
-    _bleAlertBeepTimer = null;
-  }
-
-  void _playWearableBleAlertCue() {
-    if (!Platform.isAndroid) {
-      return;
-    }
-
-    // Vibration only, no sound.
-    unawaited(AndroidAcquisitionForegroundService.vibrateBleDisconnectionAlert());
-    unawaited(HapticFeedback.vibrate().catchError((_) {}));
-  }
-
-  void _notifyWearableBleAlertChanged() {
-    _bleAlertRevision.value += 1;
-  }
-
-  String get _wearableBleAlertKey {
-    return '${widget.service.device.remoteId}:$_bleDisconnectionAlertVersion';
-  }
-
-  double _valueForMetric(
-    _WearableMetric metric,
-    WearableAgmSample sample,
-  ) {
-    return switch (metric) {
-      _WearableMetric.accelerometerX => sample.accX,
-      _WearableMetric.accelerometerY => sample.accY,
-      _WearableMetric.accelerometerZ => sample.accZ,
-      _WearableMetric.accelerometerMagnitude => math.sqrt(
-          (sample.accX * sample.accX) +
-              (sample.accY * sample.accY) +
-              (sample.accZ * sample.accZ),
-        ),
-      _WearableMetric.gyroscopeX => sample.gyrX,
-      _WearableMetric.gyroscopeY => sample.gyrY,
-      _WearableMetric.gyroscopeZ => sample.gyrZ,
-      _WearableMetric.magnetometerX => sample.magX,
-      _WearableMetric.magnetometerY => sample.magY,
-      _WearableMetric.magnetometerZ => sample.magZ,
-    };
-  }
-
-  void _requestThrottledUiRefresh() {
-    if (!mounted) {
-      return;
-    }
-
-    final now = DateTime.now();
-    final lastRefresh = _lastUiRefreshAt;
-    if (lastRefresh == null ||
-        now.difference(lastRefresh) >= _uiRefreshInterval) {
-      _lastUiRefreshAt = now;
-      setState(() {});
-      return;
-    }
-
-    if (_uiRefreshTimer != null) {
-      return;
-    }
-
-    final remaining = _uiRefreshInterval - now.difference(lastRefresh);
-    _uiRefreshTimer = Timer(remaining, () {
-      _uiRefreshTimer = null;
-      if (!mounted) {
-        return;
-      }
-
-      _lastUiRefreshAt = DateTime.now();
-      setState(() {});
-    });
-  }
-
-  Future<void> _requestStopAcquisition() async {
-    if (!mounted ||
-        _stopConfirmationOpen ||
-        _isStoppingAcquisition ||
-        widget.service.isStopping) {
-      return;
-    }
-
-    _stopConfirmationOpen = true;
-    final bool confirmed;
-    try {
-      confirmed = await _confirmStopAcquisition(context);
-    } finally {
-      _stopConfirmationOpen = false;
-    }
-    if (!mounted || !confirmed) {
-      return;
-    }
-    await _stopAcquisition();
-  }
-
-  Future<void> _stopAcquisition() async {
-    if (_isStoppingAcquisition || widget.service.isStopping) {
-      return;
-    }
-
-    _bleAutoReconnectCoordinator.cancel();
-    setState(() {
-      _isStoppingAcquisition = true;
-    });
-
-    try {
-      await widget.service.stopAcquisition();
-      var csvFinalizeFailed = false;
-      try {
-        await widget.stopWearableCsvLogging();
-        await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
-        await AndroidAcquisitionForegroundService.stop();
-        await AcquisitionRecoveryStore.clear();
-        await _ActiveAcquisitionRuntime.markInactive();
-      } catch (_) {
-        csvFinalizeFailed = true;
-      }
-      widget.onAcquisitionStopped();
-
-      if (!mounted) {
-        return;
-      }
-
-      if (csvFinalizeFailed) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not finalize CSV file')),
-        );
-      }
-      unawaited(
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute<void>(
-            builder: (_) => WearableAcquisitionCompletedPage(
-              csvLogger: widget.csvLogger,
-            ),
-          ),
-        ),
-      );
-    } catch (_) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _isStoppingAcquisition = false;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not stop acquisition')),
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return PopScope(
-      canPop: false,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('Acquisition in progress...'),
-          automaticallyImplyLeading: false,
-        ),
-        body: Column(
-          children: [
-            if (_bleDisconnectedDuringAcquisition)
-              _buildWearableBleDisconnectedBanner(),
-            Expanded(
-              child: _buildWearableDashboard(),
-            ),
-            _buildBackgroundStatus(),
-            _buildStopAcquisitionButton(),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildWearableBleDisconnectedBanner() {
-    final colorScheme = Theme.of(context).colorScheme;
-    final message = _bleReconnectFailureMessage ?? _bleReconnectStatus.label;
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: colorScheme.errorContainer,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          child: Row(
-            children: [
-              Icon(
-                Icons.warning_amber_rounded,
-                color: colorScheme.onErrorContainer,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  message,
-                  style: TextStyle(color: colorScheme.onErrorContainer),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildWearableDashboard() {
-    final definitions =
-        _wearableMetricDefinitionsFor(widget.service.configuredSensorMask);
-    return ListView.separated(
-      padding: const EdgeInsets.all(16),
-      itemCount: definitions.length + 1,
-      separatorBuilder: (_, _) => const SizedBox(height: 12),
-      itemBuilder: (context, index) {
-        if (index == 0) {
-          return _buildStatusBoxes(context);
-        }
-
-        final definition = definitions[index - 1];
-        return _WearableMetricChartCard(
-          definition: definition,
-          series: _metricSeries[definition.metric]!,
-          windowEnd: _latestSampleReceivedAt,
-          windowDuration: _visibleChartWindow,
-          formatTime: _formatChartTime,
-        );
-      },
-    );
-  }
-
-  Widget _buildStatusBoxes(BuildContext context) {
-    return _WearableStatusBoxes(
-      batteryPercent: _latestBatteryPercent,
-      flushFailureRate: _latestFlushFailureRate,
-      receptionMonitor: widget.service.receptionMonitor,
-      calibrationInstruction: widget.service.calibrationInstruction,
-      magCalibrationWarning: widget.service.magCalibrationWarning,
-      noDataThreshold: widget.service.noDataAlertThreshold,
-    );
-  }
-
-  Widget _buildBackgroundStatus() {
-    if (!Platform.isAndroid) {
-      return const SizedBox.shrink();
-    }
-
-    final warning = widget.backgroundStatusMessage;
-    final colorScheme = Theme.of(context).colorScheme;
-    final backgroundColor = warning == null
-        ? Colors.green.shade50
-        : colorScheme.errorContainer;
-    final foregroundColor = warning == null
-        ? Colors.green.shade900
-        : colorScheme.onErrorContainer;
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: backgroundColor,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: Row(
-            children: [
-              Icon(
-                warning == null
-                    ? Icons.notifications_active
-                    : Icons.warning_amber_rounded,
-                size: 18,
-                color: foregroundColor,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  warning ?? 'Background acquisition active',
-                  style: TextStyle(color: foregroundColor),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildStopAcquisitionButton() {
-    final isStopping = _isStoppingAcquisition || widget.service.isStopping;
-
-    return SafeArea(
-      top: false,
-      bottom: true,
-      minimum: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-      child: SizedBox(
-        width: double.infinity,
-        height: 48,
-        child: FilledButton(
-          onPressed: isStopping ? null : _requestStopAcquisition,
-          child: Text(isStopping ? 'Stopping...' : 'Stop acquisition'),
-        ),
-      ),
-    );
-  }
-
-  String _formatChartTime(DateTime value) {
-    final local = value.toLocal();
-    final hour = local.hour.toString().padLeft(2, '0');
-    final minute = local.minute.toString().padLeft(2, '0');
-    final second = local.second.toString().padLeft(2, '0');
-    return '$hour:$minute:$second';
   }
 }
 
@@ -6598,6 +6577,19 @@ class _ReceptionDescription {
       _ReceptionLevel.unknown => colorScheme.outline,
     };
   }
+}
+
+/// Icon color of the time-alignment indicator.
+Color _timeAlignmentColor(
+  ImuTimeAlignmentState state,
+  ColorScheme colorScheme,
+) {
+  return switch (state) {
+    ImuTimeAlignmentState.waiting => colorScheme.outline,
+    ImuTimeAlignmentState.aligning => colorScheme.primary,
+    ImuTimeAlignmentState.aligned => Colors.green.shade600,
+    ImuTimeAlignmentState.uncertain => Colors.orange.shade700,
+  };
 }
 
 /// Green >= 99%, orange >= 95%, red below or when nothing arrived for
@@ -7124,99 +7116,17 @@ class _WearableMetricChartCard extends StatelessWidget {
   }
 }
 
-class WearableAcquisitionCompletedPage extends StatelessWidget {
-  const WearableAcquisitionCompletedPage({
-    super.key,
-    required this.csvLogger,
-  });
-
-  final WearableAcquisitionCsvLogger csvLogger;
-
-  Future<void> _downloadData(BuildContext context) async {
-    try {
-      await csvLogger.exportToDownloadsOrShare();
-      if (!context.mounted) {
-        return;
-      }
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('CSV file saved successfully')),
-      );
-    } catch (_) {
-      if (!context.mounted) {
-        return;
-      }
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not save CSV file')),
-      );
-    }
-  }
-
-  void _goHome(BuildContext context) {
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute<void>(
-        builder: (_) => const SectionPage(
-          sectionName: 'user',
-          message: 'Welcome to the user section!',
-        ),
-      ),
-      (_) => false,
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return PopScope(
-      canPop: false,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('Acquisition completed'),
-          automaticallyImplyLeading: false,
-        ),
-        body: SafeArea(
-          child: Center(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 360),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    FilledButton.icon(
-                      icon: const Icon(Icons.download),
-                      label: const Text('Download data'),
-                      onPressed: () => unawaited(_downloadData(context)),
-                    ),
-                    const SizedBox(height: 24),
-                    IconButton(
-                      icon: const Icon(Icons.home),
-                      iconSize: 40,
-                      onPressed: () => _goHome(context),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
+/// Settings of one environmental monitor of the multi-device acquisition: it
+/// only collects the configuration and hands it back, nothing is sent here.
 class DeviceConfigurationPage extends StatefulWidget {
   const DeviceConfigurationPage({
     super.key,
-    required this.device,
     this.initialConfiguration,
-    this.onConfigurationConfirmed,
+    required this.onConfigurationConfirmed,
   });
 
-  final BluetoothDevice device;
   final BleConfiguration? initialConfiguration;
-  final ValueChanged<BleConfiguration>? onConfigurationConfirmed;
+  final ValueChanged<BleConfiguration> onConfigurationConfirmed;
 
   @override
   State<DeviceConfigurationPage> createState() =>
@@ -7261,11 +7171,6 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
   ];
 
   int _samplingFrequencyIndex = 0;
-  bool _isContinuing = false;
-
-  bool get _isConfigurationOnly {
-    return widget.onConfigurationConfirmed != null;
-  }
 
   int get _selectedSamplingFrequency {
     return _samplingFrequencies[_samplingFrequencyIndex];
@@ -7314,52 +7219,18 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
     });
   }
 
-  void _openAcquisitionInitializationPage() {
-    if (_isContinuing) {
-      return;
-    }
-
-    final configuration = BleConfiguration(
-      enabledOptions: Map<String, bool>.from(_options),
-      samplingFrequencySeconds: _selectedSamplingFrequency,
-    );
-
-    if (_isConfigurationOnly) {
-      widget.onConfigurationConfirmed?.call(configuration);
-      Navigator.of(context).pop();
-      return;
-    }
-
-    setState(() {
-      _isContinuing = true;
-    });
-
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => AcquisitionInitializationPage(
-          device: widget.device,
-          configuration: configuration,
-        ),
+  void _confirmConfiguration() {
+    widget.onConfigurationConfirmed(
+      BleConfiguration(
+        enabledOptions: Map<String, bool>.from(_options),
+        samplingFrequencySeconds: _selectedSamplingFrequency,
       ),
-    ).whenComplete(() {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _isContinuing = false;
-      });
-    });
+    );
+    Navigator.of(context).pop();
   }
 
   @override
   Widget build(BuildContext context) {
-    final buttonText = _isConfigurationOnly
-        ? 'Confirm Configuration'
-        : _isContinuing
-            ? 'Opening...'
-            : 'Continue';
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('Device Configuration'),
@@ -7414,9 +7285,8 @@ class _DeviceConfigurationPageState extends State<DeviceConfigurationPage> {
               width: double.infinity,
               height: 52,
               child: FilledButton(
-                onPressed:
-                    _isContinuing ? null : _openAcquisitionInitializationPage,
-                child: Text(buttonText),
+                onPressed: _confirmConfiguration,
+                child: const Text('Confirm Configuration'),
               ),
             ),
           ),
@@ -7603,1152 +7473,6 @@ class _MeasurementChartSample {
 enum _LiveVisualizationMode {
   cards,
   charts,
-}
-
-class AcquisitionInitializationPage extends StatefulWidget {
-  const AcquisitionInitializationPage({
-    super.key,
-    required this.device,
-    required this.configuration,
-  });
-
-  final BluetoothDevice device;
-  final BleConfiguration configuration;
-
-  @override
-  State<AcquisitionInitializationPage> createState() =>
-      _AcquisitionInitializationPageState();
-}
-
-class _AcquisitionInitializationPageState
-    extends State<AcquisitionInitializationPage> with WidgetsBindingObserver {
-  bool _stopConfirmationOpen = false;
-  late BluetoothDevice _activeDevice;
-  late final String _deviceDisplayName;
-  late final BleConfigurationService _service;
-  late final OpenRemoteMqttService _mqttService;
-  late final AcquisitionCsvLogger _csvLogger;
-  late final GpsLocationService _gpsLocationService;
-  late final List<_MeasurementDefinition> _visibleMeasurements;
-  late final Map<String, _MeasurementDefinition> _visibleMeasurementsByPrefix;
-
-  final List<BleNotificationMessage> _messages = [];
-  final Map<String, _LiveMeasurementValue> _liveMeasurementValues = {};
-  final Map<String, List<_MeasurementChartSample>> _chartSamplesByPrefix = {};
-  StreamSubscription<BleNotificationMessage>? _messagesSubscription;
-  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
-  StreamSubscription<OpenRemoteMqttState>? _mqttStateSubscription;
-
-  bool _isInitializing = true;
-  bool _initializationStarted = false;
-  bool _acquisitionStarted = false;
-  bool _acquisitionStopped = false;
-  bool _isStoppingAcquisition = false;
-  String? _errorMessage;
-  bool _canRetry = false;
-  bool _requiresReconnect = false;
-  bool _foregroundServiceStarted = false;
-  bool _bleDisconnectedDuringActiveAcquisition = false;
-  int _bleDisconnectionAlertVersion = 0;
-  _BleReconnectStatus _bleReconnectStatus = _BleReconnectStatus.disconnected;
-  String? _bleReconnectFailureMessage;
-  final Set<String> _dismissedBleAlertKeys = {};
-  final ValueNotifier<int> _bleAlertRevision = ValueNotifier<int>(0);
-  late final _BleAutoReconnectCoordinator _bleAutoReconnectCoordinator;
-  Timer? _bleAlertBeepTimer;
-  BuildContext? _bleAlertDialogContext;
-  bool _bleAlertDialogOpen = false;
-  String? _backgroundStatusMessage;
-  _LiveVisualizationMode _visualizationMode = _LiveVisualizationMode.cards;
-  OpenRemoteMqttState _mqttState = const OpenRemoteMqttState(
-    status: OpenRemoteMqttStatus.disconnected,
-  );
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    _activeDevice = widget.device;
-    _deviceDisplayName = _deviceName(_activeDevice);
-    _service = BleConfigurationService(_activeDevice);
-    _mqttService = OpenRemoteMqttService();
-    _csvLogger = AcquisitionCsvLogger();
-    _gpsLocationService = GpsLocationService();
-    _bleAutoReconnectCoordinator = _BleAutoReconnectCoordinator(
-      runAutomaticCycle: _runSingleAutomaticBleReconnectCycle,
-      hasPendingWork: _hasSingleAutomaticBleReconnectWork,
-      canContinue: _canContinueSingleAutomaticBleReconnect,
-      onStateChanged: _handleSingleAutoReconnectStateChanged,
-    );
-    _visibleMeasurements = _measurementDefinitions
-        .where(
-          (definition) =>
-              widget.configuration.enabledOptions[definition.label] ?? false,
-        )
-        .toList(growable: false);
-    _visibleMeasurementsByPrefix = {
-      for (final definition in _visibleMeasurements)
-        definition.prefix: definition,
-    };
-    _messagesSubscription = _service.messages.listen((message) {
-      if (_acquisitionStopped) {
-        return;
-      }
-
-      if (mounted) {
-        setState(() {
-          _messages.add(message);
-          _updateLiveMeasurement(message);
-        });
-      } else {
-        _messages.add(message);
-        _updateLiveMeasurement(message);
-      }
-      if (_acquisitionStarted && _csvLogger.isStarted) {
-        unawaited(
-          _csvLogger.appendBleMessage(
-            receivedAt: message.receivedAt,
-            deviceName: _deviceDisplayName,
-            gpsCoordinates: _gpsLocationService.currentCoordinates,
-            value: message.value,
-          ),
-        );
-      }
-      unawaited(_publishPm10IfConnected(message.value));
-    });
-    _attachConnectionListener();
-    _mqttStateSubscription = _mqttService.states.listen((state) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _mqttState = state;
-      });
-
-      if (state.status == OpenRemoteMqttStatus.failed &&
-          state.message != null) {
-        _appendLog('OpenRemote: ${state.message}');
-      }
-    });
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _startInitialization();
-    });
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _syncSingleBleDisconnectionAlertDialog();
-      });
-      return;
-    }
-
-    _stopSingleBleAlertAlarm();
-  }
-
-  void _attachConnectionListener() {
-    unawaited(_connectionSubscription?.cancel());
-    _connectionSubscription = _service.connectionState.listen((state) {
-      if (_acquisitionStopped ||
-          _isStoppingAcquisition ||
-          state != BluetoothConnectionState.disconnected) {
-        return;
-      }
-
-      if (_acquisitionStarted) {
-        _markSingleBleDisconnectedDuringAcquisition();
-        return;
-      }
-
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _isInitializing = false;
-        _errorMessage = 'BLE device disconnected.';
-        _canRetry = true;
-        _requiresReconnect = true;
-      });
-      _initializationStarted = false;
-    });
-  }
-
-  void _markSingleBleDisconnectedDuringAcquisition() {
-    if (_isStoppingAcquisition || _acquisitionStopped) {
-      return;
-    }
-
-    if (_bleDisconnectedDuringActiveAcquisition &&
-        _bleReconnectStatus != _BleReconnectStatus.reconnected) {
-      return;
-    }
-
-    if (mounted) {
-      setState(() {
-        _isInitializing = false;
-        _bleDisconnectedDuringActiveAcquisition = true;
-        _bleDisconnectionAlertVersion += 1;
-        _bleReconnectStatus = _BleReconnectStatus.disconnected;
-        _bleReconnectFailureMessage = null;
-      });
-    } else {
-      _bleDisconnectedDuringActiveAcquisition = true;
-      _bleDisconnectionAlertVersion += 1;
-      _bleReconnectStatus = _BleReconnectStatus.disconnected;
-      _bleReconnectFailureMessage = null;
-    }
-    _notifySingleBleAlertChanged();
-    _initializationStarted = false;
-
-    unawaited(
-      AndroidAcquisitionForegroundService.showBleDisconnectionAlert(
-        _deviceDisplayName,
-      ),
-    );
-    _bleAutoReconnectCoordinator.start();
-
-    if (!_ActiveAcquisitionRuntime.isForegroundVisible) {
-      return;
-    }
-
-    _syncSingleBleDisconnectionAlertDialog();
-  }
-
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _bleAutoReconnectCoordinator.cancel(notify: false);
-    _stopSingleBleAlertAlarm();
-    _bleAlertRevision.dispose();
-    if (_acquisitionStarted && !_acquisitionStopped) {
-      super.dispose();
-      return;
-    }
-
-    unawaited(_messagesSubscription?.cancel());
-    unawaited(_connectionSubscription?.cancel());
-    unawaited(_mqttStateSubscription?.cancel());
-    if (!_acquisitionStarted || _acquisitionStopped) {
-      unawaited(_csvLogger.stop());
-      unawaited(_gpsLocationService.dispose());
-      unawaited(_mqttService.dispose());
-      unawaited(_service.dispose());
-      unawaited(AndroidAcquisitionForegroundService.stop());
-    }
-    super.dispose();
-  }
-
-  Future<void> _startInitialization() async {
-    if (_initializationStarted) {
-      return;
-    }
-
-    _initializationStarted = true;
-
-    if (mounted) {
-      setState(() {
-        _isInitializing = true;
-        _errorMessage = null;
-        _canRetry = false;
-        _requiresReconnect = false;
-        _bleDisconnectedDuringActiveAcquisition = false;
-        _bleReconnectStatus = _BleReconnectStatus.disconnected;
-        _bleReconnectFailureMessage = null;
-        if (!_acquisitionStarted) {
-          _messages.clear();
-          _liveMeasurementValues.clear();
-          _chartSamplesByPrefix.clear();
-        }
-      });
-    }
-
-    try {
-      await _service.initialize(widget.configuration);
-      if (!_csvLogger.isStarted) {
-        await _csvLogger.start();
-        await _gpsLocationService.start();
-        final gpsStatusMessage = _gpsLocationService.statusMessage;
-        if (gpsStatusMessage != null) {
-          _backgroundStatusMessage = _mergeStatusMessage(
-            _backgroundStatusMessage,
-            gpsStatusMessage,
-          );
-        }
-      }
-      _acquisitionStarted = true;
-      await _activateAndroidBackgroundSupport();
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _isInitializing = false;
-      });
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _isInitializing = false;
-        _errorMessage = error.toString();
-        _canRetry = error is BleConfigurationException && error.canRetry;
-        _requiresReconnect = false;
-      });
-      await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
-      await AndroidAcquisitionForegroundService.stop();
-    }
-  }
-
-  Future<void> _activateAndroidBackgroundSupport() async {
-    if (!Platform.isAndroid) {
-      return;
-    }
-
-    final notificationStatus = await Permission.notification.request();
-    if (!notificationStatus.isGranted) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        'Android background acquisition may be unreliable without the persistent notification.',
-      );
-    }
-
-    try {
-      await AndroidAcquisitionForegroundService.start();
-      _foregroundServiceStarted = true;
-    } catch (error) {
-      _backgroundStatusMessage = _mergeStatusMessage(
-        _backgroundStatusMessage,
-        'Android background acquisition may be unreliable: $error',
-      );
-    }
-
-    await _ActiveAcquisitionRuntime.markActive();
-    await AcquisitionRecoveryStore.saveActive(
-      acquisitionType: 'environmentalMonitor',
-      deviceNames: [_deviceDisplayName],
-      deviceTypes: [KnownDeviceType.environmentalMonitor.name],
-      configurationSummaries: [
-        _summarizeEnvironmentalConfiguration(widget.configuration),
-      ],
-      startedAt: DateTime.now(),
-      logicalRoute: 'acquisition',
-      status: 'running',
-      csvFileName: _csvLogger.fileName,
-      csvFilePath: _csvLogger.file?.path,
-    );
-  }
-
-  Future<void> _retryInitialization() async {
-    if (_isInitializing) {
-      return;
-    }
-
-    _initializationStarted = false;
-    await _startInitialization();
-  }
-
-  Future<void> _reconnectAndRestartInitialization() async {
-    if (_acquisitionStarted && _bleDisconnectedDuringActiveAcquisition) {
-      await _reconnectSingleEnvironmentalAfterDisconnection();
-      return;
-    }
-
-    if (_isInitializing) {
-      return;
-    }
-
-    if (mounted) {
-      setState(() {
-        _isInitializing = true;
-        _errorMessage = null;
-        _canRetry = false;
-      });
-    }
-
-    try {
-      await _activeDevice.connect(
-        license: License.nonprofit,
-        timeout: const Duration(seconds: 12),
-      );
-      _initializationStarted = false;
-      await _startInitialization();
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _isInitializing = false;
-        _errorMessage = 'Could not reconnect to $_deviceDisplayName: $error';
-        _canRetry = true;
-        _requiresReconnect = true;
-      });
-    }
-  }
-
-  Future<void> _reconnectSingleEnvironmentalAfterDisconnection() async {
-    if (!_canAttemptSingleBleReconnect()) {
-      return;
-    }
-
-    await _bleAutoReconnectCoordinator.requestImmediate(
-      operation: _runSingleBleReconnectAttempt,
-    );
-  }
-
-  Future<void> _runSingleAutomaticBleReconnectCycle() async {
-    if (!_canAttemptSingleBleReconnect()) {
-      return;
-    }
-
-    await _runSingleBleReconnectAttempt();
-  }
-
-  Future<void> _runSingleBleReconnectAttempt() async {
-    if (!_canAttemptSingleBleReconnect()) {
-      return;
-    }
-
-    setState(() {
-      _bleReconnectStatus = _BleReconnectStatus.reconnecting;
-      _bleReconnectFailureMessage = null;
-    });
-    _notifySingleBleAlertChanged();
-
-    try {
-      final reconnectedDevice = await _BleReconnectHelper.reconnect(
-        currentDevice: _activeDevice,
-        deviceId: _activeDevice.remoteId.toString(),
-        deviceName: _deviceDisplayName,
-      );
-      _activeDevice = reconnectedDevice;
-      if (!_canContinueSingleAutomaticBleReconnect()) {
-        return;
-      }
-      await _service.resumeNotificationsAfterReconnect(
-        reconnectedDevice: reconnectedDevice,
-      );
-      _attachConnectionListener();
-
-      if (!_canContinueSingleAutomaticBleReconnect()) {
-        return;
-      }
-
-      setState(() {
-        _bleDisconnectedDuringActiveAcquisition = false;
-        _bleReconnectStatus = _BleReconnectStatus.reconnected;
-        _bleReconnectFailureMessage = null;
-      });
-      _notifySingleBleAlertChanged();
-      unawaited(AndroidAcquisitionForegroundService.clearBleDisconnectionAlert());
-      _closeSingleBleAlertDialog(dismissCurrentDevice: false);
-    } catch (_) {
-      try {
-        await _activeDevice.disconnect();
-      } catch (_) {}
-
-      if (!_canContinueSingleAutomaticBleReconnect()) {
-        return;
-      }
-
-      setState(() {
-        _bleDisconnectedDuringActiveAcquisition = true;
-        _bleReconnectStatus = _BleReconnectStatus.failed;
-        _bleReconnectFailureMessage =
-            'Could not reconnect to $_deviceDisplayName. Move closer and try again.';
-      });
-      _notifySingleBleAlertChanged();
-    }
-  }
-
-  bool _hasSingleAutomaticBleReconnectWork() {
-    return _bleDisconnectedDuringActiveAcquisition &&
-        !_dismissedBleAlertKeys.contains(_singleBleAlertKey);
-  }
-
-  bool _canContinueSingleAutomaticBleReconnect() {
-    return mounted && !_isStoppingAcquisition && !_acquisitionStopped;
-  }
-
-  bool _canAttemptSingleBleReconnect() {
-    return _canContinueSingleAutomaticBleReconnect() &&
-        _acquisitionStarted &&
-        _bleDisconnectedDuringActiveAcquisition &&
-        !_dismissedBleAlertKeys.contains(_singleBleAlertKey) &&
-        _bleReconnectStatus != _BleReconnectStatus.reconnecting &&
-        _bleReconnectStatus != _BleReconnectStatus.reconnected;
-  }
-
-  void _handleSingleAutoReconnectStateChanged() {
-    _notifySingleBleAlertChanged();
-    if (mounted) {
-      setState(() {});
-    }
-  }
-
-  void _syncSingleBleDisconnectionAlertDialog() {
-    if (!mounted || !Platform.isAndroid) {
-      return;
-    }
-
-    if (_bleAlertDialogOpen) {
-      if (!_bleDisconnectedDuringActiveAcquisition) {
-        _closeSingleBleAlertDialog(dismissCurrentDevice: false);
-      }
-      return;
-    }
-
-    if (!_ActiveAcquisitionRuntime.isForegroundVisible ||
-        !_bleDisconnectedDuringActiveAcquisition ||
-        _dismissedBleAlertKeys.contains(_singleBleAlertKey)) {
-      return;
-    }
-
-    _showSingleBleAlertDialog();
-  }
-
-  void _showSingleBleAlertDialog() {
-    if (_bleAlertDialogOpen || !mounted) {
-      return;
-    }
-
-    _bleAlertDialogOpen = true;
-    _startSingleBleAlertAlarm();
-    unawaited(
-      showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (dialogContext) {
-          _bleAlertDialogContext = dialogContext;
-          return ValueListenableBuilder<int>(
-            valueListenable: _bleAlertRevision,
-            builder: (_, _, _) {
-              return _BleDisconnectionAlertDialog(
-                items: [_singleBleAlertItem],
-                onClose: () {
-                  _closeSingleBleAlertDialog(dismissCurrentDevice: true);
-                },
-              );
-            },
-          );
-        },
-      ).whenComplete(() {
-        _bleAlertDialogOpen = false;
-        _bleAlertDialogContext = null;
-        _stopSingleBleAlertAlarm();
-        if (mounted) {
-          setState(() {});
-        }
-      }),
-    );
-  }
-
-  _BleDisconnectionAlertItem get _singleBleAlertItem {
-    return _BleDisconnectionAlertItem(
-      id: _activeDevice.remoteId.toString(),
-      deviceName: _deviceDisplayName,
-      status: _bleReconnectStatus,
-      reconnectEnabled: !_bleAutoReconnectCoordinator.isOperationInProgress &&
-          !_isStoppingAcquisition &&
-          !_acquisitionStopped,
-      failureMessage: _bleReconnectFailureMessage,
-      onReconnect: () {
-        unawaited(_reconnectSingleEnvironmentalAfterDisconnection());
-      },
-    );
-  }
-
-  void _closeSingleBleAlertDialog({required bool dismissCurrentDevice}) {
-    if (dismissCurrentDevice && _bleDisconnectedDuringActiveAcquisition) {
-      _dismissedBleAlertKeys.add(_singleBleAlertKey);
-      _bleAutoReconnectCoordinator.cancel();
-    }
-
-    _stopSingleBleAlertAlarm();
-    final dialogContext = _bleAlertDialogContext;
-    _bleAlertDialogContext = null;
-    if (dialogContext != null) {
-      Navigator.of(dialogContext).pop();
-    }
-  }
-
-  void _startSingleBleAlertAlarm() {
-    _stopSingleBleAlertAlarm();
-    _playSingleBleAlertCue();
-    _bleAlertBeepTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      _playSingleBleAlertCue();
-    });
-  }
-
-  void _stopSingleBleAlertAlarm() {
-    _bleAlertBeepTimer?.cancel();
-    _bleAlertBeepTimer = null;
-  }
-
-  void _playSingleBleAlertCue() {
-    if (!Platform.isAndroid) {
-      return;
-    }
-
-    // Vibration only, no sound.
-    unawaited(AndroidAcquisitionForegroundService.vibrateBleDisconnectionAlert());
-    unawaited(HapticFeedback.vibrate().catchError((_) {}));
-  }
-
-  void _notifySingleBleAlertChanged() {
-    _bleAlertRevision.value += 1;
-  }
-
-  String get _singleBleAlertKey {
-    return '${_activeDevice.remoteId}:$_bleDisconnectionAlertVersion';
-  }
-
-  Future<void> _connectOpenRemote() async {
-    if (_mqttState.status == OpenRemoteMqttStatus.connecting ||
-        _mqttState.status == OpenRemoteMqttStatus.connected) {
-      return;
-    }
-
-    // Preserve the legacy target explicitly; device mapping belongs to the
-    // current multi-device session manager only.
-    await _mqttService.connect(assetId: '1zKVSJ8J0enUWtWRBY4bul');
-  }
-
-  Future<void> _publishPm10IfConnected(String bleValue) async {
-    if (!_mqttService.isConnected) {
-      return;
-    }
-
-    final pm10 = parsePm10Value(bleValue);
-    if (pm10 == null) {
-      return;
-    }
-
-    final sent = await _mqttService.publishPm10(pm10);
-    if (!sent || !mounted) {
-      return;
-    }
-
-    _appendLog('MQTT sent — PM10: ${_formatPm10(pm10)}');
-  }
-
-  void _updateLiveMeasurement(BleNotificationMessage message) {
-    final separatorIndex = message.value.indexOf(':');
-    if (separatorIndex <= 0) {
-      return;
-    }
-
-    final prefix = message.value.substring(0, separatorIndex);
-    final definition = _visibleMeasurementsByPrefix[prefix];
-    if (definition == null) {
-      return;
-    }
-
-    final rawValue = message.value.substring(separatorIndex + 1);
-    final parsedValue = double.tryParse(rawValue);
-    if (parsedValue == null) {
-      return;
-    }
-
-    final previous = _liveMeasurementValues[definition.prefix];
-    _liveMeasurementValues[definition.prefix] = _LiveMeasurementValue(
-      formattedValue: parsedValue.toStringAsFixed(1),
-      updatedAt: message.receivedAt,
-      updateCount: (previous?.updateCount ?? 0) + 1,
-    );
-
-    final samples = _chartSamplesByPrefix.putIfAbsent(
-      definition.prefix,
-      () => [],
-    );
-    samples.add(
-      _MeasurementChartSample(
-        receivedAt: message.receivedAt,
-        value: parsedValue,
-      ),
-    );
-    if (samples.length > 100) {
-      samples.removeRange(0, samples.length - 100);
-    }
-  }
-
-  void _appendLog(String value) {
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      _messages.add(
-        BleNotificationMessage(
-          receivedAt: DateTime.now(),
-          value: value,
-        ),
-      );
-    });
-  }
-
-  String _formatPm10(double value) {
-    if (value == value.truncateToDouble()) {
-      return value.toInt().toString();
-    }
-
-    return value.toString();
-  }
-
-  String _formatDashboardTime(DateTime value) {
-    final local = value.toLocal();
-    final hour = local.hour.toString().padLeft(2, '0');
-    final minute = local.minute.toString().padLeft(2, '0');
-    final second = local.second.toString().padLeft(2, '0');
-    return '$hour:$minute:$second';
-  }
-
-  String _deviceName(BluetoothDevice device) {
-    final platformName = device.platformName.trim();
-    return platformName.isEmpty ? 'Unknown device' : platformName;
-  }
-
-  Future<void> _requestStopAcquisition() async {
-    if (!mounted ||
-        _stopConfirmationOpen ||
-        _isStoppingAcquisition ||
-        _acquisitionStopped) {
-      return;
-    }
-
-    _stopConfirmationOpen = true;
-    final bool confirmed;
-    try {
-      confirmed = await _confirmStopAcquisition(context);
-    } finally {
-      _stopConfirmationOpen = false;
-    }
-    if (!mounted || !confirmed) {
-      return;
-    }
-    await _stopAcquisition();
-  }
-
-  Future<void> _stopAcquisition() async {
-    if (_isStoppingAcquisition || _acquisitionStopped) {
-      return;
-    }
-
-    _bleAutoReconnectCoordinator.cancel();
-    setState(() {
-      _isStoppingAcquisition = true;
-      _acquisitionStopped = true;
-    });
-
-    try {
-      await _messagesSubscription?.cancel();
-      _messagesSubscription = null;
-      await _csvLogger.stop();
-      await _gpsLocationService.stop();
-      await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
-      await AndroidAcquisitionForegroundService.stop();
-      await AcquisitionRecoveryStore.clear();
-      await _ActiveAcquisitionRuntime.markInactive();
-
-      if (!mounted) {
-        return;
-      }
-
-      await Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => AcquisitionCompletedPage(csvLogger: _csvLogger),
-        ),
-      );
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _acquisitionStopped = false;
-        _isStoppingAcquisition = false;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not stop acquisition')),
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final title = _isInitializing || (_errorMessage != null && !_acquisitionStarted)
-        ? 'Acquisition Initialization'
-        : 'Acquisition in progress...';
-
-    return PopScope(
-      canPop: !_isInitializing,
-      child: AbsorbPointer(
-        absorbing: _isInitializing,
-        child: Scaffold(
-          backgroundColor: Colors.white,
-          appBar: AppBar(
-            backgroundColor: Colors.white,
-            title: Text(title),
-          ),
-          body: SafeArea(
-            child: _buildBody(context),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildBody(BuildContext context) {
-    if (_isInitializing) {
-      return const Center(
-        child: CircularProgressIndicator(),
-      );
-    }
-
-    if (_errorMessage != null && !_acquisitionStarted) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                _errorMessage!,
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
-              ),
-              if (_canRetry) ...[
-                const SizedBox(height: 16),
-                FilledButton(
-                  onPressed: _requiresReconnect
-                      ? _reconnectAndRestartInitialization
-                      : _retryInitialization,
-                  child: Text(_requiresReconnect ? 'Reconnect' : 'Retry'),
-                ),
-              ],
-            ],
-          ),
-        ),
-      );
-    }
-
-    return Column(
-      children: [
-        _buildVisualizationModeSelector(),
-        if (_bleDisconnectedDuringActiveAcquisition)
-          _buildSingleBleDisconnectedBanner(),
-        _buildBackgroundStatus(),
-        Expanded(
-          child: _buildLiveVisualization(),
-        ),
-        _buildStopAcquisitionButton(),
-        _buildOpenRemoteBanner(context),
-      ],
-    );
-  }
-
-  Widget _buildSingleBleDisconnectedBanner() {
-    final colorScheme = Theme.of(context).colorScheme;
-    final message = _bleReconnectFailureMessage ?? _bleReconnectStatus.label;
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: colorScheme.errorContainer,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          child: Row(
-            children: [
-              Icon(
-                Icons.warning_amber_rounded,
-                color: colorScheme.onErrorContainer,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  message,
-                  style: TextStyle(color: colorScheme.onErrorContainer),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildBackgroundStatus() {
-    if (!Platform.isAndroid) {
-      return const SizedBox.shrink();
-    }
-
-    final warning = _backgroundStatusMessage;
-    final colorScheme = Theme.of(context).colorScheme;
-    final backgroundColor = warning == null
-        ? Colors.green.shade50
-        : colorScheme.errorContainer;
-    final foregroundColor = warning == null
-        ? Colors.green.shade900
-        : colorScheme.onErrorContainer;
-    final text = warning ??
-        (_foregroundServiceStarted
-            ? 'Background acquisition active'
-            : 'Background acquisition starting');
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: backgroundColor,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: Row(
-            children: [
-              Icon(
-                warning == null
-                    ? Icons.notifications_active
-                    : Icons.warning_amber_rounded,
-                size: 18,
-                color: foregroundColor,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  text,
-                  style: TextStyle(color: foregroundColor),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildVisualizationModeSelector() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-      child: Align(
-        alignment: Alignment.centerRight,
-        child: SegmentedButton<_LiveVisualizationMode>(
-          showSelectedIcon: false,
-          segments: const [
-            ButtonSegment<_LiveVisualizationMode>(
-              value: _LiveVisualizationMode.cards,
-              icon: _CardsModeIcon(),
-              tooltip: 'Measurement cards',
-            ),
-            ButtonSegment<_LiveVisualizationMode>(
-              value: _LiveVisualizationMode.charts,
-              icon: _ChartModeIcon(),
-              tooltip: 'Line charts',
-            ),
-          ],
-          selected: {_visualizationMode},
-          onSelectionChanged: (selection) {
-            setState(() {
-              _visualizationMode = selection.first;
-            });
-          },
-        ),
-      ),
-    );
-  }
-
-  Widget _buildLiveVisualization() {
-    return switch (_visualizationMode) {
-      _LiveVisualizationMode.cards => _buildLiveMeasurementsGrid(),
-      _LiveVisualizationMode.charts => _buildLiveMeasurementsCharts(),
-    };
-  }
-
-  Widget _buildStopAcquisitionButton() {
-    return SafeArea(
-      top: false,
-      bottom: false,
-      minimum: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-      child: SizedBox(
-        width: double.infinity,
-        height: 48,
-        child: FilledButton(
-          onPressed: _isStoppingAcquisition ? null : _requestStopAcquisition,
-          child: Text(
-            _isStoppingAcquisition ? 'Stopping...' : 'Stop acquisition',
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildLiveMeasurementsGrid() {
-    if (_visibleMeasurements.isEmpty) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.all(24),
-          child: Text(
-            'No measurements selected.',
-            textAlign: TextAlign.center,
-          ),
-        ),
-      );
-    }
-
-    return GridView.builder(
-      padding: const EdgeInsets.all(16),
-      itemCount: _visibleMeasurements.length,
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 2,
-        crossAxisSpacing: 12,
-        mainAxisSpacing: 12,
-        childAspectRatio: 0.9,
-      ),
-      itemBuilder: (context, index) {
-        final definition = _visibleMeasurements[index];
-        final value = _liveMeasurementValues[definition.prefix];
-
-        return _LiveMeasurementCard(
-          definition: definition,
-          value: value,
-          updatedAtText: value == null
-              ? 'No data received yet'
-              : _formatDashboardTime(value.updatedAt),
-        );
-      },
-    );
-  }
-
-  Widget _buildLiveMeasurementsCharts() {
-    if (_visibleMeasurements.isEmpty) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.all(24),
-          child: Text(
-            'No measurements selected.',
-            textAlign: TextAlign.center,
-          ),
-        ),
-      );
-    }
-
-    return ListView.separated(
-      padding: const EdgeInsets.all(16),
-      itemCount: _visibleMeasurements.length,
-      separatorBuilder: (_, _) => const SizedBox(height: 12),
-      itemBuilder: (context, index) {
-        final definition = _visibleMeasurements[index];
-        final samples = _chartSamplesByPrefix[definition.prefix] ?? const [];
-        final value = _liveMeasurementValues[definition.prefix];
-
-        return _LiveMeasurementChartCard(
-          definition: definition,
-          samples: samples,
-          currentValue: value,
-          formatTime: _formatDashboardTime,
-        );
-      },
-    );
-  }
-
-  Widget _buildOpenRemoteBanner(BuildContext context) {
-    final status = _mqttState.status;
-    final canTap = status == OpenRemoteMqttStatus.disconnected ||
-        status == OpenRemoteMqttStatus.failed;
-    final colorScheme = Theme.of(context).colorScheme;
-
-    final text = switch (status) {
-      OpenRemoteMqttStatus.connecting => 'Connecting to OpenRemote...',
-      OpenRemoteMqttStatus.connected => 'Connected to OpenRemote',
-      OpenRemoteMqttStatus.failed => 'Connection failed — Tap to retry',
-      OpenRemoteMqttStatus.disconnected => 'Connect to OpenRemote',
-    };
-
-    final backgroundColor = switch (status) {
-      OpenRemoteMqttStatus.connected => Colors.green.shade50,
-      OpenRemoteMqttStatus.failed => colorScheme.errorContainer,
-      OpenRemoteMqttStatus.connecting => colorScheme.secondaryContainer,
-      OpenRemoteMqttStatus.disconnected => colorScheme.surfaceContainerHighest,
-    };
-
-    final foregroundColor = switch (status) {
-      OpenRemoteMqttStatus.connected => Colors.green.shade900,
-      OpenRemoteMqttStatus.failed => colorScheme.onErrorContainer,
-      OpenRemoteMqttStatus.connecting => colorScheme.onSecondaryContainer,
-      OpenRemoteMqttStatus.disconnected => colorScheme.onSurfaceVariant,
-    };
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-      child: Material(
-        color: backgroundColor,
-        borderRadius: BorderRadius.circular(8),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(8),
-          onTap: canTap ? _connectOpenRemote : null,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            child: Row(
-              children: [
-                Image.asset(
-                  'assets/images/openremote_logo.png',
-                  width: 36,
-                  height: 36,
-                  fit: BoxFit.contain,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        text,
-                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                              color: foregroundColor,
-                            ),
-                      ),
-                      if (status == OpenRemoteMqttStatus.failed &&
-                          _mqttState.message != null) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          _mqttState.message!,
-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                color: foregroundColor,
-                              ),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-                if (status == OpenRemoteMqttStatus.connecting)
-                  SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: foregroundColor,
-                    ),
-                  )
-                else if (status == OpenRemoteMqttStatus.connected)
-                  Icon(Icons.check_circle, color: foregroundColor)
-                else
-                  Icon(Icons.chevron_right, color: foregroundColor),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
 }
 
 class _LiveMeasurementCard extends StatelessWidget {
@@ -9288,87 +8012,5 @@ class _ChartModeIconPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _ChartModeIconPainter oldDelegate) {
     return oldDelegate.color != color;
-  }
-}
-
-class AcquisitionCompletedPage extends StatelessWidget {
-  const AcquisitionCompletedPage({
-    super.key,
-    required this.csvLogger,
-  });
-
-  final AcquisitionCsvLogger csvLogger;
-
-  Future<void> _downloadData(BuildContext context) async {
-    try {
-      await csvLogger.exportToDownloadsOrShare();
-      if (!context.mounted) {
-        return;
-      }
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('CSV file saved successfully')),
-      );
-    } catch (_) {
-      if (!context.mounted) {
-        return;
-      }
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not save CSV file')),
-      );
-    }
-  }
-
-  void _goHome(BuildContext context) {
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute<void>(
-        builder: (_) => const SectionPage(
-          sectionName: 'user',
-          message: 'Welcome to the user section!',
-        ),
-      ),
-      (_) => false,
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return PopScope(
-      canPop: false,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('Acquisition completed'),
-          automaticallyImplyLeading: false,
-        ),
-        body: SafeArea(
-          child: Center(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 360),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    FilledButton.icon(
-                      icon: const Icon(Icons.download),
-                      label: const Text('Download data'),
-                      onPressed: () => unawaited(_downloadData(context)),
-                    ),
-                    const SizedBox(height: 24),
-                    IconButton(
-                      icon: const Icon(Icons.home),
-                      iconSize: 40,
-                      onPressed: () => _goHome(context),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
   }
 }

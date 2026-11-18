@@ -22,6 +22,10 @@ object LaresBleAlertNotifications {
     // IMU connected but silent.
     private const val NO_DATA_NOTIFICATION_ID = 4207
     private const val NO_DATA_TITLE = "No IMU data"
+    // SD card problems of the IMUs (stuck, failing or without a file),
+    // shown until the stop.
+    private const val SD_NOTIFICATION_ID = 4208
+    private const val SD_TITLE = "SD card problem"
     // Blue of the LaRes logo.
     private const val NOTIFICATION_COLOR = 0xFF013988.toInt()
     private val VIBRATION_PATTERN = longArrayOf(0, 350, 180, 350)
@@ -74,6 +78,33 @@ object LaresBleAlertNotifications {
             val notificationManager =
                 context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             notificationManager.cancel(NO_DATA_NOTIFICATION_ID)
+        } catch (_: Exception) {
+            // Best effort only.
+        }
+    }
+
+    // SD card of an IMU not saving: its data are only in the app.
+    fun showSd(context: Context, text: String, alert: Boolean) {
+        try {
+            if (!canPostNotifications(context)) {
+                return
+            }
+
+            createChannel(context)
+            val notification = buildAlertNotification(context, SD_TITLE, text, !alert)
+            val notificationManager =
+                context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.notify(SD_NOTIFICATION_ID, notification)
+        } catch (_: Exception) {
+            // Acquisition must continue even if the alert notification fails.
+        }
+    }
+
+    fun clearSd(context: Context) {
+        try {
+            val notificationManager =
+                context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.cancel(SD_NOTIFICATION_ID)
         } catch (_: Exception) {
             // Best effort only.
         }

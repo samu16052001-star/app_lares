@@ -2,10 +2,13 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:app_lares/polar_h10/polar_h10_models.dart';
+import 'package:app_lares/services/acquisition_event_log.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:share_plus/share_plus.dart';
 
 class UnifiedAcquisitionCsvLogger {
+  UnifiedAcquisitionCsvLogger({this.eventLog});
+
   static final RegExp _counterPattern = RegExp(r'^\d+$');
   static const List<_CsvSensorField> _sensorFields = [
     _CsvSensorField(prefix: 'CO2', label: 'CO2', unit: 'ppm'),
@@ -70,6 +73,10 @@ class UnifiedAcquisitionCsvLogger {
   final Map<String, _EnvironmentalV2ClusterState> _environmentalV2Clusters =
       {};
 
+  /// Companion log of the connection events (Acquisition_events_*.csv),
+  /// created, closed and exported together with the data file.
+  final AcquisitionEventLog? eventLog;
+
   String? get fileName => _fileName;
 
   File? get file => _file;
@@ -79,8 +86,15 @@ class UnifiedAcquisitionCsvLogger {
   bool get isStopped => _isStopped;
 
   Future<void> start() async {
-    if (_isStarted) {
+    // A new file is created also after a stop (initialization
+    // failed and started again from the same scan page). Before, start() did
+    // nothing the second time and the new attempt wrote no data.
+    if (_isStarted && !_isStopped) {
       return;
+    }
+    final previousStop = _stopFuture;
+    if (previousStop != null) {
+      await previousStop;
     }
 
     final now = DateTime.now();
@@ -101,6 +115,20 @@ class UnifiedAcquisitionCsvLogger {
     _stopFuture = null;
     _environmentalClusters.clear();
     _environmentalV2Clusters.clear();
+
+    final eventLog = this.eventLog;
+    if (eventLog != null) {
+      try {
+        await eventLog.open(
+          File(
+            '${Directory.systemTemp.path}${Platform.pathSeparator}'
+            '${AcquisitionEventLog.fileNameFor(_fileName!)}',
+          ),
+        );
+      } catch (_) {
+        // The event log must never block the acquisition.
+      }
+    }
   }
 
   Future<void> appendEnvironmentalMessage({
@@ -182,6 +210,7 @@ class UnifiedAcquisitionCsvLogger {
     required String deviceName,
     required String gpsCoordinates,
     required List<WearableAgmSample> samples,
+    List<DateTime>? phoneTimes,
   }) {
     return _enqueue(() async {
       final sink = _sink;
@@ -193,7 +222,7 @@ class UnifiedAcquisitionCsvLogger {
         [
           _escapeCsvField(_formatWearableTimestamp(receivedAt)),
           _escapeCsvField(deviceName),
-          _escapeCsvField(_formatWearableDataReceived(samples)),
+          _escapeCsvField(_formatWearableDataReceived(samples, phoneTimes)),
           _escapeCsvField(gpsCoordinates),
         ].join(';'),
       );
@@ -315,6 +344,9 @@ class UnifiedAcquisitionCsvLogger {
         await sink.flush();
         await sink.close();
       }
+      try {
+        await eventLog?.close();
+      } catch (_) {}
     });
     _stopFuture = stopFuture;
     return stopFuture;
@@ -331,13 +363,30 @@ class UnifiedAcquisitionCsvLogger {
       );
     }
 
+    // The event log goes with the data.
+    final eventsFile = eventLog?.file;
+    final File? exportedEventsFile =
+        eventsFile != null && await eventsFile.exists() ? eventsFile : null;
+    final eventsFileName = AcquisitionEventLog.fileNameFor(fileName);
+
     if (Platform.isAndroid && await _copyToAndroidDownloads(file, fileName)) {
+      if (exportedEventsFile != null) {
+        await _copyToAndroidDownloads(exportedEventsFile, eventsFileName);
+      }
       return;
     }
 
     await SharePlus.instance.share(
       ShareParams(
-        files: [XFile(file.path, mimeType: 'text/csv', name: fileName)],
+        files: [
+          XFile(file.path, mimeType: 'text/csv', name: fileName),
+          if (exportedEventsFile != null)
+            XFile(
+              exportedEventsFile.path,
+              mimeType: 'text/csv',
+              name: eventsFileName,
+            ),
+        ],
         subject: fileName,
       ),
     );
@@ -473,12 +522,25 @@ class UnifiedAcquisitionCsvLogger {
     }).join(',');
   }
 
-  String _formatWearableDataReceived(List<WearableAgmSample> samples) {
-    return samples.map(_formatWearableSample).join(' - ');
-  }
-
-  String _formatWearableSample(WearableAgmSample sample) {
-    return formatWearableSampleForCsv(sample);
+  /// Samples of one notification; with [phoneTimes] (time alignment) every
+  /// sample also gets tp = its phone time, in the format of the TIMESTAMP
+  /// column.
+  String _formatWearableDataReceived(
+    List<WearableAgmSample> samples,
+    List<DateTime>? phoneTimes,
+  ) {
+    final times =
+        phoneTimes != null && phoneTimes.length == samples.length
+            ? phoneTimes
+            : null;
+    return [
+      for (var index = 0; index < samples.length; index++)
+        formatWearableSampleForCsv(
+          samples[index],
+          phoneTime:
+              times == null ? null : _formatWearableTimestamp(times[index]),
+        ),
+    ].join(' - ');
   }
 
   String _polarDeviceName(String deviceName) {

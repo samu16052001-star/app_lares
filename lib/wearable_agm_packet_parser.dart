@@ -422,11 +422,17 @@ class WearableImdPacketParser {
 }
 
 /// Text of one IMU sample in the acquisition CSV files:
-/// `t=<ms> ms, acc=(x, y, z) g, gyr=(x, y, z) dps, mag=(x, y, z) uT`.
-/// Only the sensors present in the sample are written.
-String formatWearableSampleForCsv(WearableAgmSample sample) {
+/// `t=<ms> ms, tp=<phone time>, acc=(x, y, z) g, gyr=(x, y, z) dps, ...`
+/// with `mag=(x, y, z) uT` at the end. t = sensor time (IMU clock); tp =
+/// phone time from the time alignment, written only when [phoneTime] is
+/// given. Only the sensors present in the sample are written.
+String formatWearableSampleForCsv(
+  WearableAgmSample sample, {
+  String? phoneTime,
+}) {
   return [
     't=${sample.timestampMs} ms',
+    if (phoneTime != null) 'tp=$phoneTime',
     if (sample.hasAccelerometer)
       'acc=(${sample.accX.toStringAsFixed(3)}, '
           '${sample.accY.toStringAsFixed(3)}, '
