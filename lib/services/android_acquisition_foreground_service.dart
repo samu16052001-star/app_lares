@@ -9,6 +9,18 @@ class AndroidAcquisitionForegroundService {
     'app_lares/acquisition_foreground_service',
   );
 
+  static void setActivityAttachedHandler(Future<void> Function() handler) {
+    if (!Platform.isAndroid) return;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'acquisitionActivityAttached') await handler();
+    });
+  }
+
+  static Future<bool> isActivityAttached() async {
+    if (!Platform.isAndroid) return true;
+    return await _channel.invokeMethod<bool>('isActivityAttached') ?? false;
+  }
+
   static Future<void> start() async {
     if (!Platform.isAndroid) {
       return;

@@ -383,6 +383,51 @@ class WearableConfigurationBleService {
     }
   }
 
+  /// Acquisition recovered after Android restarted the app process: this
+  /// service is new, while the IMU has probably gone on recording (its link
+  /// dropped when the process died). The saved configuration is taken as
+  /// already sent, then the IMU is asked STATUS like after any reconnection
+  /// ([_restartAcquisitionIfImuRebooted]): still recording, the data simply
+  /// go on (same SD file, no CONFIG, no calibration); switched off and on in
+  /// the meantime, the same CONFIG and a new START without calibration.
+  Future<void> recoverAfterProcessRestart({
+    required int odr,
+    required int mag,
+    required int accG,
+    required int gyrDPS,
+  }) async {
+    if (_isDisposed) {
+      throw StateError('Wearable BLE service is disposed.');
+    }
+
+    await initialize();
+    if (!isReadyToContinue) {
+      throw StateError('Wearable BLE setup is not complete.');
+    }
+
+    _calibrationEnabled = false;
+    _magCalibrationEnabled = false;
+    // INIT_DONE was delivered before the restart: the safety net of the IMU
+    // is already active.
+    _holdSafetyNet = false;
+    _initDonePending = false;
+    _magRequested = mag == 1;
+    _magStatus = null;
+    _magConfigRetries = 0;
+    _configuredSensorMask = WearableSensorMask.fromConfiguration(
+      mag: mag,
+      accG: accG,
+      gyrDPS: gyrDPS,
+    );
+    _configuredOdr = odr;
+    _lastConfigCommand = 'CONFIG:$odr,$mag,$accG,$gyrDPS';
+    _linkConnected = true;
+    _noDataWatchdogArmedAt = DateTime.now();
+    _setSequenceState(WearableBleSequenceState.streaming);
+    _log('Acquisition recovered after an app restart: asking STATUS.');
+    await _restartAcquisitionIfImuRebooted();
+  }
+
   Future<void> stopAcquisition() async {
     if (_isDisposed || isStopping || isStopped) {
       return;

@@ -6,6 +6,8 @@ import 'package:app_lares/services/acquisition_event_log.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
 import 'package:share_plus/share_plus.dart';
 
+import 'acquisition_csv_file.dart';
+
 class UnifiedAcquisitionCsvLogger {
   UnifiedAcquisitionCsvLogger({this.eventLog});
 
@@ -64,6 +66,8 @@ class UnifiedAcquisitionCsvLogger {
 
   File? _file;
   IOSink? _sink;
+  AcquisitionCsvFile? _output;
+  Future<void>? _startFuture;
   String? _fileName;
   bool _isStarted = false;
   bool _isStopped = false;
@@ -85,10 +89,40 @@ class UnifiedAcquisitionCsvLogger {
 
   bool get isStopped => _isStopped;
 
-  Future<void> start() async {
-    // A new file is created also after a stop (initialization
-    // failed and started again from the same scan page). Before, start() did
-    // nothing the second time and the new attempt wrote no data.
+  /// Opens the data file. [existingFilePath] (Android): acquisition recovered
+  /// after the app process was restarted, the rows go on in the same file.
+  /// Calls while a start is in progress or done share it; after [stop] a new
+  /// start creates a new file (initialization failed and started again from
+  /// the same scan page).
+  Future<void> start({
+    String? existingFilePath,
+    String? existingFileName,
+    DateTime? startedAt,
+    String? sessionId,
+  }) {
+    final pending = _startFuture;
+    if (pending != null) return pending;
+    final operation = _start(
+      existingFilePath: existingFilePath,
+      existingFileName: existingFileName,
+      startedAt: startedAt,
+      sessionId: sessionId,
+    );
+    _startFuture = operation;
+    return operation.catchError((Object error, StackTrace stackTrace) {
+      _startFuture = null;
+      Error.throwWithStackTrace(error, stackTrace);
+    });
+  }
+
+  Future<void> _start({
+    String? existingFilePath,
+    String? existingFileName,
+    DateTime? startedAt,
+    String? sessionId,
+  }) async {
+    // Before, start() did nothing the second time and the new attempt wrote
+    // no data.
     if (_isStarted && !_isStopped) {
       return;
     }
@@ -97,33 +131,36 @@ class UnifiedAcquisitionCsvLogger {
       await previousStop;
     }
 
-    final now = DateTime.now();
-    _fileName = 'Acquisition_data_${_formatFileTimestamp(now)}.csv';
-    final path =
-        '${Directory.systemTemp.path}${Platform.pathSeparator}$_fileName';
-    final file = File(path);
+    final now = Platform.isAndroid ? startedAt ?? DateTime.now() : DateTime.now();
+    _fileName = Platform.isAndroid && existingFilePath != null
+        ? existingFileName ?? File(existingFilePath).uri.pathSegments.last
+        : 'Acquisition_data_${_formatFileTimestamp(now)}.csv';
+    final output = await AcquisitionCsvFile.open(
+      fileName: _fileName!,
+      existingFilePath: Platform.isAndroid ? existingFilePath : null,
+      sessionId: sessionId,
+    );
 
-    await file.create(recursive: true);
-    final sink = file.openWrite(mode: FileMode.writeOnly);
-    sink.writeln('TIMESTAMP;DEVICE_NAME;DATA_RECEIVED;GPS_COORDINATES');
-    await sink.flush();
-
-    _file = file;
-    _sink = sink;
+    _output = output;
+    _file = output.file;
+    _sink = output.sink;
     _isStarted = true;
     _isStopped = false;
     _stopFuture = null;
     _environmentalClusters.clear();
     _environmentalV2Clusters.clear();
 
+    // Event log next to the data file. After a recovery it goes on in the
+    // same file (the events before the restart are kept).
     final eventLog = this.eventLog;
     if (eventLog != null) {
       try {
         await eventLog.open(
           File(
-            '${Directory.systemTemp.path}${Platform.pathSeparator}'
+            '${output.file.parent.path}${Platform.pathSeparator}'
             '${AcquisitionEventLog.fileNameFor(_fileName!)}',
           ),
+          append: Platform.isAndroid && existingFilePath != null,
         );
       } catch (_) {
         // The event log must never block the acquisition.
@@ -133,6 +170,7 @@ class UnifiedAcquisitionCsvLogger {
 
   Future<void> appendEnvironmentalMessage({
     required DateTime receivedAt,
+    String? deviceId,
     required String deviceName,
     required String gpsCoordinates,
     required String value,
@@ -150,16 +188,20 @@ class UnifiedAcquisitionCsvLogger {
           _handleCounter(
             counter,
             receivedAt,
+            Platform.isAndroid ? deviceId ?? deviceName : deviceName,
             deviceName,
             gpsCoordinates,
             sink,
           );
-          await sink.flush();
+          await _output!.flush();
         }
         return;
       }
 
-      _handleDataMessage(deviceName, trimmedValue);
+      _handleDataMessage(
+        Platform.isAndroid ? deviceId ?? deviceName : deviceName,
+        trimmedValue,
+      );
     });
   }
 
@@ -200,7 +242,7 @@ class UnifiedAcquisitionCsvLogger {
       cluster.values[messageType] = value;
 
       if (closesCurrentRow) {
-        await sink.flush();
+        await _output!.flush();
       }
     });
   }
@@ -226,7 +268,7 @@ class UnifiedAcquisitionCsvLogger {
           _escapeCsvField(gpsCoordinates),
         ].join(';'),
       );
-      await sink.flush();
+      await _output!.flush();
     });
   }
 
@@ -250,7 +292,7 @@ class UnifiedAcquisitionCsvLogger {
           _escapeCsvField(gpsCoordinates),
         ].join(';'),
       );
-      await sink.flush();
+      await _output!.flush();
     });
   }
 
@@ -279,7 +321,7 @@ class UnifiedAcquisitionCsvLogger {
           ].join(';'),
         );
       }
-      await sink.flush();
+      await _output!.flush();
     });
   }
 
@@ -312,7 +354,7 @@ class UnifiedAcquisitionCsvLogger {
           ].join(';'),
         );
       }
-      await sink.flush();
+      await _output!.flush();
     });
   }
 
@@ -325,6 +367,8 @@ class UnifiedAcquisitionCsvLogger {
       return Future<void>.value();
     }
 
+    // The next start() opens a new file.
+    _startFuture = null;
     final stopFuture = _enqueue(() async {
       final sink = _sink;
       if (sink != null) {
@@ -341,8 +385,8 @@ class UnifiedAcquisitionCsvLogger {
       _sink = null;
 
       if (sink != null) {
-        await sink.flush();
-        await sink.close();
+        await _output!.close();
+        _output = null;
       }
       try {
         await eventLog?.close();
@@ -422,12 +466,13 @@ class UnifiedAcquisitionCsvLogger {
   void _handleCounter(
     int counter,
     DateTime receivedAt,
+    String deviceId,
     String deviceName,
     String gpsCoordinates,
     IOSink sink,
   ) {
     final cluster = _environmentalClusters.putIfAbsent(
-      deviceName,
+      deviceId,
       _EnvironmentalClusterState.new,
     );
     _flushEnvironmentalClusterIfNeeded(cluster, sink);

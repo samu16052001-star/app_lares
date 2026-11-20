@@ -89,15 +89,23 @@ class AcquisitionEventLog {
 
   /// Creates [file] with the header and every event so far; the next events
   /// are appended to it. A file already open is closed first.
-  Future<void> open(File file) async {
+  ///
+  /// With [append] (acquisition recovered after the app process was
+  /// restarted) a file that already has content is kept: the events go on at
+  /// its end, without a second header.
+  Future<void> open(File file, {bool append = false}) async {
     if (_sink != null) {
       await close();
     }
     _file = null;
 
     await file.create(recursive: true);
-    final sink = file.openWrite(mode: FileMode.writeOnly);
-    sink.writeln(header);
+    final keep = append && await file.length() > 0;
+    final sink =
+        file.openWrite(mode: keep ? FileMode.append : FileMode.writeOnly);
+    if (!keep) {
+      sink.writeln(header);
+    }
     for (final entry in _events) {
       sink.writeln(formatRow(entry));
     }

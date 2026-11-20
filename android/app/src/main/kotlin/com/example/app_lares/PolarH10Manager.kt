@@ -11,14 +11,11 @@ import com.polar.androidcommunications.api.ble.model.DisInfo
 import com.polar.androidcommunications.api.ble.model.gatt.client.pmd.PmdMeasurementType
 import com.polar.sdk.api.PolarBleApi
 import com.polar.sdk.api.PolarBleApiCallback
-import com.polar.sdk.api.PolarBleApiDefaultImpl
 import com.polar.sdk.api.model.EcgSample
 import com.polar.sdk.api.model.FecgSample
 import com.polar.sdk.api.model.PolarDeviceInfo
 import com.polar.sdk.api.model.PolarHealthThermometerData
 import com.polar.sdk.api.model.PolarSensorSetting
-import io.flutter.plugin.common.BinaryMessenger
-import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CompletableDeferred
@@ -40,15 +37,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class PolarH10Manager(
     private val context: Context,
-    messenger: BinaryMessenger
-) : MethodChannel.MethodCallHandler, EventChannel.StreamHandler {
+    private val apiProvider: () -> PolarBleApi,
+    private val emitEvent: (Map<String, Any?>) -> Unit
+) : MethodChannel.MethodCallHandler {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val controlChannel = MethodChannel(messenger, CONTROL_CHANNEL)
-    private val eventsChannel = EventChannel(messenger, EVENTS_CHANNEL)
     private val stopping = AtomicBoolean(false)
 
-    private var eventSink: EventChannel.EventSink? = null
     private var selectedDevice: PolarDeviceSelection? = null
     private var activeIdentifier: String? = null
     private var activeDeviceInfo: PolarDeviceInfo? = null
@@ -65,32 +60,9 @@ class PolarH10Manager(
     private var hrJob: Job? = null
     private var ecgJob: Job? = null
     private var accelerometerJob: Job? = null
-    private var apiInstance: PolarBleApi? = null
+    private val api: PolarBleApi get() = apiProvider()
 
-    private val api: PolarBleApi
-        get() {
-            val existingApi = apiInstance
-            if (existingApi != null) {
-                return existingApi
-            }
-
-            return PolarBleApiDefaultImpl.defaultImplementation(
-                context.applicationContext,
-                setOf(
-                    PolarBleApi.PolarBleSdkFeature.FEATURE_HR,
-                    PolarBleApi.PolarBleSdkFeature.FEATURE_DEVICE_INFO,
-                    PolarBleApi.PolarBleSdkFeature.FEATURE_BATTERY_INFO,
-                    PolarBleApi.PolarBleSdkFeature.FEATURE_POLAR_ONLINE_STREAMING,
-                    PolarBleApi.PolarBleSdkFeature.FEATURE_POLAR_SDK_MODE
-                )
-            ).also { polarApi ->
-                polarApi.setAutomaticReconnection(false)
-                polarApi.setApiCallback(apiCallback)
-                apiInstance = polarApi
-            }
-        }
-
-    private val apiCallback = object : PolarBleApiCallback() {
+    val apiCallback = object : PolarBleApiCallback() {
         override fun blePowerStateChanged(powered: Boolean) {
             if (!powered) {
                 sendError(
@@ -182,11 +154,6 @@ class PolarH10Manager(
         }
     }
 
-    init {
-        controlChannel.setMethodCallHandler(this)
-        eventsChannel.setStreamHandler(this)
-    }
-
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "prepare" -> launchResult(result) {
@@ -227,23 +194,13 @@ class PolarH10Manager(
         }
     }
 
-    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-        eventSink = events
-    }
-
-    override fun onCancel(arguments: Any?) {
-        eventSink = null
-    }
-
     fun dispose() {
-        scope.launch {
-            stop(disconnect = true)
-            apiInstance?.shutDown()
-            apiInstance = null
-            controlChannel.setMethodCallHandler(null)
-            eventsChannel.setStreamHandler(null)
-            scope.cancel()
-        }
+        // The bridge shuts down the shared SDK once, only when the engine ends.
+        stopping.set(true)
+        scope.cancel()
+        connectionWaiter?.cancel()
+        featureWaiters.values.forEach { it.cancel() }
+        featureWaiters.clear()
     }
 
     private fun launchResult(
@@ -475,7 +432,6 @@ class PolarH10Manager(
         ensureBluetoothPermissions()
 
         val exactMatch = CompletableDeferred<PolarDeviceInfo?>()
-        val nameMatches = mutableListOf<PolarDeviceInfo>()
         val scanJob = scope.launch(Dispatchers.Default) {
             try {
                 api.searchForDevice("Polar").collect { info ->
@@ -490,14 +446,6 @@ class PolarH10Manager(
                         return@collect
                     }
 
-                    if (selection.hasNameMatch(info)) {
-                        val known = nameMatches.any { existing ->
-                            samePolarDevice(existing, info)
-                        }
-                        if (!known) {
-                            nameMatches.add(info)
-                        }
-                    }
                 }
             } catch (_: Exception) {
                 if (!exactMatch.isCompleted) {
@@ -514,11 +462,10 @@ class PolarH10Manager(
             return foundExact
         }
 
-        return if (nameMatches.size == 1) {
-            nameMatches.first()
-        } else {
-            null
-        }
+        // A display name cannot identify a strap in a recovered multi-device
+        // session. Retain the same retry timing, but never bind another H10's
+        // streams to this device's CSV identity when the selected strap is away.
+        return null
     }
 
     private suspend fun waitForFeature(
@@ -878,7 +825,9 @@ class PolarH10Manager(
         info: PolarDeviceInfo,
         selection: PolarDeviceSelection
     ): Boolean {
-        return selection.hasExactIdentityMatch(info) || selection.hasNameMatch(info)
+        // Several H10s can advertise the same name. A callback belongs only to
+        // the selected hardware identity, never to another strap with that name.
+        return selection.hasExactIdentityMatch(info)
     }
 
     private fun samePolarDevice(first: PolarDeviceInfo, second: PolarDeviceInfo): Boolean {
@@ -925,7 +874,7 @@ class PolarH10Manager(
 
     private fun sendEvent(event: Map<String, Any?>) {
         mainHandler.post {
-            eventSink?.success(event)
+            emitEvent(event)
         }
     }
 
@@ -1013,8 +962,6 @@ class PolarH10Manager(
     ) : Exception(message)
 
     companion object {
-        private const val CONTROL_CHANNEL = "app_lares/polar_h10_control"
-        private const val EVENTS_CHANNEL = "app_lares/polar_h10_events"
         private const val CONNECT_TIMEOUT_MS = 18_000L
         private const val FEATURE_TIMEOUT_MS = 15_000L
         private const val SCAN_TIMEOUT_MS = 10_000L

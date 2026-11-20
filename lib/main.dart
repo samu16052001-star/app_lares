@@ -17,6 +17,7 @@ import 'package:app_lares/services/acquisition_recovery_store.dart';
 import 'package:app_lares/services/acquisition_event_log.dart';
 import 'package:app_lares/services/android_acquisition_foreground_service.dart';
 import 'package:app_lares/services/gps_location_service.dart';
+import 'package:app_lares/services/environmental_open_remote.dart';
 import 'package:app_lares/services/mqtt_service.dart';
 import 'package:app_lares/services/respiratory_device_name_store.dart';
 import 'package:app_lares/services/unified_acquisition_csv_logger.dart';
@@ -36,14 +37,39 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart' show Position;
 import 'package:permission_handler/permission_handler.dart';
+import 'package:uuid/uuid.dart';
+
+part 'acquisition_runtime.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   FlutterBluePlus.setOperationQueueMode(OperationQueueMode.perDevice);
-  final recoverySnapshot = await AcquisitionRecoveryStore.load();
   // Stopwatch of the bottom bar: state saved like on
   // time.sesnext.uk, so it survives the app being closed.
   await StopwatchController.instance.load();
+  AcquisitionRecoverySnapshot? recoverySnapshot;
+  try {
+    recoverySnapshot = await AcquisitionRecoveryStore.load();
+  } catch (error) {
+    if (!Platform.isAndroid) rethrow;
+    _ActiveAcquisitionRuntime.recoveryError = 'Could not read the saved acquisition: $error';
+    recoverySnapshot = const AcquisitionRecoverySnapshot(
+      isActive: true, acquisitionType: 'unknown', deviceNames: [],
+      deviceTypes: [], configurationSummaries: [], startedAtIso8601: null,
+      logicalRoute: 'recovery', status: 'recovery_error',
+    );
+  }
+  if (Platform.isAndroid) {
+    if (recoverySnapshot == null) await AndroidAcquisitionForegroundService.stop();
+    AndroidAcquisitionForegroundService.setActivityAttachedHandler(
+      _ActiveAcquisitionRuntime.handleResumed,
+    );
+    _ActiveAcquisitionRuntime._isForegroundVisible =
+        await AndroidAcquisitionForegroundService.isActivityAttached();
+    if (recoverySnapshot?.status != 'recovery_error') {
+      await _ActiveAcquisitionRuntime.restore(recoverySnapshot);
+    }
+  }
   runApp(LaresApp(recoverySnapshot: recoverySnapshot));
 }
 
@@ -112,8 +138,9 @@ class _LaresAppState extends State<LaresApp> with WidgetsBindingObserver {
         child: child ?? const SizedBox.shrink(),
       ),
       home: widget.recoverySnapshot == null
-          ? const AccessCodePage()
-          : AcquisitionRecoveryPage(snapshot: widget.recoverySnapshot!),
+          ? (_ActiveAcquisitionRuntime.activePage ?? const AccessCodePage())
+          : (_ActiveAcquisitionRuntime.activePage ??
+              AcquisitionRecoveryPage(snapshot: widget.recoverySnapshot!)),
     );
   }
 }
@@ -122,6 +149,44 @@ class _ActiveAcquisitionRuntime {
   static bool _isActive = false;
   static bool _isForegroundVisible = true;
   static _MultiDeviceSessionManager? _multiDeviceManager;
+  static Object? activeOwner;
+  static Widget Function()? _pageBuilder;
+  static Future<void> Function()? _resume;
+  static Timer? _heartbeat;
+  static Future<void>? _restoration;
+  static String? recoveryError;
+
+  static Widget? get activePage => _pageBuilder?.call();
+
+  static void registerSingleOwner(
+    Object owner,
+    Widget Function() pageBuilder,
+    Future<void> Function() resume,
+  ) {
+    if (activeOwner != null && !identical(activeOwner, owner)) {
+      throw StateError('An acquisition already owns this runtime.');
+    }
+    activeOwner = owner;
+    _pageBuilder = pageBuilder;
+    _resume = resume;
+  }
+
+  static Future<void> restore(AcquisitionRecoverySnapshot? snapshot) async {
+    if (!Platform.isAndroid || snapshot == null || _isActive) return;
+    if (_restoration != null) return _restoration;
+    final operation = _restoreSavedAcquisition(snapshot);
+    _restoration = operation;
+    try {
+      await operation;
+    } catch (error) {
+      recoveryError = error.toString();
+      if (activeOwner == null) {
+        try { await AndroidAcquisitionForegroundService.stop(); } catch (_) {}
+      }
+    } finally {
+      _restoration = null;
+    }
+  }
 
   static bool get isForegroundVisible => _isForegroundVisible;
 
@@ -131,11 +196,27 @@ class _ActiveAcquisitionRuntime {
 
   static Future<void> markActive() async {
     _isActive = true;
+    if (Platform.isAndroid) {
+      _heartbeat ??= Timer.periodic(const Duration(seconds: 5), (_) {
+        unawaited(AcquisitionRecoveryStore.heartbeat().catchError((_) {}));
+      });
+    }
   }
 
   static Future<void> markInactive() async {
     _isActive = false;
     _multiDeviceManager = null;
+    activeOwner = null;
+    _pageBuilder = null;
+    _resume = null;
+    _heartbeat?.cancel();
+    _heartbeat = null;
+  }
+
+  static void beginStopping() {
+    _isActive = false;
+    _heartbeat?.cancel();
+    _heartbeat = null;
   }
 
   static Future<void> handlePaused() async {
@@ -171,7 +252,7 @@ class _ActiveAcquisitionRuntime {
 
     await AcquisitionRecoveryStore.updateStatus(
       logicalRoute: 'detached',
-      status: 'interrupted',
+      status: Platform.isAndroid ? 'running_in_background' : 'interrupted',
     );
   }
 
@@ -187,9 +268,11 @@ class _ActiveAcquisitionRuntime {
     );
     await _ensureAndroidForegroundService();
     await _multiDeviceManager?.refreshAfterResume();
+    await _resume?.call();
   }
 
   static Future<void> _ensureAndroidForegroundService() async {
+    if (!_isActive) return;
     try {
       await AndroidAcquisitionForegroundService.start();
     } catch (_) {
@@ -198,9 +281,8 @@ class _ActiveAcquisitionRuntime {
   }
 }
 
-class AcquisitionRecoveryPage extends StatelessWidget {
-  const AcquisitionRecoveryPage({
-    super.key,
+class _LegacyAcquisitionRecoveryPage extends StatelessWidget {
+  const _LegacyAcquisitionRecoveryPage({
     required this.snapshot,
   });
 
@@ -886,6 +968,7 @@ class _BleReconnectHelper {
     required String deviceId,
     required String deviceName,
     bool requireUnambiguousEnvironmentalV2NameFallback = false,
+    bool allowNameFallback = true,
   }) async {
     late final Object savedDeviceError;
 
@@ -900,6 +983,7 @@ class _BleReconnectHelper {
       deviceName: deviceName,
       requireUnambiguousEnvironmentalV2NameFallback:
           requireUnambiguousEnvironmentalV2NameFallback,
+      allowNameFallback: allowNameFallback,
     );
     if (scannedDevice == null) {
       throw savedDeviceError;
@@ -930,6 +1014,7 @@ class _BleReconnectHelper {
     required String deviceId,
     required String deviceName,
     required bool requireUnambiguousEnvironmentalV2NameFallback,
+    required bool allowNameFallback,
   }) async {
     final hasPermissions = await _requestBluetoothReconnectPermissions();
     if (!hasPermissions) {
@@ -954,6 +1039,8 @@ class _BleReconnectHelper {
           }
           return;
         }
+
+        if (!allowNameFallback) continue;
 
         if (requireUnambiguousEnvironmentalV2NameFallback) {
           if (_scanResultMatchesEnvironmentalV2Name(result, deviceName)) {
@@ -990,6 +1077,14 @@ class _BleReconnectHelper {
   static Future<bool> _requestBluetoothReconnectPermissions() async {
     if (!Platform.isAndroid) {
       return true;
+    }
+
+    // Background retry may use granted permissions but must never ask an
+    // Activity-dependent plugin to present a dialog without an Activity.
+    if (!await AndroidAcquisitionForegroundService.isActivityAttached()) {
+      final scanStatus = await Permission.bluetoothScan.status;
+      final connectStatus = await Permission.bluetoothConnect.status;
+      return scanStatus.isGranted && connectStatus.isGranted;
     }
 
     final statuses = await [
@@ -1069,9 +1164,14 @@ class _BleAutoReconnectCoordinator {
   Timer? _retryTimer;
   bool _active = false;
   bool _operationInProgress = false;
+  Future<void>? _inFlight;
   int _generation = 0;
 
   bool get isActive => _active;
+
+  Future<void> waitForIdle() async {
+    await _inFlight;
+  }
 
   void start() {
     if (_active || !_canRun) {
@@ -1105,7 +1205,7 @@ class _BleAutoReconnectCoordinator {
 
     _operationInProgress = true;
     _notify();
-    return _completeOperation(generation, operation);
+    return _inFlight = _completeOperation(generation, operation);
   }
 
   Future<void> _completeOperation(
@@ -1196,6 +1296,11 @@ class _ConnectedDeviceSession {
     this.polarRssi,
   });
 
+  factory _ConnectedDeviceSession.fromRecoveryDevice(Map<String, dynamic> value) =>
+      _decodeAcquisitionDevice(value);
+
+  Map<String, dynamic> toRecoveryDevice() => _encodeAcquisitionDevice(this);
+
   static const Duration wearableVisibleChartWindow = Duration(seconds: 2);
   static const Duration polarVisibleEcgWindow = Duration(seconds: 5);
   static const int polarVisibleEcgSampleCount = 650;
@@ -1223,6 +1328,7 @@ class _ConnectedDeviceSession {
   PolarH10Configuration? polarConfiguration;
   BleConfigurationService? environmentalService;
   EnvironmentalV2BleService? environmentalV2Service;
+  EnvironmentalV2OpenRemotePublisher? environmentalV2OpenRemotePublisher;
   WearableConfigurationBleService? wearableService;
   StreamSubscription<BluetoothConnectionState>? connectionSubscription;
   StreamSubscription<BleNotificationMessage>? environmentalMessagesSubscription;
@@ -1239,6 +1345,10 @@ class _ConnectedDeviceSession {
   /// 1 at the first initialization of this device; more when its link
   /// dropped during it and only this device is initialized again.
   int initializationAttempt = 1;
+  // A process restart needs configuration replay; ordinary radio reconnects
+  // continue using the existing notification-only reconnect path.
+  bool needsProcessRecovery = false;
+  bool interruptionPending = false;
   bool environmentalV2ConfigurationApplied = false;
   bool environmentalV2NotificationsRequested = false;
   bool environmentalV2NotificationsStarted = false;
@@ -1356,6 +1466,7 @@ class _ConnectedDeviceSession {
   }
 
   Future<void> cancelLiveSubscriptions() async {
+    environmentalV2OpenRemotePublisher?.reset();
     await environmentalMessagesSubscription?.cancel();
     environmentalMessagesSubscription = null;
     await environmentalV2MessagesSubscription?.cancel();
@@ -1389,10 +1500,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     logEvent('SCAN_PAGE_OPENED');
   }
 
-  static const _openRemoteAssetIdByEnvironmentalDeviceName = <String, String>{
-    'LARES_ENV_V1_106': '7l9c0BynTv7UqckE045gaf',
-    'LARES_ENV_V1_06': '39xOKe65bmS7yhutTrk100',
-  };
+  static Future<void> restore(AcquisitionRecoverySnapshot snapshot) =>
+      _restoreMultiDeviceAcquisition(snapshot);
 
   static const _openRemoteAttributeByEnvironmentalPrefix = <String, String>{
     'CO2': 'co2',
@@ -1444,6 +1553,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   bool _openRemoteLocationAuthorized = false;
   bool _foregroundServiceStarted = false;
   DateTime? _startedAt;
+  String _sessionId = const Uuid().v4();
+  bool _openRemoteConnectRequested = false;
+  Future<void>? _streamStartup;
   String? backgroundStatusMessage;
 
   List<_ConnectedDeviceSession> get sessions => List.unmodifiable(_sessions);
@@ -1500,18 +1612,27 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
   bool get isAndroidBackgroundServiceActive => _foregroundServiceStarted;
 
-  bool get canUseOpenRemote => _openRemoteAssetId != null;
-
-  String? get _openRemoteAssetId {
-    if (_sessions.length != 1 ||
-        _sessions.first.type != KnownDeviceType.environmentalMonitor) {
-      return null;
-    }
-
-    return _openRemoteAssetIdByEnvironmentalDeviceName[
-      _sessions.first.deviceName
-    ];
+  bool get canUseOpenRemote {
+    if (_sessions.isEmpty) return false;
+    final session = _sessions.first;
+    return EnvironmentalOpenRemote.isEligible(
+      sessionDeviceCount: _sessions.length,
+      bleDeviceName: session.deviceName,
+      isEnvironmentalV1: session.type == KnownDeviceType.environmentalMonitor,
+      isEnvironmentalV2:
+          session.type == KnownDeviceType.environmentalMonitorV2 &&
+          KnownDeviceClassifier.environmentalV2NameFrom([session.deviceName]) !=
+              null,
+    );
   }
+
+  String? get _openRemoteAssetId => canUseOpenRemote
+      ? EnvironmentalOpenRemote.assetIdByDeviceName[_sessions.first.deviceName]
+      : null;
+
+  bool get _usesPhoneGpsForOpenRemote =>
+      canUseOpenRemote &&
+      _sessions.first.type == KnownDeviceType.environmentalMonitor;
 
   List<String> get _recoveryConfigurationSummaries {
     return [
@@ -1720,7 +1841,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     } catch (_) {}
     if (session.isPolarManaged) {
       try {
-        await PolarH10PlatformService.instance.stop();
+        await PolarH10PlatformService.forDevice(session.deviceId).stop();
       } catch (_) {}
     } else {
       try {
@@ -1743,6 +1864,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     EnvironmentalV2Configuration configuration,
   ) {
+    session.environmentalV2OpenRemotePublisher?.reset();
     session.environmentalV2Configuration = configuration;
     notifyListeners();
   }
@@ -1768,58 +1890,57 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
-    _initializationStarted = true;
-    _invalidateOpenRemoteLocationAuthorization();
-    logEvent(
-      'INITIALIZATION_STARTED',
-      details: [for (final session in _sessions) session.displayName].join(', '),
-    );
-    // A new attempt starts from scratch (a failed one can leave devices
-    // initialized or marked as disconnected).
-    for (final session in _sessions) {
-      session
-        ..isInitializing = false
-        ..isInitialized = false
-        ..disconnectedDuringAcquisition = false
-        ..reconnectStatus = _BleReconnectStatus.disconnected
-        ..reconnectFailureMessage = null
-        ..errorMessage = null
-        ..latestSdHealth = null;
-      session.sdProblems.clear();
-    }
-    await csvLogger.start();
-    await gpsLocationService.start();
-    _openRemoteLocationSubscription ??= gpsLocationService.livePositions.listen(
-      _handleOpenRemoteLivePosition,
-    );
-    final gpsStatusMessage = gpsLocationService.statusMessage;
-    if (gpsStatusMessage != null) {
-      backgroundStatusMessage = _mergeStatusMessage(
-        backgroundStatusMessage,
-        gpsStatusMessage,
+    if (Platform.isAndroid) {
+      _ActiveAcquisitionRuntime.registerSingleOwner(
+        this,
+        () => _MultiDeviceAcquisitionInitializationPage(manager: this),
+        () async {},
       );
     }
 
-    if (canUseOpenRemote) {
-      _mqttStateSubscription = mqttService.states.listen((state) {
-        mqttState = state;
-        if (state.status == OpenRemoteMqttStatus.connected) {
-          _completePendingOpenRemoteLocationAuthorization();
-        } else if (state.status == OpenRemoteMqttStatus.failed ||
-            state.status == OpenRemoteMqttStatus.disconnected) {
-          _openRemoteLocationConnectionPending = false;
-        }
-        if (state.status == OpenRemoteMqttStatus.failed &&
-            state.message != null &&
-            _sessions.isNotEmpty) {
-          _appendEnvironmentalLog(_sessions.first, 'OpenRemote: ${state.message}');
-        }
-        notifyListeners();
-      });
-    }
-
+    _initializationStarted = true;
     _ConnectedDeviceSession? currentSession;
     try {
+      _invalidateOpenRemoteLocationAuthorization();
+      logEvent(
+        'INITIALIZATION_STARTED',
+        details:
+            [for (final session in _sessions) session.displayName].join(', '),
+      );
+      // A new attempt starts from scratch (a failed one can leave devices
+      // initialized or marked as disconnected).
+      for (final session in _sessions) {
+        session
+          ..isInitializing = false
+          ..isInitialized = false
+          ..disconnectedDuringAcquisition = false
+          ..reconnectStatus = _BleReconnectStatus.disconnected
+          ..reconnectFailureMessage = null
+          ..errorMessage = null
+          ..latestSdHealth = null;
+        session.sdProblems.clear();
+      }
+      if (Platform.isAndroid) _startedAt = DateTime.now();
+      await csvLogger.start(startedAt: _startedAt, sessionId: _sessionId);
+      await gpsLocationService.start();
+      _openRemoteLocationSubscription ??=
+          gpsLocationService.livePositions.listen(
+        _handleOpenRemoteLivePosition,
+      );
+      final gpsStatusMessage = gpsLocationService.statusMessage;
+      if (gpsStatusMessage != null) {
+        backgroundStatusMessage = _mergeStatusMessage(
+          backgroundStatusMessage,
+          gpsStatusMessage,
+        );
+      }
+
+      if (canUseOpenRemote) {
+        _mqttStateSubscription = mqttService.states.listen(
+          _handleOpenRemoteMqttState,
+        );
+      }
+
       for (final session in List<_ConnectedDeviceSession>.from(_sessions)) {
         currentSession = session;
         if (!session.isConfigured) {
@@ -1830,7 +1951,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       currentSession = null;
 
       _acquisitionStarted = true;
-      _startedAt = DateTime.now();
+      _startedAt ??= DateTime.now();
       logEvent('ACQUISITION_STARTED', details: 'INIT_DONE sent to the IMUs');
       // INIT_DONE to every IMU: from now on an IMU whose link
       // loses data may disconnect by itself, and it is reconnected right
@@ -1842,6 +1963,9 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         }
       }
       await _activateAndroidBackgroundSupport();
+      // Android: Polar and environmental V2 streams are started here, not by
+      // the acquisition page, so they do not depend on the page being open.
+      if (Platform.isAndroid) await _startRuntimeStreams();
       // IMUs that disconnected while the other devices were being configured
       // (_isRecordingWearableDuringInitialization) are reconnected now.
       if (disconnectedSessionsDuringAcquisition.isNotEmpty) {
@@ -1963,21 +2087,62 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
   }
 
   Future<void> connectOpenRemote() async {
-    final assetId = _openRemoteAssetId;
-    if (assetId == null ||
+    if (_disposed ||
+        _isStopping ||
+        !canUseOpenRemote ||
         mqttState.status == OpenRemoteMqttStatus.connecting ||
         mqttState.status == OpenRemoteMqttStatus.connected) {
       return;
     }
 
+    final assetId = _openRemoteAssetId;
+    if (assetId == null) {
+      mqttState = OpenRemoteMqttState(
+        status: OpenRemoteMqttStatus.failed,
+        message: EnvironmentalOpenRemote.missingAssetMessage(
+          _sessions.first.deviceName,
+        ),
+      );
+      notifyListeners();
+      return;
+    }
+
     _openRemoteLocationConnectionPending =
-        !_disposed && _acquisitionStarted && !_isStopping;
+        _usesPhoneGpsForOpenRemote && _acquisitionStarted;
+    if (Platform.isAndroid) {
+      _openRemoteConnectRequested = true;
+      await AcquisitionRecoveryStore.mergeRuntimeState({
+        'openRemoteConnectRequested': true,
+        'openRemoteAssetId': assetId,
+      });
+    }
     await mqttService.connect(assetId: assetId);
     if (mqttService.isConnected) {
       _completePendingOpenRemoteLocationAuthorization();
     } else {
       _openRemoteLocationConnectionPending = false;
     }
+  }
+
+  void _handleOpenRemoteMqttState(OpenRemoteMqttState state) {
+    if (mqttState.status != state.status) {
+      for (final session in _sessions) {
+        session.environmentalV2OpenRemotePublisher?.reset();
+      }
+    }
+    mqttState = state;
+    if (state.isConnected) {
+      _completePendingOpenRemoteLocationAuthorization();
+    } else if (state.status == OpenRemoteMqttStatus.failed ||
+        state.status == OpenRemoteMqttStatus.disconnected) {
+      _openRemoteLocationConnectionPending = false;
+    }
+    if (state.status == OpenRemoteMqttStatus.failed &&
+        state.message != null &&
+        _sessions.isNotEmpty) {
+      _appendEnvironmentalLog(_sessions.first, 'OpenRemote: ${state.message}');
+    }
+    notifyListeners();
   }
 
   void _completePendingOpenRemoteLocationAuthorization() {
@@ -1989,12 +2154,17 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (_disposed ||
         !_acquisitionStarted ||
         _isStopping ||
-        !canUseOpenRemote ||
+        !_usesPhoneGpsForOpenRemote ||
         !mqttService.isConnected) {
       return;
     }
 
     _openRemoteLocationAuthorized = true;
+    if (Platform.isAndroid) {
+      unawaited(AcquisitionRecoveryStore.mergeRuntimeState({
+        'openRemoteLocationAuthorized': true,
+      }));
+    }
   }
 
   void _invalidateOpenRemoteLocationAuthorization() {
@@ -2031,7 +2201,17 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       } catch (_) {}
     }
 
-    await _activateAndroidBackgroundSupport();
+    if (Platform.isAndroid) {
+      try {
+        await AndroidAcquisitionForegroundService.start();
+        _foregroundServiceStarted = true;
+        await gpsLocationService.resumeAfterAndroidActivityAttached();
+      } catch (error) {
+        backgroundStatusMessage = _mergeStatusMessage(
+          backgroundStatusMessage, 'Android background acquisition: $error',
+        );
+      }
+    }
     notifyListeners();
   }
 
@@ -2084,6 +2264,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    session.environmentalV2OpenRemotePublisher?.reset();
     session
       ..reconnectStatus = _BleReconnectStatus.reconnecting
       ..reconnectFailureMessage = null;
@@ -2099,6 +2280,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         }
         session
           ..isConnected = true
+          ..isInitialized = true
+          ..needsProcessRecovery = false
           ..disconnectedDuringAcquisition = false
           ..reconnectStatus = _BleReconnectStatus.reconnected
           ..reconnectFailureMessage = null;
@@ -2133,6 +2316,10 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         currentDevice: session.bleDevice,
         deviceId: session.deviceId,
         deviceName: session.deviceName,
+        allowNameFallback: !Platform.isAndroid || !_sessions.any((other) =>
+            other.deviceId != session.deviceId &&
+            _normalizeDeviceNameForReconnect(other.deviceName) ==
+                _normalizeDeviceNameForReconnect(session.deviceName)),
         requireUnambiguousEnvironmentalV2NameFallback:
             session.type == KnownDeviceType.environmentalMonitorV2,
       );
@@ -2150,43 +2337,47 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         session.device = reconnectedDevice;
       }
 
-      switch (session.type) {
-        case KnownDeviceType.environmentalMonitor:
-          final service = session.environmentalService;
-          if (service == null) {
-            throw StateError('Environmental BLE service is not available.');
-          }
-          await service.resumeNotificationsAfterReconnect(
-            reconnectedDevice: reconnectedDevice,
-          );
-          break;
-        case KnownDeviceType.environmentalMonitorV2:
-          final service = session.environmentalV2Service;
-          if (service == null) {
-            throw StateError(
-              'Environmental Monitor V2 BLE service is not available.',
-            );
-          }
-          if (session.environmentalV2NotificationsRequested) {
+      if (session.needsProcessRecovery) {
+        await _initializeRecoveredDevice(session);
+      } else {
+        switch (session.type) {
+          case KnownDeviceType.environmentalMonitor:
+            final service = session.environmentalService;
+            if (service == null) {
+              throw StateError('Environmental BLE service is not available.');
+            }
             await service.resumeNotificationsAfterReconnect(
               reconnectedDevice: reconnectedDevice,
             );
-            session.environmentalV2NotificationsStarted = true;
-          }
-          break;
-        case KnownDeviceType.respiratoryMonitor:
-          final service = session.wearableService;
-          if (service == null) {
-            throw StateError('Wearable BLE service is not available.');
-          }
-          await service.resumeNotificationsAfterReconnect(
-            reconnectedDevice: reconnectedDevice,
-          );
-          break;
-        case KnownDeviceType.polarH10:
-          throw StateError('${session.displayName} is managed by the Polar SDK.');
-        case KnownDeviceType.unsupported:
-          throw StateError('${session.displayName} is unsupported.');
+            break;
+          case KnownDeviceType.environmentalMonitorV2:
+            final service = session.environmentalV2Service;
+            if (service == null) {
+              throw StateError(
+                'Environmental Monitor V2 BLE service is not available.',
+              );
+            }
+            if (session.environmentalV2NotificationsRequested) {
+              await service.resumeNotificationsAfterReconnect(
+                reconnectedDevice: reconnectedDevice,
+              );
+              session.environmentalV2NotificationsStarted = true;
+            }
+            break;
+          case KnownDeviceType.respiratoryMonitor:
+            final service = session.wearableService;
+            if (service == null) {
+              throw StateError('Wearable BLE service is not available.');
+            }
+            await service.resumeNotificationsAfterReconnect(
+              reconnectedDevice: reconnectedDevice,
+            );
+            break;
+          case KnownDeviceType.polarH10:
+            throw StateError('${session.displayName} is managed by the Polar SDK.');
+          case KnownDeviceType.unsupported:
+            throw StateError('${session.displayName} is unsupported.');
+        }
       }
       if (!_canContinueAutomaticBleReconnect() ||
           !_sessions.contains(session)) {
@@ -2298,11 +2489,25 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     for (final session in _sessions) {
       session.sdProblems.closeAtStop(stoppedAt);
     }
+    // Saved session marked as stopping first: if Android kills the app during
+    // the stop, the acquisition is not recovered at the next launch.
+    if (Platform.isAndroid) {
+      try {
+        await AcquisitionRecoveryStore.markStopping();
+      } catch (_) {}
+    }
+    _ActiveAcquisitionRuntime.beginStopping();
     _invalidateOpenRemoteLocationAuthorization();
     notifyListeners();
 
     await _openRemoteLocationSubscription?.cancel();
     _openRemoteLocationSubscription = null;
+    // Let in-flight configuration/reconnect work observe _isStopping before
+    // releasing resources, so it cannot create a stream after Stop completes.
+    if (Platform.isAndroid) {
+      await _bleAutoReconnectCoordinator.waitForIdle();
+      await _streamStartup;
+    }
 
     final sessionsToStop = List<_ConnectedDeviceSession>.from(_sessions);
 
@@ -2349,7 +2554,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
           break;
         case KnownDeviceType.polarH10:
           try {
-            await PolarH10PlatformService.instance.stop();
+            await PolarH10PlatformService.forDevice(session.deviceId).stop();
           } catch (_) {}
           break;
         case KnownDeviceType.unsupported:
@@ -2370,11 +2575,16 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     logEvent('STOPPED');
     await csvLogger.stop();
     await AndroidAcquisitionForegroundService.clearBleDisconnectionAlert();
-    await AndroidAcquisitionForegroundService.stop();
-    await AcquisitionRecoveryStore.clear();
+    try {
+      await AcquisitionRecoveryStore.clear();
+    } catch (_) {}
     await _ActiveAcquisitionRuntime.markInactive();
+    await AndroidAcquisitionForegroundService.stop();
     _foregroundServiceStarted = false;
     _acquisitionStarted = false;
+    // A new initialization (Retry) starts the Polar and environmental V2
+    // streams again.
+    _streamStartup = null;
     _isStopping = false;
     notifyListeners();
   }
@@ -2404,7 +2614,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     if (_acquisitionStarted) {
-      _bleAutoReconnectCoordinator.cancel();
+      if (!Platform.isAndroid) _bleAutoReconnectCoordinator.cancel();
       return;
     }
 
@@ -2427,7 +2637,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       } catch (_) {}
       if (session.isPolarManaged) {
         try {
-          await PolarH10PlatformService.instance.stop();
+          await PolarH10PlatformService.forDevice(session.deviceId).stop();
         } catch (_) {}
       } else {
         try {
@@ -2448,6 +2658,11 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    _ActiveAcquisitionRuntime.registerSingleOwner(
+      this, () => _MultiDeviceAcquisitionPage(manager: this), () async {},
+    );
+    _ActiveAcquisitionRuntime.registerMultiDeviceManager(this);
+    await _persistSession();
     await _requestAndroidNotificationPermission();
     try {
       await AndroidAcquisitionForegroundService.start();
@@ -2460,7 +2675,19 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     await _ActiveAcquisitionRuntime.markActive();
+  }
+
+  Future<void> _persistSession() async {
     await AcquisitionRecoveryStore.saveActive(
+      sessionId: _sessionId,
+      workflow: 'multi-device',
+      devices: [for (final session in _sessions) session.toRecoveryDevice()],
+      runtimeState: {
+        'gpsRequested': true,
+        'openRemoteConnectRequested': _openRemoteConnectRequested,
+        'openRemoteAssetId': _openRemoteAssetId,
+        'openRemoteLocationAuthorized': _openRemoteLocationAuthorized,
+      },
       acquisitionType: _sessions.length == 1
           ? _sessions.first.type.name
           : 'multi-device',
@@ -2479,6 +2706,8 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (!Platform.isAndroid) {
       return;
     }
+
+    if (!await AndroidAcquisitionForegroundService.isActivityAttached()) return;
 
     final status = await Permission.notification.request();
     if (!status.isGranted) {
@@ -2515,6 +2744,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         }
 
         session.isConnected = isConnected;
+        session.environmentalV2OpenRemotePublisher?.reset();
         if (!isConnected) {
           if (session.type == KnownDeviceType.environmentalMonitorV2) {
             session.environmentalV2NotificationsStarted = false;
@@ -2574,6 +2804,20 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
       return;
     }
 
+    session.environmentalV2OpenRemotePublisher?.reset();
+    if (Platform.isAndroid && !session.interruptionPending) {
+      session.interruptionPending = true;
+      backgroundStatusMessage = _mergeStatusMessage(
+        backgroundStatusMessage,
+        'A Bluetooth interruption may have caused missing samples. Details are saved with the CSV.',
+      );
+      unawaited(AcquisitionRecoveryStore.recordInterruption(
+        deviceId: session.deviceId,
+        startedAt: DateTime.now(),
+        reason: 'ble_disconnected',
+      ));
+    }
+
     session
       ..disconnectedDuringAcquisition = true
       ..disconnectionAlertVersion += 1
@@ -2626,6 +2870,57 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
   Future<void> _initializeWearable(_ConnectedDeviceSession session) async {
     final configuration = session.wearableConfiguration!;
+    final service = _createWearableService(session);
+
+    await service.initialize();
+    if (!service.isReadyToContinue) {
+      throw StateError('${session.displayName} BLE setup is not complete.');
+    }
+
+    await service.startConfigurationSequence(
+      odr: configuration.odr,
+      mag: configuration.mag,
+      accG: configuration.commandAccG,
+      gyrDPS: configuration.commandGyrDPS,
+      calibrationEnabled: configuration.calibrationEnabled,
+      magCalibrationEnabled: configuration.magCalibrationEnabled,
+      // INIT_BUSY before START: the IMU does not disconnect by
+      // itself while the other devices are being configured.
+      holdSafetyNetUntilInitDone: true,
+    );
+
+    final state = await _waitForWearableStart(session, service);
+    if (state == null) {
+      throw StateError(
+        '${session.displayName} lost its BLE link during its initialization.',
+      );
+    }
+    if (state != WearableBleSequenceState.streaming) {
+      throw StateError('${session.displayName} did not enter streaming mode.');
+    }
+  }
+
+  /// Acquisition recovered after Android restarted the app process (see
+  /// acquisition_runtime.dart): a new service for an IMU that is probably
+  /// still recording. No CONFIG and no calibration if it is recording (same
+  /// SD file); if it was switched off and on, the same CONFIG and a new
+  /// START without calibration, like after any reconnection.
+  Future<void> _recoverWearable(_ConnectedDeviceSession session) async {
+    final configuration = session.wearableConfiguration!;
+    final service = _createWearableService(session);
+    logEvent('IMU_PROCESS_RECOVERY', session: session);
+    await service.recoverAfterProcessRestart(
+      odr: configuration.odr,
+      mag: configuration.mag,
+      accG: configuration.commandAccG,
+      gyrDPS: configuration.commandGyrDPS,
+    );
+  }
+
+  /// IMU service of [session], with its data and SD status subscriptions.
+  WearableConfigurationBleService _createWearableService(
+    _ConnectedDeviceSession session,
+  ) {
     final service = WearableConfigurationBleService(
       session.bleDevice,
       onStateChanged: notifyListeners,
@@ -2661,33 +2956,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         notifyListeners();
       },
     );
-
-    await service.initialize();
-    if (!service.isReadyToContinue) {
-      throw StateError('${session.displayName} BLE setup is not complete.');
-    }
-
-    await service.startConfigurationSequence(
-      odr: configuration.odr,
-      mag: configuration.mag,
-      accG: configuration.commandAccG,
-      gyrDPS: configuration.commandGyrDPS,
-      calibrationEnabled: configuration.calibrationEnabled,
-      magCalibrationEnabled: configuration.magCalibrationEnabled,
-      // INIT_BUSY before START: the IMU does not disconnect by
-      // itself while the other devices are being configured.
-      holdSafetyNetUntilInitDone: true,
-    );
-
-    final state = await _waitForWearableStart(session, service);
-    if (state == null) {
-      throw StateError(
-        '${session.displayName} lost its BLE link during its initialization.',
-      );
-    }
-    if (state != WearableBleSequenceState.streaming) {
-      throw StateError('${session.displayName} did not enter streaming mode.');
-    }
+    return service;
   }
 
   /// Waits for the end of the IMU start sequence (configuration,
@@ -2745,16 +3014,23 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     await session.polarEventsSubscription?.cancel();
     session.polarListeningSince = DateTime.now();
     session.polarEventsSubscription =
-        PolarH10PlatformService.instance.events.listen(
+        PolarH10PlatformService.forDevice(session.deviceId).events.listen(
       (event) {
         _handlePolarH10Event(session, event);
       },
     );
 
-    await PolarH10PlatformService.instance.prepare(
+    await PolarH10PlatformService.forDevice(session.deviceId).prepare(
       identity: session.polarIdentity,
       configuration: configuration,
     );
+  }
+
+  Future<void> _startRuntimeStreams() {
+    return _streamStartup ??= () async {
+      await startPolarStreamsForAcquisition();
+      await startEnvironmentalV2NotificationsForAcquisition();
+    }();
   }
 
   Future<void> startPolarStreamsForAcquisition() async {
@@ -2763,6 +3039,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     }
 
     for (final session in _sessions.where((session) => session.isPolarManaged)) {
+      if (Platform.isAndroid && (_isStopping || _disposed)) return;
       if (session.polarStreamsStarted || !session.isInitialized) {
         continue;
       }
@@ -2775,7 +3052,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
       try {
         logEvent('POLAR_STREAMS_REQUESTED', session: session);
-        await PolarH10PlatformService.instance.startStreams(
+        await PolarH10PlatformService.forDevice(session.deviceId).startStreams(
           identity: session.polarIdentity,
           configuration: configuration,
         );
@@ -2881,12 +3158,12 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
 
     await session.polarEventsSubscription?.cancel();
     session.polarEventsSubscription =
-        PolarH10PlatformService.instance.events.listen(
+        PolarH10PlatformService.forDevice(session.deviceId).events.listen(
       (event) {
         _handlePolarH10Event(session, event);
       },
     );
-    await PolarH10PlatformService.instance.reconnectAndStart(
+    await PolarH10PlatformService.forDevice(session.deviceId).reconnectAndStart(
       identity: session.polarIdentity,
       configuration: configuration,
     );
@@ -3044,6 +3321,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     PolarH10HrSample sample,
   ) {
+    _recordRecoveredSample(session);
     session
       ..latestPolarHrSample = sample
       ..isConnected = true;
@@ -3065,6 +3343,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (samples.isEmpty) {
       return;
     }
+    _recordRecoveredSample(session);
 
     session
       ..isConnected = true
@@ -3114,6 +3393,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     if (samples.isEmpty) {
       return;
     }
+    _recordRecoveredSample(session);
 
     session
       ..isConnected = true
@@ -3207,7 +3487,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
         !_acquisitionStarted ||
         _isStopping ||
         !_openRemoteLocationAuthorized ||
-        !canUseOpenRemote ||
+        !_usesPhoneGpsForOpenRemote ||
         !_sessions.first.isConnected ||
         !mqttService.isConnected) {
       return;
@@ -3249,11 +3529,13 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     BleNotificationMessage message,
   ) {
+    _recordRecoveredSample(session);
     session.environmentalMessages.add(message);
     _updateEnvironmentalLiveMeasurement(session, message);
     unawaited(
       csvLogger.appendEnvironmentalMessage(
         receivedAt: message.receivedAt,
+        deviceId: session.deviceId,
         deviceName: session.displayName,
         gpsCoordinates: gpsLocationService.currentCoordinates,
         value: message.value,
@@ -3271,10 +3553,24 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     EnvironmentalV2NotificationMessage message,
   ) {
+    _recordRecoveredSample(session);
     final configuration = session.environmentalV2Configuration;
     if (configuration == null ||
         !configuration.isMessageTypeEnabled(message.type)) {
       return;
+    }
+
+    if (!_disposed &&
+        _acquisitionStarted &&
+        !_isStopping &&
+        canUseOpenRemote &&
+        _openRemoteAssetId != null &&
+        identical(_sessions.first, session)) {
+      final publisher = session.environmentalV2OpenRemotePublisher ??=
+          EnvironmentalV2OpenRemotePublisher(mqttService);
+      unawaited(
+        publisher.publish(message: message, configuration: configuration),
+      );
     }
 
     final definition = session.visibleMeasurementsByPrefix[message.type];
@@ -3423,6 +3719,7 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     WearableAgmReceivedBatch event,
   ) {
+    _recordRecoveredSample(session);
     // Live charts: about 26 samples per second (1 every 4 at 104 Hz), each
     // at its aligned phone time (tp), not at the arrival of the notification.
     final chartPoints = session.wearableChartSampler.pick(
@@ -3819,7 +4116,7 @@ class _BluetoothScanningPageState extends State<BluetoothScanningPage> {
     var connectionSlotTaken = false;
     try {
       if (deviceType == KnownDeviceType.polarH10) {
-        if (_sessionManager.sessions.any(
+        if (!Platform.isAndroid && _sessionManager.sessions.any(
           (session) => session.type == KnownDeviceType.polarH10,
         )) {
           setState(() {
@@ -4923,10 +5220,14 @@ class _MultiDeviceAcquisitionPageState
     widget.manager.addListener(_handleManagerChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _syncBleDisconnectionAlert();
-      unawaited(widget.manager.startPolarStreamsForAcquisition());
-      unawaited(
-        widget.manager.startEnvironmentalV2NotificationsForAcquisition(),
-      );
+      // On Android the manager starts these streams itself at the end of the
+      // initialization (they must not depend on this page).
+      if (!Platform.isAndroid) {
+        unawaited(widget.manager.startPolarStreamsForAcquisition());
+        unawaited(
+          widget.manager.startEnvironmentalV2NotificationsForAcquisition(),
+        );
+      }
     });
   }
 
@@ -4934,7 +5235,9 @@ class _MultiDeviceAcquisitionPageState
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     widget.manager.removeListener(_handleManagerChanged);
-    widget.manager.cancelAutomaticBleReconnect();
+    // On Android the acquisition belongs to the manager, not to this page:
+    // closing the page does not stop the automatic reconnection.
+    if (!Platform.isAndroid) widget.manager.cancelAutomaticBleReconnect();
     _receptionRefreshTimer?.cancel();
     _noDataAlert.clear();
     _sdAlert.clear();
