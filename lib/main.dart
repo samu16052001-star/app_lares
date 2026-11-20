@@ -23,6 +23,7 @@ import 'package:app_lares/services/unified_acquisition_csv_logger.dart';
 import 'package:app_lares/stopwatch/stopwatch_bar.dart';
 import 'package:app_lares/stopwatch/stopwatch_controller.dart';
 import 'package:app_lares/wearable_agm_packet_parser.dart';
+import 'package:app_lares/wearable_chart_sampler.dart';
 import 'package:app_lares/wearable_configuration_service.dart';
 import 'package:app_lares/wearable_mag_calibration.dart';
 import 'package:app_lares/wearable_reception_monitor.dart';
@@ -1256,7 +1257,10 @@ class _ConnectedDeviceSession {
     for (final definition in _wearableMetricDefinitions)
       definition.metric: _WearableMetricSeries(),
   };
-  DateTime? latestWearableSampleReceivedAt;
+  // Live charts: samples drawn (about 26 per second) and right edge of the
+  // chart = time of the last drawn sample.
+  final WearableChartSampler wearableChartSampler = WearableChartSampler();
+  DateTime? wearableChartWindowEnd;
   int? latestBatteryPercent;
   int? latestFlushFailureRate;
   WearableSdHealth? latestSdHealth;
@@ -3419,24 +3423,38 @@ class _MultiDeviceSessionManager extends ChangeNotifier {
     _ConnectedDeviceSession session,
     WearableAgmReceivedBatch event,
   ) {
-    final sample = event.firstSample;
-    session.latestWearableSampleReceivedAt = event.receivedAt;
-    final cutoff = event.receivedAt.subtract(
-      _ConnectedDeviceSession.wearableVisibleChartWindow,
+    // Live charts: about 26 samples per second (1 every 4 at 104 Hz), each
+    // at its aligned phone time (tp), not at the arrival of the notification.
+    final chartPoints = session.wearableChartSampler.pick(
+      odr: session.wearableConfiguration?.odr ?? 104,
+      sensorTimesMs: [for (final sample in event.samples) sample.timestampMs],
+      receivedAt: event.receivedAt,
+      phoneTimes: event.phoneTimes,
     );
-    for (final definition in _wearableMetricDefinitions) {
-      final series = session.wearableMetricSeries[definition.metric];
-      if (series == null ||
-          !_wearableMetricInSample(definition.metric, sample)) {
-        continue;
-      }
+    if (chartPoints.isNotEmpty) {
+      final windowEnd = chartPoints.last.time;
+      session.wearableChartWindowEnd = windowEnd;
+      final cutoff = windowEnd.subtract(
+        _ConnectedDeviceSession.wearableVisibleChartWindow,
+      );
+      for (final definition in _wearableMetricDefinitions) {
+        final series = session.wearableMetricSeries[definition.metric];
+        if (series == null) {
+          continue;
+        }
 
-      series
-        ..addSample(
-          receivedAt: event.receivedAt,
-          value: _valueForWearableMetric(definition.metric, sample),
-        )
-        ..pruneBefore(cutoff);
+        for (final point in chartPoints) {
+          final sample = event.samples[point.index];
+          if (!_wearableMetricInSample(definition.metric, sample)) {
+            continue;
+          }
+          series.addSample(
+            time: point.time,
+            value: _valueForWearableMetric(definition.metric, sample),
+          );
+        }
+        series.pruneBefore(cutoff);
+      }
     }
 
     final gpsCoordinates = gpsLocationService.currentCoordinates;
@@ -5541,7 +5559,7 @@ class _MultiDeviceAcquisitionPageState
           _WearableMetricChartCard(
             definition: definition,
             series: session.wearableMetricSeries[definition.metric]!,
-            windowEnd: session.latestWearableSampleReceivedAt,
+            windowEnd: session.wearableChartWindowEnd,
             windowDuration: _ConnectedDeviceSession.wearableVisibleChartWindow,
             formatTime: _formatDashboardTime,
           ),
@@ -6739,13 +6757,20 @@ class _WearableMetricSeries {
 
   double? get mean => count == 0 ? null : sum / count;
 
+  /// [time] = aligned phone time of the sample (tp). When the alignment
+  /// line is refitted the new times can start a few ms before the last
+  /// drawn ones: those last points are removed, so the line never goes back.
   void addSample({
-    required DateTime receivedAt,
+    required DateTime time,
     required double value,
   }) {
+    while (visibleSamples.isNotEmpty &&
+        !visibleSamples.last.time.isBefore(time)) {
+      visibleSamples.removeLast();
+    }
     visibleSamples.add(
       _WearableChartSample(
-        receivedAt: receivedAt,
+        time: time,
         value: value,
       ),
     );
@@ -6759,7 +6784,7 @@ class _WearableMetricSeries {
 
   void pruneBefore(DateTime cutoff) {
     while (visibleSamples.isNotEmpty &&
-        visibleSamples.first.receivedAt.isBefore(cutoff)) {
+        visibleSamples.first.time.isBefore(cutoff)) {
       visibleSamples.removeAt(0);
     }
   }
@@ -6767,11 +6792,12 @@ class _WearableMetricSeries {
 
 class _WearableChartSample {
   const _WearableChartSample({
-    required this.receivedAt,
+    required this.time,
     required this.value,
   });
 
-  final DateTime receivedAt;
+  /// Aligned phone time of the sample (tp).
+  final DateTime time;
   final double value;
 }
 
@@ -6879,7 +6905,7 @@ class _WearableMetricChartCard extends StatelessWidget {
     final start = end.subtract(windowDuration);
     final windowSeconds = windowDuration.inMilliseconds / 1000;
     final spots = series.visibleSamples.map((sample) {
-      final seconds = sample.receivedAt.difference(start).inMilliseconds / 1000;
+      final seconds = sample.time.difference(start).inMilliseconds / 1000;
       return FlSpot(seconds.clamp(0, windowSeconds).toDouble(), sample.value);
     }).toList(growable: false);
 
